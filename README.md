@@ -1,5 +1,8 @@
 # lcc
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen.svg)](#install)
+
 One command to go from "I should work on PE-N" to a clean git worktree with `.env` symlinks and Claude Code already running.
 
 ```
@@ -86,6 +89,14 @@ lcc auth --token <personal-api-key>
 ```
 
 This stores a personal API token directly. No refresh, no expiry tracking — use OAuth wherever possible.
+
+## Contributing
+
+PRs welcome. Run `npm run typecheck && npm run build` before opening a PR.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 ## Troubleshooting
 
