@@ -32,6 +32,10 @@ program
 
 function run(fn: () => Promise<unknown>): void {
   fn().catch((err: unknown) => {
+    // Ctrl-C in an inquirer picker — exit silently with conventional SIGINT code
+    if (err instanceof Error && err.name === 'ExitPromptError') {
+      process.exit(130);
+    }
     if (err instanceof Error) {
       log.error(err.message);
     } else {

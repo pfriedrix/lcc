@@ -19,7 +19,7 @@ export async function fetchActiveIssues(
 ): Promise<ActiveIssue[]> {
   const me = await client.viewer;
   const result = await me.assignedIssues({
-    filter: { state: { type: { in: ['unstarted', 'started'] } } },
+    filter: { state: { type: { in: ['backlog', 'unstarted', 'started'] } } },
     first: 100,
   });
   const wantedNames = new Set(activeStateNames.map((s) => s.toLowerCase()));
