@@ -1,0 +1,32 @@
+{
+  "name": "lcc",
+  "version": "0.1.0",
+  "description": "Pick a Linear issue, get a git worktree with .env symlinks and Claude Code running",
+  "type": "module",
+  "bin": {
+    "lcc": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^7.0.0",
+    "@linear/sdk": "^39.0.0",
+    "@napi-rs/keyring": "^1.1.6",
+    "commander": "^12.1.0",
+    "execa": "^9.5.1",
+    "open": "^10.1.0",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

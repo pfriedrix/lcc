@@ -1,0 +1,44 @@
+import { Command } from 'commander';
+import { authCmd, authSetupCmd } from './commands/auth.js';
+import { startCmd } from './commands/start.js';
+import { log } from './ui.js';
+
+const program = new Command();
+
+program
+  .name('lcc')
+  .description('Pick a Linear issue → git worktree + .env symlinks + Claude Code')
+  .version('0.1.0');
+
+const auth = program
+  .command('auth')
+  .description('Authenticate with Linear (OAuth browser flow)')
+  .option('--logout', 'remove stored token')
+  .option('--status', 'show current authentication state')
+  .option('--token <pat>', 'headless fallback: store a personal API token directly')
+  .action((opts) => run(() => authCmd(opts)));
+
+auth
+  .command('setup')
+  .description('Configure OAuth client_id (one-time)')
+  .requiredOption('--client-id <id>', 'Linear OAuth application client_id')
+  .action((opts) => run(() => authSetupCmd(opts)));
+
+program
+  .command('start', { isDefault: true })
+  .description('Pick an active Linear issue and bootstrap a worktree + Claude session')
+  .option('--start-task', 'auto-run /linear-pfx-plugin:start-task in the new Claude session')
+  .action((opts) => run(() => startCmd(opts)));
+
+function run(fn: () => Promise<unknown>): void {
+  fn().catch((err: unknown) => {
+    if (err instanceof Error) {
+      log.error(err.message);
+    } else {
+      log.error(String(err));
+    }
+    process.exit(1);
+  });
+}
+
+program.parseAsync();
