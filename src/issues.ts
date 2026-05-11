@@ -1,4 +1,4 @@
-import type { Issue, LinearClient } from '@linear/sdk';
+import type { LinearClient } from '@linear/sdk';
 
 export interface ActiveIssue {
   id: string;
@@ -10,23 +10,61 @@ export interface ActiveIssue {
   priority: number;
   url: string;
   updatedAt: Date;
-  raw: Issue;
+}
+
+const ACTIVE_ISSUES_QUERY = /* GraphQL */ `
+  query LccActiveIssues {
+    viewer {
+      assignedIssues(
+        filter: { state: { type: { in: ["backlog", "unstarted", "started"] } } }
+        first: 100
+      ) {
+        nodes {
+          id
+          identifier
+          title
+          branchName
+          priority
+          url
+          updatedAt
+          state {
+            name
+            type
+          }
+        }
+      }
+    }
+  }
+`;
+
+interface RawIssue {
+  id: string;
+  identifier: string;
+  title: string;
+  branchName: string;
+  priority: number;
+  url: string;
+  updatedAt: string;
+  state: { name: string; type: string } | null;
+}
+
+interface RawResponse {
+  viewer: { assignedIssues: { nodes: RawIssue[] } };
 }
 
 export async function fetchActiveIssues(
   client: LinearClient,
   activeStateNames: string[],
 ): Promise<ActiveIssue[]> {
-  const me = await client.viewer;
-  const result = await me.assignedIssues({
-    filter: { state: { type: { in: ['backlog', 'unstarted', 'started'] } } },
-    first: 100,
-  });
+  const { data } = await client.client.rawRequest<RawResponse, Record<string, never>>(
+    ACTIVE_ISSUES_QUERY,
+    {},
+  );
+  if (!data) throw new Error('Linear API returned no data');
   const wantedNames = new Set(activeStateNames.map((s) => s.toLowerCase()));
   const enriched: ActiveIssue[] = [];
-  for (const issue of result.nodes) {
-    const state = await issue.state;
-    const stateName = state?.name ?? 'Unknown';
+  for (const issue of data.viewer.assignedIssues.nodes) {
+    const stateName = issue.state?.name ?? 'Unknown';
     if (!wantedNames.has(stateName.toLowerCase())) continue;
     enriched.push({
       id: issue.id,
@@ -34,11 +72,10 @@ export async function fetchActiveIssues(
       title: issue.title,
       branchName: issue.branchName,
       stateName,
-      stateType: state?.type ?? 'unknown',
+      stateType: issue.state?.type ?? 'unknown',
       priority: issue.priority,
       url: issue.url,
-      updatedAt: issue.updatedAt,
-      raw: issue,
+      updatedAt: new Date(issue.updatedAt),
     });
   }
   // Preserve the order from `activeStateNames` (so Todo before In Progress, etc.),
