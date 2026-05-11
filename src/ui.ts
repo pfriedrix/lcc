@@ -23,17 +23,24 @@ export async function pickIssue(issues: ActiveIssue[]): Promise<ActiveIssue> {
     value: issue,
     description: `${issue.branchName} — ${issue.url}`,
   }));
+  const pageSize = Math.max(7, Math.min(30, (process.stdout.rows ?? 24) - 6));
   return await search<ActiveIssue>({
-    message: 'Pick a Linear issue:',
+    message: `Pick a Linear issue (${issues.length} total, type to search):`,
+    pageSize,
     source: (term) => {
       if (!term) return choices;
-      const q = term.toLowerCase();
-      return choices.filter(
-        (c) =>
-          c.value.identifier.toLowerCase().includes(q) ||
-          c.value.title.toLowerCase().includes(q) ||
-          c.value.branchName.toLowerCase().includes(q),
-      );
+      const tokens = term.toLowerCase().split(/\s+/).filter(Boolean);
+      return choices.filter((c) => {
+        const haystack = [
+          c.value.identifier,
+          c.value.title,
+          c.value.branchName,
+          c.value.stateName,
+        ]
+          .join(' ')
+          .toLowerCase();
+        return tokens.every((t) => haystack.includes(t));
+      });
     },
   });
 }

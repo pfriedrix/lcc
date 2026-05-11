@@ -13,11 +13,12 @@ export interface ActiveIssue {
 }
 
 const ACTIVE_ISSUES_QUERY = /* GraphQL */ `
-  query LccActiveIssues {
+  query LccActiveIssues($after: String) {
     viewer {
       assignedIssues(
         filter: { state: { type: { in: ["backlog", "unstarted", "started"] } } }
-        first: 100
+        first: 250
+        after: $after
       ) {
         nodes {
           id
@@ -31,6 +32,10 @@ const ACTIVE_ISSUES_QUERY = /* GraphQL */ `
             name
             type
           }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
         }
       }
     }
@@ -49,21 +54,42 @@ interface RawIssue {
 }
 
 interface RawResponse {
-  viewer: { assignedIssues: { nodes: RawIssue[] } };
+  viewer: {
+    assignedIssues: {
+      nodes: RawIssue[];
+      pageInfo: { hasNextPage: boolean; endCursor: string | null };
+    };
+  };
+}
+
+const MAX_PAGES = 10; // 250 × 10 = 2500 issues; safety cap to avoid runaway loops
+
+async function fetchAllRaw(client: LinearClient): Promise<RawIssue[]> {
+  const all: RawIssue[] = [];
+  let after: string | null = null;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const result: { data?: RawResponse } = await client.client.rawRequest<
+      RawResponse,
+      { after: string | null }
+    >(ACTIVE_ISSUES_QUERY, { after });
+    const data = result.data;
+    if (!data) throw new Error('Linear API returned no data');
+    const conn = data.viewer.assignedIssues;
+    all.push(...conn.nodes);
+    if (!conn.pageInfo.hasNextPage || !conn.pageInfo.endCursor) break;
+    after = conn.pageInfo.endCursor;
+  }
+  return all;
 }
 
 export async function fetchActiveIssues(
   client: LinearClient,
   activeStateNames: string[],
 ): Promise<ActiveIssue[]> {
-  const { data } = await client.client.rawRequest<RawResponse, Record<string, never>>(
-    ACTIVE_ISSUES_QUERY,
-    {},
-  );
-  if (!data) throw new Error('Linear API returned no data');
+  const raw = await fetchAllRaw(client);
   const wantedNames = new Set(activeStateNames.map((s) => s.toLowerCase()));
   const enriched: ActiveIssue[] = [];
-  for (const issue of data.viewer.assignedIssues.nodes) {
+  for (const issue of raw) {
     const stateName = issue.state?.name ?? 'Unknown';
     if (!wantedNames.has(stateName.toLowerCase())) continue;
     enriched.push({
