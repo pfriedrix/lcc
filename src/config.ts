@@ -8,6 +8,7 @@ export interface Config {
   envPatterns?: string[];
   envExclude?: string[];
   activeStates?: string[];
+  startTaskCommand?: string;
 }
 
 const CONFIG_DIR = path.join(os.homedir(), '.config', 'lcc');
@@ -29,6 +30,7 @@ const DEFAULTS: Required<Omit<Config, 'clientId'>> = {
   envPatterns: ['.env', '.env.*'],
   envExclude: ['.env.example', '.env.sample', '.env.template'],
   activeStates: ['Todo', 'In Progress'],
+  startTaskCommand: '',
 };
 
 export type ResolvedConfig = Required<typeof DEFAULTS> & { clientId: string };
@@ -46,6 +48,7 @@ export async function loadConfig(): Promise<ResolvedConfig> {
     envPatterns: stored.envPatterns ?? DEFAULTS.envPatterns,
     envExclude: stored.envExclude ?? DEFAULTS.envExclude,
     activeStates: stored.activeStates ?? DEFAULTS.activeStates,
+    startTaskCommand: stored.startTaskCommand ?? DEFAULTS.startTaskCommand,
     clientId: process.env.LCC_CLIENT_ID ?? stored.clientId ?? DEFAULT_CLIENT_ID,
   };
 }

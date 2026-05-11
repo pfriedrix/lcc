@@ -19,7 +19,6 @@ import { confirmUseCurrentBase, pickBaseBranch, pickIssue, log } from '../ui.js'
 import { getToken } from '../keychain.js';
 
 export interface StartOpts {
-  startTask?: boolean;
   all?: boolean;
 }
 
@@ -117,8 +116,12 @@ export async function startCmd(opts: StartOpts): Promise<void> {
   log.info('');
 
   const extraArgs: string[] = [];
-  if (opts.startTask) {
-    extraArgs.push(`/linear-pfx-plugin:start-task ${selected.identifier}`);
+  if (cfg.startTaskCommand.trim()) {
+    const cmd = cfg.startTaskCommand
+      .replace(/\{identifier\}/g, selected.identifier)
+      .replace(/\{branch\}/g, branch)
+      .replace(/\{url\}/g, selected.url);
+    extraArgs.push(cmd);
   }
   const exitCode = await launchClaude(worktreePath, extraArgs);
   process.exit(exitCode);

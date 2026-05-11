@@ -1,5 +1,6 @@
 import { Command } from 'commander';
 import { authCmd, authSetupCmd } from './commands/auth.js';
+import { setupCmd } from './commands/setup.js';
 import { startCmd } from './commands/start.js';
 import { log } from './ui.js';
 
@@ -25,9 +26,13 @@ auth
   .action((opts) => run(() => authSetupCmd(opts)));
 
 program
+  .command('setup')
+  .description('Interactively configure lcc (startTaskCommand, worktreeTemplate, activeStates)')
+  .action(() => run(() => setupCmd()));
+
+program
   .command('start', { isDefault: true })
   .description('Pick an active Linear issue and bootstrap a worktree + Claude session')
-  .option('--no-start-task', 'skip auto-run of /linear-pfx-plugin:start-task in the new Claude session')
   .option('--all', 'show all assigned issues regardless of activeStates filter')
   .action((opts) => run(() => startCmd(opts)));
 
