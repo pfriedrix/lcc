@@ -1,4 +1,4 @@
-import { search } from '@inquirer/prompts';
+import { confirm, search } from '@inquirer/prompts';
 import pc from 'picocolors';
 import type { ActiveIssue } from './issues.js';
 
@@ -43,6 +43,27 @@ export async function pickIssue(issues: ActiveIssue[]): Promise<ActiveIssue> {
           .toLowerCase();
         return tokens.every((t) => haystack.includes(t));
       });
+    },
+  });
+}
+
+export async function confirmUseCurrentBase(current: string): Promise<boolean> {
+  return await confirm({
+    message: `Base new branch on current '${pc.cyan(current)}'?`,
+    default: true,
+  });
+}
+
+export async function pickBaseBranch(branches: string[]): Promise<string> {
+  const choices = branches.map((b) => ({ name: b, value: b }));
+  const pageSize = Math.max(7, Math.min(30, (process.stdout.rows ?? 24) - 6));
+  return await search<string>({
+    message: 'Pick base branch:',
+    pageSize,
+    source: (term) => {
+      if (!term) return choices;
+      const t = term.toLowerCase();
+      return choices.filter((c) => c.value.toLowerCase().includes(t));
     },
   });
 }

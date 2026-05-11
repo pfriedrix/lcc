@@ -31,6 +31,42 @@ export async function defaultBranch(repo: string): Promise<string> {
   return stdout.trim();
 }
 
+export async function currentBranch(repo: string): Promise<string | null> {
+  const { stdout } = await execa('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repo });
+  const branch = stdout.trim();
+  return branch === 'HEAD' ? null : branch;
+}
+
+export async function listBranches(repo: string): Promise<string[]> {
+  const { stdout } = await execa(
+    'git',
+    ['for-each-ref', '--format=%(refname:short)', 'refs/heads/', 'refs/remotes/'],
+    { cwd: repo },
+  );
+  const seen = new Set<string>();
+  for (const line of stdout.split('\n')) {
+    const ref = line.trim();
+    if (!ref || ref.endsWith('/HEAD')) continue;
+    seen.add(ref.startsWith('origin/') ? ref.slice('origin/'.length) : ref);
+  }
+  return [...seen].sort();
+}
+
+export function rewriteBranchName(linearBranch: string, prefix = 'feature'): string {
+  const slash = linearBranch.indexOf('/');
+  const tail = slash >= 0 ? linearBranch.slice(slash + 1) : linearBranch;
+  return `${prefix}/${tail}`;
+}
+
+export async function resolveStrategy(
+  repo: string,
+  branch: string,
+): Promise<WorktreeResult['created']> {
+  if (await localBranchExists(repo, branch)) return 'reused-local';
+  if (await remoteBranchExists(repo, branch)) return 'tracking-remote';
+  return 'new';
+}
+
 async function localBranchExists(repo: string, branch: string): Promise<boolean> {
   try {
     await execa('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: repo });

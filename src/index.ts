@@ -27,7 +27,7 @@ auth
 program
   .command('start', { isDefault: true })
   .description('Pick an active Linear issue and bootstrap a worktree + Claude session')
-  .option('--start-task', 'auto-run /linear-pfx-plugin:start-task in the new Claude session')
+  .option('--no-start-task', 'skip auto-run of /linear-pfx-plugin:start-task in the new Claude session')
   .option('--all', 'show all assigned issues regardless of activeStates filter')
   .action((opts) => run(() => startCmd(opts)));
 

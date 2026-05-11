@@ -3,10 +3,19 @@ import pc from 'picocolors';
 import { loadConfig } from '../config.js';
 import { getClient } from '../linear.js';
 import { fetchActiveIssues } from '../issues.js';
-import { createWorktree, defaultBranch, renderWorktreePath, repoRoot } from '../git.js';
+import {
+  createWorktree,
+  currentBranch,
+  defaultBranch,
+  listBranches,
+  renderWorktreePath,
+  repoRoot,
+  resolveStrategy,
+  rewriteBranchName,
+} from '../git.js';
 import { findEnvFiles, linkEnvFiles } from '../env.js';
 import { launchClaude } from '../claude.js';
-import { pickIssue, log } from '../ui.js';
+import { confirmUseCurrentBase, pickBaseBranch, pickIssue, log } from '../ui.js';
 import { getToken } from '../keychain.js';
 
 export interface StartOpts {
@@ -54,17 +63,41 @@ export async function startCmd(opts: StartOpts): Promise<void> {
   }
 
   const selected = await pickIssue(issues);
-  log.dim(`Selected ${pc.cyan(selected.identifier)} — branch ${pc.bold(selected.branchName)}`);
+  const branch = rewriteBranchName(selected.branchName);
+  log.dim(`Selected ${pc.cyan(selected.identifier)} — branch ${pc.bold(branch)}`);
 
   const worktreePath = renderWorktreePath(cfg.worktreeTemplate, {
     repoRoot: repo,
-    branch: selected.branchName,
+    branch,
   });
-  const base = await defaultBranch(repo);
 
-  log.step(`Creating worktree at ${pc.dim(worktreePath)} (base: ${base})`);
-  const wt = await createWorktree(repo, selected.branchName, worktreePath, base);
-  log.success(`Worktree ${wt.created === 'new' ? 'created' : wt.created === 'reused-local' ? 'reused local branch' : 'tracking origin'}: ${wt.path}`);
+  const strategy = await resolveStrategy(repo, branch);
+  let base: string;
+  if (strategy === 'new') {
+    const def = await defaultBranch(repo);
+    const cur = await currentBranch(repo);
+    if (!cur || cur === def) {
+      base = def;
+    } else if (await confirmUseCurrentBase(cur)) {
+      base = cur;
+    } else {
+      const branches = await listBranches(repo);
+      base = await pickBaseBranch(branches);
+    }
+    log.step(`Creating worktree at ${pc.dim(worktreePath)} (base: ${pc.bold(base)})`);
+  } else {
+    base = await defaultBranch(repo);
+    log.step(`Creating worktree at ${pc.dim(worktreePath)}`);
+  }
+
+  const wt = await createWorktree(repo, branch, worktreePath, base);
+  const summary =
+    wt.created === 'new'
+      ? `created from ${pc.bold(base)}`
+      : wt.created === 'reused-local'
+        ? 'reused local branch'
+        : `tracking origin/${branch}`;
+  log.success(`Worktree ${summary}: ${wt.path}`);
 
   const envFiles = await findEnvFiles(repo, cfg.envPatterns, cfg.envExclude);
   if (envFiles.length === 0) {
@@ -85,7 +118,7 @@ export async function startCmd(opts: StartOpts): Promise<void> {
 
   const extraArgs: string[] = [];
   if (opts.startTask) {
-    extraArgs.push('-p', `/linear-pfx-plugin:start-task ${selected.identifier}`);
+    extraArgs.push(`/linear-pfx-plugin:start-task ${selected.identifier}`);
   }
   const exitCode = await launchClaude(worktreePath, extraArgs);
   process.exit(exitCode);
