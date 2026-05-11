@@ -11,6 +11,7 @@ import { getToken } from '../keychain.js';
 
 export interface StartOpts {
   startTask?: boolean;
+  all?: boolean;
 }
 
 export async function startCmd(opts: StartOpts): Promise<void> {
@@ -22,13 +23,33 @@ export async function startCmd(opts: StartOpts): Promise<void> {
   const cfg = await loadConfig();
   const repo = await repoRoot();
 
-  log.step(`Fetching Linear issues (${cfg.activeStates.join(', ')})...`);
+  const fetchLabel = opts.all ? 'all states' : cfg.activeStates.join(', ');
+  log.step(`Fetching Linear issues (${fetchLabel})...`);
   const client = await getClient();
-  const issues = await fetchActiveIssues(client, cfg.activeStates);
+  const { matched: issues, skippedByState, total } = await fetchActiveIssues(
+    client,
+    cfg.activeStates,
+    { includeAll: opts.all },
+  );
+
+  if (!opts.all && skippedByState.size > 0) {
+    const skippedTotal = [...skippedByState.values()].reduce((a, b) => a + b, 0);
+    const breakdown = [...skippedByState.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([name, count]) => `${name} (${count})`)
+      .join(', ');
+    log.dim(
+      `Filtered out ${skippedTotal} of ${total} assigned issues — not in activeStates: ${breakdown}`,
+    );
+    log.dim('To include them, edit ~/.config/lcc/config.json → activeStates, or run `lcc --all`.');
+  }
+
   if (issues.length === 0) {
-    log.warn(`No issues assigned to you in: ${cfg.activeStates.join(', ')}.`);
-    log.dim('Promote something into one of those states in Linear, then re-run.');
-    log.dim('To customize which states show up, edit ~/.config/lcc/config.json → activeStates.');
+    log.warn(
+      opts.all
+        ? 'No active issues assigned to you (excluding Completed/Canceled).'
+        : `No issues assigned to you in: ${cfg.activeStates.join(', ')}.`,
+    );
     return;
   }
 

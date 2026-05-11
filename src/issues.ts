@@ -10,33 +10,39 @@ export interface ActiveIssue {
   priority: number;
   url: string;
   updatedAt: Date;
+  assigneeName: string | null;
+  teamKey: string | null;
 }
 
 const ACTIVE_ISSUES_QUERY = /* GraphQL */ `
-  query LccActiveIssues($after: String) {
-    viewer {
-      assignedIssues(
-        filter: { state: { type: { in: ["backlog", "unstarted", "started"] } } }
-        first: 250
-        after: $after
-      ) {
-        nodes {
-          id
-          identifier
-          title
-          branchName
-          priority
-          url
-          updatedAt
-          state {
-            name
-            type
-          }
+  query LccIssues($after: String) {
+    issues(
+      filter: { state: { type: { nin: ["completed", "canceled"] } } }
+      first: 250
+      after: $after
+    ) {
+      nodes {
+        id
+        identifier
+        title
+        branchName
+        priority
+        url
+        updatedAt
+        state {
+          name
+          type
         }
-        pageInfo {
-          hasNextPage
-          endCursor
+        assignee {
+          name
         }
+        team {
+          key
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
       }
     }
   }
@@ -51,14 +57,14 @@ interface RawIssue {
   url: string;
   updatedAt: string;
   state: { name: string; type: string } | null;
+  assignee: { name: string } | null;
+  team: { key: string } | null;
 }
 
 interface RawResponse {
-  viewer: {
-    assignedIssues: {
-      nodes: RawIssue[];
-      pageInfo: { hasNextPage: boolean; endCursor: string | null };
-    };
+  issues: {
+    nodes: RawIssue[];
+    pageInfo: { hasNextPage: boolean; endCursor: string | null };
   };
 }
 
@@ -74,7 +80,7 @@ async function fetchAllRaw(client: LinearClient): Promise<RawIssue[]> {
     >(ACTIVE_ISSUES_QUERY, { after });
     const data = result.data;
     if (!data) throw new Error('Linear API returned no data');
-    const conn = data.viewer.assignedIssues;
+    const conn = data.issues;
     all.push(...conn.nodes);
     if (!conn.pageInfo.hasNextPage || !conn.pageInfo.endCursor) break;
     after = conn.pageInfo.endCursor;
@@ -82,16 +88,28 @@ async function fetchAllRaw(client: LinearClient): Promise<RawIssue[]> {
   return all;
 }
 
+export interface FetchResult {
+  matched: ActiveIssue[];
+  skippedByState: Map<string, number>;
+  total: number;
+}
+
 export async function fetchActiveIssues(
   client: LinearClient,
   activeStateNames: string[],
-): Promise<ActiveIssue[]> {
+  options: { includeAll?: boolean } = {},
+): Promise<FetchResult> {
   const raw = await fetchAllRaw(client);
   const wantedNames = new Set(activeStateNames.map((s) => s.toLowerCase()));
   const enriched: ActiveIssue[] = [];
+  const skippedByState = new Map<string, number>();
   for (const issue of raw) {
-    const stateName = issue.state?.name ?? 'Unknown';
-    if (!wantedNames.has(stateName.toLowerCase())) continue;
+    const stateName = (issue.state?.name ?? 'Unknown').trim();
+    const matches = options.includeAll || wantedNames.has(stateName.toLowerCase());
+    if (!matches) {
+      skippedByState.set(stateName, (skippedByState.get(stateName) ?? 0) + 1);
+      continue;
+    }
     enriched.push({
       id: issue.id,
       identifier: issue.identifier,
@@ -102,10 +120,13 @@ export async function fetchActiveIssues(
       priority: issue.priority,
       url: issue.url,
       updatedAt: new Date(issue.updatedAt),
+      assigneeName: issue.assignee?.name ?? null,
+      teamKey: issue.team?.key ?? null,
     });
   }
   // Preserve the order from `activeStateNames` (so Todo before In Progress, etc.),
-  // then most recently updated first within each state.
+  // then most recently updated first within each state. With --all, sort by
+  // state name alphabetically then by recency.
   const stateOrder = new Map(activeStateNames.map((s, i) => [s.toLowerCase(), i]));
   enriched.sort((a, b) => {
     const ai = stateOrder.get(a.stateName.toLowerCase()) ?? 99;
@@ -113,5 +134,5 @@ export async function fetchActiveIssues(
     if (ai !== bi) return ai - bi;
     return b.updatedAt.getTime() - a.updatedAt.getTime();
   });
-  return enriched;
+  return { matched: enriched, skippedByState, total: raw.length };
 }
