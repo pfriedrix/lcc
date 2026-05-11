@@ -14,8 +14,7 @@ function formatChoice(issue: ActiveIssue): string {
   const id = pc.cyan(issue.identifier.padEnd(8));
   const state = issue.stateType === 'started' ? pc.green(issue.stateName) : pc.yellow(issue.stateName);
   const prio = pc.dim(PRIORITY_LABEL[issue.priority] ?? '   ');
-  const assignee = issue.assigneeName ? pc.dim(`@${issue.assigneeName.split(' ')[0]}`) : pc.dim('—');
-  return `${id} ${prio} ${state.padEnd(20)} ${pc.dim(assignee.padEnd(14))} ${issue.title}`;
+  return `${id} ${prio} ${state.padEnd(20)} ${issue.title}`;
 }
 
 export async function pickIssue(issues: ActiveIssue[]): Promise<ActiveIssue> {
