@@ -113,6 +113,7 @@ export async function createWorktree(
     );
   }
   await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+  await ensureLocalIgnore(repo, worktreePath);
 
   if (await localBranchExists(repo, branch)) {
     await execa('git', ['worktree', 'add', worktreePath, branch], { cwd: repo, stdio: 'inherit' });
@@ -127,6 +128,26 @@ export async function createWorktree(
   }
   await execa('git', ['worktree', 'add', '-b', branch, worktreePath, base], { cwd: repo, stdio: 'inherit' });
   return { path: worktreePath, branch, created: 'new' };
+}
+
+async function ensureLocalIgnore(repo: string, worktreePath: string): Promise<void> {
+  const rel = path.relative(repo, worktreePath);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return;
+  const topDir = rel.split(path.sep)[0];
+  if (!topDir) return;
+  const entry = `/${topDir}/`;
+  const excludeFile = path.join(repo, '.git', 'info', 'exclude');
+  let current = '';
+  try {
+    current = await fs.readFile(excludeFile, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+  const lines = current.split('\n').map((l) => l.trim());
+  if (lines.includes(entry) || lines.includes(topDir) || lines.includes(`${topDir}/`)) return;
+  const next = (current.endsWith('\n') || current === '' ? current : current + '\n') + entry + '\n';
+  await fs.mkdir(path.dirname(excludeFile), { recursive: true });
+  await fs.writeFile(excludeFile, next, 'utf8');
 }
 
 export function renderWorktreePath(

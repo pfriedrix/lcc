@@ -11,7 +11,7 @@ $ lcc
   PE-51       Todo          Add Liquid Glass to settings sheet
 > PE-47   M   Todo          Backfill missing receipt categories
   ...
-✓ Worktree created: /Users/me/Documents/Projects/Pantry.worktrees/PE-47-backfill-receipts
+✓ Worktree created: /Users/me/Documents/Projects/Pantry/.lcc/worktrees/PE-47-backfill-receipts
 ✓ Linked .env
 ✓ Linked .env.local
 [claude opens in worktree]
@@ -50,7 +50,7 @@ lcc auth --logout    # clear token from keychain
 
 1. Fetches your **active** Linear issues (assigned to you, state Todo or In Progress) via the official `@linear/sdk`.
 2. Shows a searchable picker (`@inquirer/prompts`).
-3. Runs `git worktree add` using the branch name Linear computes for the issue (`feature/PE-N-slug`). Base = `origin/HEAD` (or `main` / `master`).
+3. Runs `git worktree add` using the branch name Linear computes for the issue (`feature/PE-N-slug`). Base = `origin/HEAD` (or `main` / `master`). Worktrees live at `<repo>/.lcc/worktrees/<branchLeaf>` by default; `.lcc/` is appended to `.git/info/exclude` so git status stays clean.
 4. Symlinks every `.env*` from the repo root into the new worktree (skips `.env.example`, `.env.sample`, `.env.template`).
 5. Spawns `claude` in the worktree with `stdio: 'inherit'` so you land directly in the session.
 
@@ -60,7 +60,7 @@ lcc auth --logout    # clear token from keychain
 
 ```json
 {
-  "worktreeTemplate": "{repoParent}/{repoName}.worktrees/{branchLeaf}",
+  "worktreeTemplate": "{repoRoot}/.lcc/worktrees/{branchLeaf}",
   "envPatterns": [".env", ".env.*"],
   "envExclude": [".env.example", ".env.sample", ".env.template"]
 }

@@ -26,7 +26,7 @@ export const DEFAULT_SCOPES = ['read', 'write'];
 export const DEFAULT_CLIENT_ID = '6bf6dd7b761b5ce6539cf5a9ed99b4fb';
 
 const DEFAULTS: Required<Omit<Config, 'clientId'>> = {
-  worktreeTemplate: '{repoParent}/{repoName}.worktrees/{branchLeaf}',
+  worktreeTemplate: '{repoRoot}/.lcc/worktrees/{branchLeaf}',
   envPatterns: ['.env', '.env.*'],
   envExclude: ['.env.example', '.env.sample', '.env.template'],
   activeStates: ['Todo', 'In Progress'],
