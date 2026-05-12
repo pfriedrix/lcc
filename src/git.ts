@@ -150,6 +150,60 @@ async function ensureLocalIgnore(repo: string, worktreePath: string): Promise<vo
   await fs.writeFile(excludeFile, next, 'utf8');
 }
 
+export interface WorktreeEntry {
+  path: string;
+  branch: string | null;
+  head: string;
+  locked: boolean;
+  prunable: boolean;
+  isMain: boolean;
+}
+
+export async function listWorktrees(repo: string): Promise<WorktreeEntry[]> {
+  const { stdout } = await execa('git', ['worktree', 'list', '--porcelain'], { cwd: repo });
+  const entries: WorktreeEntry[] = [];
+  let current: Partial<WorktreeEntry> | null = null;
+  const flush = () => {
+    if (current?.path) {
+      entries.push({
+        path: current.path,
+        branch: current.branch ?? null,
+        head: current.head ?? '',
+        locked: current.locked ?? false,
+        prunable: current.prunable ?? false,
+        isMain: false,
+      });
+    }
+    current = null;
+  };
+  for (const line of stdout.split('\n')) {
+    if (line.startsWith('worktree ')) {
+      flush();
+      current = { path: line.slice('worktree '.length).trim() };
+    } else if (!current) {
+      continue;
+    } else if (line.startsWith('HEAD ')) {
+      current.head = line.slice('HEAD '.length).trim();
+    } else if (line.startsWith('branch ')) {
+      current.branch = line.slice('branch '.length).trim().replace(/^refs\/heads\//, '');
+    } else if (line === 'locked' || line.startsWith('locked ')) {
+      current.locked = true;
+    } else if (line === 'prunable' || line.startsWith('prunable ')) {
+      current.prunable = true;
+    }
+  }
+  flush();
+  if (entries[0]) entries[0].isMain = true;
+  return entries;
+}
+
+export async function removeWorktree(repo: string, worktreePath: string, force = false): Promise<void> {
+  const args = ['worktree', 'remove'];
+  if (force) args.push('--force');
+  args.push(worktreePath);
+  await execa('git', args, { cwd: repo });
+}
+
 export function renderWorktreePath(
   template: string,
   ctx: { repoRoot: string; branch: string },

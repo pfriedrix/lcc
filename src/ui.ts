@@ -54,6 +54,58 @@ export async function confirmUseCurrentBase(current: string): Promise<boolean> {
   });
 }
 
+export interface WorktreeChoice {
+  path: string;
+  branch: string | null;
+  head: string;
+  locked: boolean;
+  prunable: boolean;
+  managed: boolean;
+}
+
+export async function pickWorktree(entries: WorktreeChoice[], message: string): Promise<WorktreeChoice> {
+  const choices = entries.map((wt) => {
+    const branch = wt.branch ? pc.cyan(wt.branch) : pc.dim(wt.head.slice(0, 8) + ' (detached)');
+    const flags: string[] = [];
+    if (wt.locked) flags.push(pc.yellow('locked'));
+    if (wt.prunable) flags.push(pc.red('prunable'));
+    if (wt.managed) flags.push(pc.dim('lcc'));
+    const tail = flags.length ? '  ' + flags.join(' ') : '';
+    return {
+      name: `${branch.padEnd(40)}  ${pc.dim(wt.path)}${tail}`,
+      value: wt,
+      description: wt.path,
+    };
+  });
+  const pageSize = Math.max(7, Math.min(30, (process.stdout.rows ?? 24) - 6));
+  return await search<WorktreeChoice>({
+    message,
+    pageSize,
+    source: (term) => {
+      if (!term) return choices;
+      const t = term.toLowerCase();
+      return choices.filter((c) =>
+        (c.value.branch ?? '').toLowerCase().includes(t) || c.value.path.toLowerCase().includes(t),
+      );
+    },
+  });
+}
+
+export async function confirmRemoveWorktree(wt: WorktreeChoice): Promise<boolean> {
+  const label = wt.branch ?? wt.head.slice(0, 8);
+  return await confirm({
+    message: `Remove worktree ${pc.cyan(label)} at ${pc.dim(wt.path)}?`,
+    default: false,
+  });
+}
+
+export async function confirmForceRemove(): Promise<boolean> {
+  return await confirm({
+    message: pc.yellow('Worktree has uncommitted changes or is locked. Force remove?'),
+    default: false,
+  });
+}
+
 export async function pickBaseBranch(branches: string[]): Promise<string> {
   const choices = branches.map((b) => ({ name: b, value: b }));
   const pageSize = Math.max(7, Math.min(30, (process.stdout.rows ?? 24) - 6));

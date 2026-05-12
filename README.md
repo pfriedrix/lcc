@@ -40,7 +40,9 @@ lcc auth
 
 ```bash
 lcc                  # pick an issue, bootstrap worktree, launch Claude
-lcc --start-task     # also run /linear-pfx-plugin:start-task in the new session
+lcc setup            # configure startTaskCommand, worktreeTemplate, activeStates
+lcc list             # list lcc-managed worktrees (use --all to include any)
+lcc remove           # interactively pick and remove a worktree (--force, --all)
 lcc auth             # log in
 lcc auth --status    # who am I, when does token expire
 lcc auth --logout    # clear token from keychain

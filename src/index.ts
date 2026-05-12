@@ -1,5 +1,7 @@
 import { Command } from 'commander';
 import { authCmd, authSetupCmd } from './commands/auth.js';
+import { listCmd } from './commands/list.js';
+import { removeCmd } from './commands/remove.js';
 import { setupCmd } from './commands/setup.js';
 import { startCmd } from './commands/start.js';
 import { log } from './ui.js';
@@ -35,6 +37,22 @@ program
   .description('Pick an active Linear issue and bootstrap a worktree + Claude session')
   .option('--all', 'show all assigned issues regardless of activeStates filter')
   .action((opts) => run(() => startCmd(opts)));
+
+program
+  .command('list')
+  .alias('ls')
+  .description('List lcc-managed worktrees in the current repo')
+  .option('--all', 'include worktrees not under .lcc/worktrees')
+  .action((opts) => run(() => listCmd(opts)));
+
+program
+  .command('remove')
+  .alias('rm')
+  .description('Pick a worktree and remove it (git worktree remove)')
+  .option('--all', 'pick from every worktree, not just lcc-managed')
+  .option('-f, --force', 'force remove even with uncommitted changes')
+  .option('-y, --yes', 'skip the confirmation prompt')
+  .action((opts) => run(() => removeCmd(opts)));
 
 function run(fn: () => Promise<unknown>): void {
   fn().catch((err: unknown) => {
