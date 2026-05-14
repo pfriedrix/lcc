@@ -41,15 +41,13 @@ program
 program
   .command('list')
   .alias('ls')
-  .description('List lcc-managed worktrees in the current repo')
-  .option('--all', 'include worktrees not under .lcc/worktrees')
-  .action((opts) => run(() => listCmd(opts)));
+  .description('List worktrees in the current repo')
+  .action(() => run(() => listCmd()));
 
 program
   .command('remove')
   .alias('rm')
   .description('Pick a worktree and remove it (git worktree remove)')
-  .option('--all', 'pick from every worktree, not just lcc-managed')
   .option('-f, --force', 'force remove even with uncommitted changes')
   .option('-y, --yes', 'skip the confirmation prompt')
   .action((opts) => run(() => removeCmd(opts)));

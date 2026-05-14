@@ -3,11 +3,7 @@ import pc from 'picocolors';
 import { listWorktrees, repoRoot } from '../git.js';
 import { log } from '../ui.js';
 
-export interface ListOpts {
-  all?: boolean;
-}
-
-export async function listCmd(opts: ListOpts): Promise<void> {
+export async function listCmd(): Promise<void> {
   const repo = await repoRoot();
   const entries = await listWorktrees(repo);
   const managedRoot = path.join(repo, '.lcc', 'worktrees');
@@ -17,15 +13,10 @@ export async function listCmd(opts: ListOpts): Promise<void> {
       ...wt,
       managed: wt.path.startsWith(managedRoot + path.sep),
     }))
-    .filter((wt) => !wt.isMain)
-    .filter((wt) => opts.all || wt.managed);
+    .filter((wt) => !wt.isMain);
 
   if (rows.length === 0) {
-    if (!opts.all && entries.some((wt) => !wt.isMain)) {
-      log.dim('No lcc-managed worktrees. Use `lcc list --all` to see every worktree.');
-    } else {
-      log.dim('No worktrees.');
-    }
+    log.dim('No worktrees.');
     return;
   }
 
