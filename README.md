@@ -42,6 +42,7 @@ lcc auth
 lcc                  # pick an issue, bootstrap worktree, launch Claude
 lcc setup            # configure startTaskCommand, worktreeTemplate, activeStates
 lcc list             # list all worktrees
+lcc open             # pick a worktree and resume Claude in it (--no-resume for fresh)
 lcc remove           # interactively pick and remove a worktree (--force)
 lcc auth             # log in
 lcc auth --status    # who am I, when does token expire
