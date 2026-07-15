@@ -46,11 +46,11 @@ program
   .action(() => run(() => listCmd()));
 
 program
-  .command('open')
+  .command('open [target]')
   .alias('o')
-  .description('Pick a worktree and resume Claude Code in it')
+  .description('Pick a worktree and open it — Claude Code (default) or Xcode (`open xcode`)')
   .option('--no-resume', 'launch Claude without --resume (fresh session)')
-  .action((opts) => run(() => openCmd(opts)));
+  .action((target, opts) => run(() => openCmd(target, opts)));
 
 program
   .command('remove')

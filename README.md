@@ -43,11 +43,14 @@ lcc                  # pick an issue, bootstrap worktree, launch Claude
 lcc setup            # configure startTaskCommand, worktreeTemplate, activeStates
 lcc list             # list all worktrees
 lcc open             # pick a worktree and resume Claude in it (--no-resume for fresh)
+lcc open xcode       # pick a worktree and open it in Xcode instead
 lcc remove           # interactively pick and remove a worktree (--force)
 lcc auth             # log in
 lcc auth --status    # who am I, when does token expire
 lcc auth --logout    # clear token from keychain
 ```
+
+`lcc open xcode` (alias `lcc o xcode`) uses the same worktree picker as `lcc open`, then launches Xcode instead of Claude. It looks for the shallowest `.xcworkspace`, `.xcodeproj`, or `Package.swift` in the worktree (workspace > project > package when several sit at the same depth) and opens it with `open -a Xcode`.
 
 ## How it works
 
