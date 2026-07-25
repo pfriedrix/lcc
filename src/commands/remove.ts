@@ -9,13 +9,21 @@ import {
   withSizes,
   type SizedDerivedData,
 } from '../derived-data.js';
-import { listWorktrees, removeWorktree, repoRoot } from '../git.js';
+import {
+  branchDisposition,
+  deleteBranch,
+  listWorktrees,
+  removeWorktree,
+  repoRoot,
+  type BranchDisposition,
+} from '../git.js';
 import { confirmForceRemove, confirmRemoveWorktree, log, pickWorktree } from '../ui.js';
 
 export interface RemoveOpts {
   force?: boolean;
   yes?: boolean;
   keepDerivedData?: boolean;
+  keepBranch?: boolean;
 }
 
 export async function removeCmd(opts: RemoveOpts): Promise<void> {
@@ -51,7 +59,10 @@ export async function removeCmd(opts: RemoveOpts): Promise<void> {
   if (derived.length > 0) log.step(`Measuring Xcode build data (${derived.length})…`);
   const sized = await withSizes(derived);
 
-  if (!opts.yes && !(await confirmRemoveWorktree(picked, sized))) {
+  const branch =
+    picked.branch && !opts.keepBranch ? await branchDisposition(repo, picked.branch) : null;
+
+  if (!opts.yes && !(await confirmRemoveWorktree(picked, sized, branch))) {
     log.dim('Aborted.');
     return;
   }
@@ -71,7 +82,36 @@ export async function removeCmd(opts: RemoveOpts): Promise<void> {
 
   log.success(`Removed worktree ${pc.cyan(picked.branch ?? picked.head.slice(0, 8))}`);
   await purge(sized, root);
-  log.dim(`Branch left intact. Delete with: git branch -D ${picked.branch ?? '<branch>'}`);
+  await disposeBranch(repo, picked.branch, branch);
+}
+
+async function disposeBranch(
+  repo: string,
+  branchName: string | null,
+  disposition: BranchDisposition | null,
+): Promise<void> {
+  if (!branchName) return; // Detached worktree — no branch to speak of.
+  if (!disposition) {
+    log.dim(`Branch left intact. Delete with: git branch -D ${branchName}`);
+    return;
+  }
+  if (!disposition.safe) {
+    const detail =
+      disposition.reason === 'default-branch'
+        ? 'is the default branch'
+        : `has ${disposition.unmerged} unmerged commit${disposition.unmerged === 1 ? '' : 's'}`;
+    log.warn(`Branch ${pc.cyan(branchName)} ${detail} — kept.`);
+    log.dim(`  Delete anyway with: git branch -D ${branchName}`);
+    return;
+  }
+  try {
+    // A gone upstream means `-d` refuses even though the work is safely merged.
+    await deleteBranch(repo, branchName, disposition.reason === 'upstream-gone');
+    log.success(`Deleted branch ${pc.cyan(branchName)}`);
+  } catch (err) {
+    log.warn(`Could not delete branch ${branchName}: ${err instanceof Error ? err.message : String(err)}`);
+    log.dim(`  Delete manually with: git branch -D ${branchName}`);
+  }
 }
 
 async function purge(sized: SizedDerivedData[], root: string): Promise<void> {

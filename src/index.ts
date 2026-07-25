@@ -56,10 +56,11 @@ program
 program
   .command('remove')
   .alias('rm')
-  .description('Pick a worktree and remove it, along with its Xcode build data')
+  .description('Pick a worktree and remove it, along with its branch and Xcode build data')
   .option('-f, --force', 'force remove even with uncommitted changes')
   .option('-y, --yes', 'skip the confirmation prompt')
   .option('--keep-derived-data', 'leave the Xcode DerivedData folder in place')
+  .option('--keep-branch', 'leave the git branch in place')
   .action((opts) => run(() => removeCmd(opts)));
 
 program
