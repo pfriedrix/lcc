@@ -1,0 +1,222 @@
+//! lcc — pick a Linear issue, get a git worktree with .env symlinks and
+//! Claude Code running.
+
+const std = @import("std");
+const Io = std.Io;
+
+const app_mod = @import("app.zig");
+const auth_cmd = @import("commands/auth.zig");
+const clean_cmd = @import("commands/clean.zig");
+const list_cmd = @import("commands/list.zig");
+const open_cmd = @import("commands/open.zig");
+const remove_cmd = @import("commands/remove.zig");
+const setup_cmd = @import("commands/setup.zig");
+const start_cmd = @import("commands/start.zig");
+const ui = @import("ui.zig");
+
+const version = "0.1.0";
+
+const usage =
+    \\Usage: lcc [command] [options]
+    \\
+    \\Pick a Linear issue → git worktree + .env symlinks + Claude Code
+    \\
+    \\Commands:
+    \\  start                    Pick an active Linear issue and bootstrap a worktree (default)
+    \\    --all                  show all assigned issues regardless of activeStates filter
+    \\  auth                     Authenticate with Linear (OAuth browser flow)
+    \\    --logout               remove stored token
+    \\    --status               show current authentication state
+    \\    --token <pat>          headless fallback: store a personal API token directly
+    \\  auth setup --client-id <id>
+    \\                           Configure OAuth client_id (one-time)
+    \\  setup                    Interactively configure lcc
+    \\  list | ls                List worktrees in the current repo
+    \\  open | o [claude|xcode]  Open a worktree — Claude Code (default) or Xcode
+    \\    --no-resume            launch Claude without --resume (fresh session)
+    \\  remove | rm              Remove a worktree, its branch, and its Xcode build data
+    \\    -f, --force            force remove even with uncommitted changes
+    \\    -y, --yes              skip the confirmation prompt
+    \\    --keep-derived-data    leave the Xcode DerivedData folder in place
+    \\    --keep-branch          leave the git branch in place
+    \\  clean                    Delete Xcode build data left by worktrees that no longer exist
+    \\    -y, --yes              delete every orphaned folder without prompting
+    \\
+    \\  -h, --help               show this help
+    \\  -V, --version            show version
+    \\
+;
+
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
+
+    ui.detectColor(io, init.environ_map);
+
+    var out_buffer: [16 * 1024]u8 = undefined;
+    var err_buffer: [4 * 1024]u8 = undefined;
+    var out_writer: Io.File.Writer = .init(.stdout(), io, &out_buffer);
+    var err_writer: Io.File.Writer = .init(.stderr(), io, &err_buffer);
+
+    const app: app_mod.App = .{
+        .gpa = arena,
+        .io = io,
+        .environ = init.environ_map,
+        .ui = .{
+            .io = io,
+            .out = &out_writer.interface,
+            .err = &err_writer.interface,
+        },
+    };
+    defer app.ui.flush();
+
+    const args = try init.minimal.args.toSlice(arena);
+    dispatch(app, args[1..]) catch |err| {
+        app.ui.fail("{s}", .{describe(err)});
+        app.ui.flush();
+        std.process.exit(1);
+    };
+}
+
+fn dispatch(app: app_mod.App, args: []const []const u8) !void {
+    if (args.len > 0) {
+        const first = args[0];
+        if (eq(first, "-h") or eq(first, "--help") or eq(first, "help")) {
+            app.ui.info("{s}", .{usage});
+            return;
+        }
+        if (eq(first, "-V") or eq(first, "--version")) {
+            app.ui.info("{s}", .{version});
+            return;
+        }
+        if (eq(first, "auth")) return authCommand(app, args[1..]);
+        if (eq(first, "setup")) return setup_cmd.run(app);
+        if (eq(first, "list") or eq(first, "ls")) return list_cmd.run(app);
+        if (eq(first, "open") or eq(first, "o")) return openCommand(app, args[1..]);
+        if (eq(first, "remove") or eq(first, "rm")) return removeCommand(app, args[1..]);
+        if (eq(first, "clean")) return cleanCommand(app, args[1..]);
+        if (eq(first, "start")) return startCommand(app, args[1..]);
+        if (!std.mem.startsWith(u8, first, "-")) return error.UnknownCommand;
+    }
+    // No command, or only flags: `start` is the default, as in commander.
+    return startCommand(app, args);
+}
+
+fn startCommand(app: app_mod.App, args: []const []const u8) !void {
+    var all = false;
+    for (args) |arg| {
+        if (eq(arg, "--all")) all = true else return error.UnknownOption;
+    }
+    return start_cmd.run(app, all);
+}
+
+fn authCommand(app: app_mod.App, args: []const []const u8) !void {
+    if (args.len > 0 and eq(args[0], "setup")) {
+        var client_id: ?[]const u8 = null;
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            if (eq(args[i], "--client-id")) {
+                i += 1;
+                if (i >= args.len) return error.MissingOptionValue;
+                client_id = args[i];
+            } else return error.UnknownOption;
+        }
+        return auth_cmd.setup(app, client_id orelse return error.MissingClientId);
+    }
+
+    var opts: auth_cmd.Opts = .{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (eq(args[i], "--logout")) {
+            opts.logout = true;
+        } else if (eq(args[i], "--status")) {
+            opts.status = true;
+        } else if (eq(args[i], "--token")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.token = args[i];
+        } else return error.UnknownOption;
+    }
+    return auth_cmd.run(app, opts);
+}
+
+fn openCommand(app: app_mod.App, args: []const []const u8) !void {
+    var target_arg: ?[]const u8 = null;
+    var no_resume = false;
+    for (args) |arg| {
+        if (eq(arg, "--no-resume")) {
+            no_resume = true;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return error.UnknownOption;
+        } else if (target_arg == null) {
+            target_arg = arg;
+        } else return error.TooManyArguments;
+    }
+
+    const target = open_cmd.resolveTarget(target_arg) orelse {
+        app.ui.fail("Unknown open target '{s}'. Use one of: claude, xcode.", .{target_arg.?});
+        std.process.exit(1);
+    };
+    return open_cmd.run(app, target, no_resume);
+}
+
+fn removeCommand(app: app_mod.App, args: []const []const u8) !void {
+    var opts: remove_cmd.Opts = .{};
+    for (args) |arg| {
+        if (eq(arg, "-f") or eq(arg, "--force")) {
+            opts.force = true;
+        } else if (eq(arg, "-y") or eq(arg, "--yes")) {
+            opts.yes = true;
+        } else if (eq(arg, "--keep-derived-data")) {
+            opts.keep_derived_data = true;
+        } else if (eq(arg, "--keep-branch")) {
+            opts.keep_branch = true;
+        } else return error.UnknownOption;
+    }
+    return remove_cmd.run(app, opts);
+}
+
+fn cleanCommand(app: app_mod.App, args: []const []const u8) !void {
+    var yes = false;
+    for (args) |arg| {
+        if (eq(arg, "-y") or eq(arg, "--yes")) yes = true else return error.UnknownOption;
+    }
+    return clean_cmd.run(app, yes);
+}
+
+fn eq(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
+test {
+    // Zig only collects tests from files the root references during test
+    // analysis, so name every module here or `zig build test` runs nothing.
+    _ = @import("app.zig");
+    _ = @import("claude.zig");
+    _ = @import("config.zig");
+    _ = @import("derived_data.zig");
+    _ = @import("env.zig");
+    _ = @import("exec.zig");
+    _ = @import("git.zig");
+    _ = @import("keychain.zig");
+    _ = @import("linear.zig");
+    _ = @import("oauth.zig");
+    _ = @import("prompt.zig");
+    _ = @import("ui.zig");
+    _ = @import("xcode.zig");
+}
+
+fn describe(err: anyerror) []const u8 {
+    return switch (err) {
+        error.NotAGitRepository => "Not inside a git repository. Run `lcc` from within your repo.",
+        error.ClaudeNotFound => "Could not find `claude` on PATH. Install Claude Code: https://docs.claude.com/en/docs/claude-code",
+        error.NotATerminal => "lcc needs an interactive terminal for this command.",
+        error.UnknownCommand => "Unknown command. Run `lcc --help`.",
+        error.UnknownOption => "Unknown option. Run `lcc --help`.",
+        error.MissingOptionValue => "Missing value for option. Run `lcc --help`.",
+        error.MissingClientId => "auth setup requires --client-id <id>.",
+        error.TooManyArguments => "Too many arguments. Run `lcc --help`.",
+        error.NoHomeDirectory => "HOME is not set.",
+        else => @errorName(err),
+    };
+}

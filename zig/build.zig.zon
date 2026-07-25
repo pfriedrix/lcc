@@ -1,0 +1,12 @@
+.{
+    .name = .lcc_spike,
+    .version = "0.0.0",
+    .fingerprint = 0x6c26c08b0d4b7e8c,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

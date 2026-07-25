@@ -1,0 +1,244 @@
+//! Xcode DerivedData: locating it, matching folders to worktrees, and
+//! reclaiming the ones whose project is gone.
+
+const std = @import("std");
+const Io = std.Io;
+const exec = @import("exec.zig");
+
+pub const Entry = struct {
+    /// Absolute path of the folder, e.g. `.../DerivedData/MyApp-abcdef…`.
+    path: []const u8,
+    /// Folder name — the same string Xcode shows in its build locations.
+    name: []const u8,
+    /// Project or workspace this folder was built for, from `info.plist`.
+    workspace_path: []const u8,
+};
+
+pub const Sized = struct {
+    entry: Entry,
+    /// Disk usage in bytes.
+    size: u64,
+};
+
+pub const Error = error{RefusingToDelete} || std.mem.Allocator.Error;
+
+/// Where Xcode keeps DerivedData. Honours a custom *absolute* location from Xcode's
+/// preferences; a relative one ("Relative to Workspace") lives inside the project and
+/// is already removed along with the worktree, so the default root still applies.
+/// `LCC_DERIVED_DATA` overrides both.
+pub fn root(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+) ![]const u8 {
+    const home = environ.get("HOME") orelse return error.NoHomeDirectory;
+
+    if (environ.get("LCC_DERIVED_DATA")) |raw| {
+        const override = std.mem.trim(u8, raw, " \t");
+        if (override.len > 0) {
+            if (std.mem.eql(u8, override, "~")) return home;
+            if (std.mem.startsWith(u8, override, "~/")) {
+                return std.fs.path.join(gpa, &.{ home, override[2..] });
+            }
+            return gpa.dupe(u8, override);
+        }
+    }
+
+    if (exec.capture(gpa, io, &.{
+        "defaults", "read", "com.apple.dt.Xcode", "IDECustomDerivedDataLocation",
+    }, null)) |custom| {
+        if (custom.len > 0 and std.fs.path.isAbsolute(custom)) return custom;
+    } else |_| {
+        // Key unset — Xcode is using the default location.
+    }
+
+    return std.fs.path.join(gpa, &.{ home, "Library", "Developer", "Xcode", "DerivedData" });
+}
+
+/// Every per-project folder under `dir_path`. Xcode's own shared caches
+/// (`ModuleCache.noindex`, `SDKStatCaches.noindex`, …) carry no `info.plist` and are
+/// skipped — they belong to no project and must never be treated as removable.
+pub fn list(gpa: std.mem.Allocator, io: Io, dir_path: []const u8) ![]Entry {
+    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return &.{};
+    defer dir.close(io);
+
+    var entries: std.ArrayList(Entry) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |dirent| {
+        if (dirent.kind != .directory or std.mem.startsWith(u8, dirent.name, ".")) continue;
+        const name = try gpa.dupe(u8, dirent.name);
+        const full = try std.fs.path.join(gpa, &.{ dir_path, name });
+        const workspace = (try readWorkspacePath(gpa, io, full)) orelse continue;
+        try entries.append(gpa, .{ .path = full, .name = name, .workspace_path = workspace });
+    }
+    return entries.toOwnedSlice(gpa);
+}
+
+fn readWorkspacePath(gpa: std.mem.Allocator, io: Io, dir_path: []const u8) !?[]const u8 {
+    const plist = try std.fs.path.join(gpa, &.{ dir_path, "info.plist" });
+    const raw = Io.Dir.cwd().readFileAlloc(io, plist, gpa, .limited(1 << 20)) catch return null;
+
+    if (try matchWorkspacePath(gpa, raw)) |value| return value;
+
+    // Some Xcode versions write a binary plist — convert before matching.
+    const converted = exec.capture(gpa, io, &.{
+        "plutil", "-convert", "xml1", "-o", "-", plist,
+    }, null) catch return null;
+    return matchWorkspacePath(gpa, converted);
+}
+
+/// Pulls `<key>WorkspacePath</key><string>…</string>` out of the plist XML.
+fn matchWorkspacePath(gpa: std.mem.Allocator, xml: []const u8) !?[]const u8 {
+    const key = "<key>WorkspacePath</key>";
+    const key_at = std.mem.indexOf(u8, xml, key) orelse return null;
+    const after = xml[key_at + key.len ..];
+
+    const open_at = std.mem.indexOf(u8, after, "<string>") orelse return null;
+    // Only whitespace may sit between the key and its value.
+    for (after[0..open_at]) |c| {
+        if (!std.ascii.isWhitespace(c)) return null;
+    }
+    const value_start = open_at + "<string>".len;
+    const close_at = std.mem.indexOfPos(u8, after, value_start, "</string>") orelse return null;
+
+    const value = std.mem.trim(u8, after[value_start..close_at], " \t\r\n");
+    if (value.len == 0) return null;
+    return try decodeEntities(gpa, value);
+}
+
+fn decodeEntities(gpa: std.mem.Allocator, value: []const u8) ![]const u8 {
+    const replacements = [_][2][]const u8{
+        .{ "&lt;", "<" },
+        .{ "&gt;", ">" },
+        .{ "&quot;", "\"" },
+        .{ "&apos;", "'" },
+        .{ "&amp;", "&" },
+    };
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    outer: while (i < value.len) {
+        if (value[i] == '&') {
+            for (replacements) |pair| {
+                if (std.mem.startsWith(u8, value[i..], pair[0])) {
+                    try out.appendSlice(gpa, pair[1]);
+                    i += pair[0].len;
+                    continue :outer;
+                }
+            }
+        }
+        try out.append(gpa, value[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Folders whose project lives inside `worktree_path`. A worktree can own more than
+/// one (an `.xcodeproj` and a `Package.swift`, say), so all matches come back.
+pub fn forWorktree(
+    gpa: std.mem.Allocator,
+    io: Io,
+    entries: []const Entry,
+    worktree_path: []const u8,
+) ![]Entry {
+    // Xcode records the resolved path; `git worktree list` does not resolve symlinks.
+    const resolved = realPath(gpa, io, worktree_path);
+
+    var matched: std.ArrayList(Entry) = .empty;
+    for (entries) |entry| {
+        if (try isInside(gpa, resolved, entry.workspace_path)) try matched.append(gpa, entry);
+    }
+    return matched.toOwnedSlice(gpa);
+}
+
+/// Entries whose project is gone from disk — the worktree was removed long ago.
+pub fn orphans(gpa: std.mem.Allocator, io: Io, entries: []const Entry) ![]Entry {
+    var dead: std.ArrayList(Entry) = .empty;
+    for (entries) |entry| {
+        Io.Dir.cwd().access(io, entry.workspace_path, .{}) catch {
+            try dead.append(gpa, entry);
+            continue;
+        };
+    }
+    return dead.toOwnedSlice(gpa);
+}
+
+/// Attaches disk usage to each entry. One `du` covers every folder — walking
+/// millions of build artifacts in-process is far slower, and one child process
+/// beats the eight the TypeScript version ran concurrently.
+pub fn withSizes(gpa: std.mem.Allocator, io: Io, entries: []const Entry) ![]Sized {
+    const sized = try gpa.alloc(Sized, entries.len);
+    for (entries, 0..) |entry, i| sized[i] = .{ .entry = entry, .size = 0 };
+    if (entries.len == 0) return sized;
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(gpa, &.{ "du", "-sk" });
+    for (entries) |entry| try argv.append(gpa, entry.path);
+
+    // `du` exits non-zero on unreadable subdirectories but still prints totals.
+    const out = exec.run(gpa, io, argv.items, null) catch return sized;
+    defer out.deinit(gpa);
+
+    var lines = std.mem.splitScalar(u8, out.stdout, '\n');
+    while (lines.next()) |line| {
+        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+        const kb = std.fmt.parseInt(u64, std.mem.trim(u8, line[0..tab], " "), 10) catch continue;
+        const path = std.mem.trim(u8, line[tab + 1 ..], " \r");
+        for (sized) |*s| {
+            if (std.mem.eql(u8, s.entry.path, path)) {
+                s.size = kb * 1024;
+                break;
+            }
+        }
+    }
+    return sized;
+}
+
+/// Delete one DerivedData folder. Refuses anything that is not a direct child of
+/// `dir_path`, so the root itself and Xcode's shared caches can never be hit.
+pub fn remove(gpa: std.mem.Allocator, io: Io, entry: Entry, dir_path: []const u8) !void {
+    _ = gpa;
+    const parent = std.fs.path.dirname(entry.path) orelse return Error.RefusingToDelete;
+    const trimmed_root = std.mem.trimEnd(u8, dir_path, "/");
+    if (!std.mem.eql(u8, parent, trimmed_root) or entry.name.len == 0) {
+        return Error.RefusingToDelete;
+    }
+    try Io.Dir.cwd().deleteTree(io, entry.path);
+}
+
+fn realPath(gpa: std.mem.Allocator, io: Io, target: []const u8) []const u8 {
+    return Io.Dir.cwd().realPathFileAlloc(io, target, gpa) catch target;
+}
+
+fn isInside(gpa: std.mem.Allocator, parent: []const u8, child: []const u8) !bool {
+    const rel = std.fs.path.relativePosix(gpa, parent, parent, child) catch return false;
+    return rel.len != 0 and !std.mem.startsWith(u8, rel, "..") and !std.fs.path.isAbsolute(rel);
+}
+
+pub fn totalSize(entries: []const Sized) u64 {
+    var total: u64 = 0;
+    for (entries) |e| total += e.size;
+    return total;
+}
+
+pub fn sizeDesc(_: void, a: Sized, b: Sized) bool {
+    return a.size > b.size;
+}
+
+test "workspace path is pulled out of plist xml" {
+    const gpa = std.testing.allocator;
+    const xml =
+        \\<plist><dict>
+        \\<key>WorkspacePath</key>
+        \\<string>/Users/me/Projects/App &amp; Co/App.xcodeproj</string>
+        \\</dict></plist>
+    ;
+    const got = (try matchWorkspacePath(gpa, xml)).?;
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("/Users/me/Projects/App & Co/App.xcodeproj", got);
+}
+
+test "unrelated key is not mistaken for the workspace path" {
+    const gpa = std.testing.allocator;
+    const xml = "<key>Other</key><string>/nope</string>";
+    try std.testing.expect((try matchWorkspacePath(gpa, xml)) == null);
+}

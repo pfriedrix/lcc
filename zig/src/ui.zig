@@ -1,0 +1,189 @@
+//! Terminal output — the `picocolors` replacement plus lcc's log prefixes.
+
+const std = @import("std");
+const Io = std.Io;
+
+var color_enabled: bool = true;
+
+/// Honours `NO_COLOR` and a non-tty stdout, like picocolors does.
+pub fn detectColor(io: Io, environ: *const std.process.Environ.Map) void {
+    if (environ.get("NO_COLOR")) |v| {
+        if (v.len > 0) {
+            color_enabled = false;
+            return;
+        }
+    }
+    color_enabled = Io.File.stdout().isTty(io) catch false;
+}
+
+pub fn setColor(on: bool) void {
+    color_enabled = on;
+}
+
+pub fn colorEnabled() bool {
+    return color_enabled;
+}
+
+/// Escape sequences for code that builds its own frames (the prompts), so they
+/// honour `NO_COLOR` and non-tty output like everything else.
+pub const Palette = struct {
+    reset: []const u8,
+    bold: []const u8,
+    dim: []const u8,
+    green: []const u8,
+    cyan: []const u8,
+};
+
+pub fn palette() Palette {
+    if (!color_enabled) return .{ .reset = "", .bold = "", .dim = "", .green = "", .cyan = "" };
+    return .{
+        .reset = Code.reset,
+        .bold = Code.bold,
+        .dim = Code.dim,
+        .green = Code.green,
+        .cyan = Code.cyan,
+    };
+}
+
+const Code = struct {
+    const reset = "\x1b[0m";
+    const bold = "\x1b[1m";
+    const dim = "\x1b[2m";
+    const red = "\x1b[31m";
+    const green = "\x1b[32m";
+    const yellow = "\x1b[33m";
+    const cyan = "\x1b[36m";
+};
+
+/// A string plus the escape it should be wrapped in. Rendered with `{f}`, so
+/// nothing is allocated and disabling colour is a single branch at write time.
+pub const Painted = struct {
+    code: []const u8,
+    text: []const u8,
+
+    pub fn format(self: Painted, w: *Io.Writer) Io.Writer.Error!void {
+        // Empty text writes nothing at all, so callers can pass conditional
+        // fragments without emitting stray escape sequences.
+        if (self.text.len == 0) return;
+        if (!color_enabled) return w.writeAll(self.text);
+        try w.writeAll(self.code);
+        try w.writeAll(self.text);
+        try w.writeAll(Code.reset);
+    }
+};
+
+pub fn bold(text: []const u8) Painted {
+    return .{ .code = Code.bold, .text = text };
+}
+pub fn dim(text: []const u8) Painted {
+    return .{ .code = Code.dim, .text = text };
+}
+pub fn red(text: []const u8) Painted {
+    return .{ .code = Code.red, .text = text };
+}
+pub fn green(text: []const u8) Painted {
+    return .{ .code = Code.green, .text = text };
+}
+pub fn yellow(text: []const u8) Painted {
+    return .{ .code = Code.yellow, .text = text };
+}
+pub fn cyan(text: []const u8) Painted {
+    return .{ .code = Code.cyan, .text = text };
+}
+
+/// Buffered stdout/stderr with lcc's log vocabulary. Writes are best-effort:
+/// a CLI that fails because its own logging failed is worse than a lost line.
+pub const Ui = struct {
+    io: Io,
+    out: *Io.Writer,
+    err: *Io.Writer,
+
+    pub fn info(self: Ui, comptime fmt: []const u8, args: anytype) void {
+        self.out.print(fmt ++ "\n", args) catch {};
+    }
+
+    pub fn success(self: Ui, comptime fmt: []const u8, args: anytype) void {
+        self.out.print("{f} " ++ fmt ++ "\n", .{green("✓")} ++ args) catch {};
+    }
+
+    pub fn warn(self: Ui, comptime fmt: []const u8, args: anytype) void {
+        self.out.print("{f} " ++ fmt ++ "\n", .{yellow("!")} ++ args) catch {};
+    }
+
+    pub fn step(self: Ui, comptime fmt: []const u8, args: anytype) void {
+        self.out.print("{f} " ++ fmt ++ "\n", .{cyan("›")} ++ args) catch {};
+    }
+
+    pub fn hint(self: Ui, comptime fmt: []const u8, args: anytype) void {
+        // `log.dim` in the TypeScript version.
+        if (color_enabled) self.out.writeAll(Code.dim) catch {};
+        self.out.print(fmt, args) catch {};
+        if (color_enabled) self.out.writeAll(Code.reset) catch {};
+        self.out.writeAll("\n") catch {};
+    }
+
+    pub fn fail(self: Ui, comptime fmt: []const u8, args: anytype) void {
+        self.flush();
+        self.err.print("{f} " ++ fmt ++ "\n", .{red("✗")} ++ args) catch {};
+        self.err.flush() catch {};
+    }
+
+    pub fn flush(self: Ui) void {
+        self.out.flush() catch {};
+    }
+};
+
+/// Pads `text` to `width` *display* columns, counting codepoints rather than
+/// bytes so non-ASCII issue titles do not shift the columns.
+pub const Padded = struct {
+    text: []const u8,
+    width: usize,
+
+    pub fn format(self: Padded, w: *Io.Writer) Io.Writer.Error!void {
+        try w.writeAll(self.text);
+        const len = displayWidth(self.text);
+        if (len < self.width) try w.splatByteAll(' ', self.width - len);
+    }
+};
+
+pub fn pad(text: []const u8, width: usize) Padded {
+    return .{ .text = text, .width = width };
+}
+
+/// Codepoint count — close enough to display width for the Latin/Cyrillic text
+/// that shows up in Linear titles and branch names.
+pub fn displayWidth(text: []const u8) usize {
+    var cols: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        i += @min(len, text.len - i);
+        cols += 1;
+    }
+    return cols;
+}
+
+/// Human-readable byte count, matching `formatBytes` in derived-data.ts.
+pub const Bytes = struct {
+    value: u64,
+
+    pub fn format(self: Bytes, w: *Io.Writer) Io.Writer.Error!void {
+        if (self.value < 1024) return w.print("{d} B", .{self.value});
+        const units = [_][]const u8{ "KB", "MB", "GB", "TB" };
+        var v: f64 = @as(f64, @floatFromInt(self.value)) / 1024.0;
+        var unit: usize = 0;
+        while (v >= 1024 and unit < units.len - 1) {
+            v /= 1024;
+            unit += 1;
+        }
+        if (v < 10) {
+            try w.print("{d:.1} {s}", .{ v, units[unit] });
+        } else {
+            try w.print("{d:.0} {s}", .{ v, units[unit] });
+        }
+    }
+};
+
+pub fn bytes(value: u64) Bytes {
+    return .{ .value = value };
+}
