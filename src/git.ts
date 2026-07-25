@@ -197,6 +197,78 @@ export async function listWorktrees(repo: string): Promise<WorktreeEntry[]> {
   return entries;
 }
 
+export interface BranchDisposition {
+  branch: string;
+  /** True when the commits survive elsewhere, so deleting the branch loses nothing. */
+  safe: boolean;
+  /** Commits on the branch that the default branch does not have. */
+  unmerged: number;
+  reason: 'merged' | 'upstream-gone' | 'unmerged' | 'default-branch';
+}
+
+/**
+ * Decide whether a branch can be deleted along with its worktree.
+ *
+ * Being an ancestor of the default branch is the plain case. A *gone* upstream is
+ * the other one: the branch was pushed and the remote branch has since been
+ * deleted, which is what a squash-merged PR looks like locally — the commits are
+ * in the default branch under different SHAs, so ancestry can never prove it.
+ */
+export async function branchDisposition(repo: string, branch: string): Promise<BranchDisposition> {
+  const base = await defaultBranch(repo);
+  if (branch === base) return { branch, safe: false, unmerged: 0, reason: 'default-branch' };
+
+  for (const ref of [base, `origin/${base}`]) {
+    if (await isAncestor(repo, branch, ref)) {
+      return { branch, safe: true, unmerged: 0, reason: 'merged' };
+    }
+  }
+  const unmerged = await countUnmerged(repo, branch, base);
+  if (await upstreamGone(repo, branch)) {
+    return { branch, safe: true, unmerged, reason: 'upstream-gone' };
+  }
+  return { branch, safe: false, unmerged, reason: 'unmerged' };
+}
+
+export async function deleteBranch(repo: string, branch: string, force = false): Promise<void> {
+  await execa('git', ['branch', force ? '-D' : '-d', branch], { cwd: repo });
+}
+
+async function isAncestor(repo: string, branch: string, ref: string): Promise<boolean> {
+  try {
+    await execa('git', ['merge-base', '--is-ancestor', branch, ref], { cwd: repo });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function upstreamGone(repo: string, branch: string): Promise<boolean> {
+  try {
+    const { stdout } = await execa(
+      'git',
+      ['for-each-ref', '--format=%(upstream:track)', `refs/heads/${branch}`],
+      { cwd: repo },
+    );
+    return stdout.trim() === '[gone]';
+  } catch {
+    return false;
+  }
+}
+
+async function countUnmerged(repo: string, branch: string, base: string): Promise<number> {
+  for (const ref of [`origin/${base}`, base]) {
+    try {
+      const { stdout } = await execa('git', ['rev-list', '--count', `${ref}..${branch}`], { cwd: repo });
+      const count = Number.parseInt(stdout.trim(), 10);
+      if (Number.isFinite(count)) return count;
+    } catch {
+      // Ref does not exist here — try the next one.
+    }
+  }
+  return 0;
+}
+
 export async function removeWorktree(repo: string, worktreePath: string, force = false): Promise<void> {
   const args = ['worktree', 'remove'];
   if (force) args.push('--force');

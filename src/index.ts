@@ -1,5 +1,6 @@
 import { Command } from 'commander';
 import { authCmd, authSetupCmd } from './commands/auth.js';
+import { cleanCmd } from './commands/clean.js';
 import { listCmd } from './commands/list.js';
 import { openCmd } from './commands/open.js';
 import { removeCmd } from './commands/remove.js';
@@ -55,10 +56,18 @@ program
 program
   .command('remove')
   .alias('rm')
-  .description('Pick a worktree and remove it (git worktree remove)')
+  .description('Pick a worktree and remove it, along with its branch and Xcode build data')
   .option('-f, --force', 'force remove even with uncommitted changes')
   .option('-y, --yes', 'skip the confirmation prompt')
+  .option('--keep-derived-data', 'leave the Xcode DerivedData folder in place')
+  .option('--keep-branch', 'leave the git branch in place')
   .action((opts) => run(() => removeCmd(opts)));
+
+program
+  .command('clean')
+  .description('Delete Xcode build data left behind by worktrees that no longer exist')
+  .option('-y, --yes', 'delete every orphaned folder without prompting')
+  .action((opts) => run(() => cleanCmd(opts)));
 
 function run(fn: () => Promise<unknown>): void {
   fn().catch((err: unknown) => {
