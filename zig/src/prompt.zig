@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const fold = @import("fold.zig");
 const ui = @import("ui.zig");
 
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
@@ -149,12 +150,87 @@ fn truncate(s: []const u8, max_cols: usize) []const u8 {
     return s;
 }
 
-fn matches(haystack: []const u8, query: []const u8) bool {
+/// Every whitespace-separated token must appear, as in the TypeScript version.
+/// The score then orders the survivors: a token landing at the very start of
+/// the haystack (the issue identifier) outranks one starting a word, which
+/// outranks one buried mid-word.
+fn score(haystack: []const u8, query: []const u8) ?i32 {
+    var total: i32 = 0;
     var tokens = std.mem.tokenizeAny(u8, query, " \t");
     while (tokens.next()) |token| {
-        if (std.ascii.indexOfIgnoreCase(haystack, token) == null) return false;
+        const at = fold.indexOf(haystack, token) orelse return null;
+        total += if (at == 0)
+            100
+        else if (startsWord(haystack, at))
+            50
+        else
+            10;
     }
-    return true;
+    return total;
+}
+
+/// True when the byte before `at` is a separator rather than part of a word.
+fn startsWord(haystack: []const u8, at: usize) bool {
+    if (at == 0) return true;
+    return switch (haystack[at - 1]) {
+        ' ', '\t', '-', '_', '/', '.', ',', ':', ';', '(', ')', '[', ']', '"', '\'' => true,
+        else => false,
+    };
+}
+
+const Ranked = struct {
+    index: usize,
+    score: i32,
+
+    /// Best score first; ties keep the order the caller supplied, which is the
+    /// state-then-recency ordering the issue list arrives in.
+    fn better(_: void, a: Ranked, b: Ranked) bool {
+        if (a.score != b.score) return a.score > b.score;
+        return a.index < b.index;
+    }
+};
+
+test "every token must match" {
+    const hay = "PE-247 Fix EXC_BAD_ACCESS data race feature/pe-247 Todo";
+    try std.testing.expect(score(hay, "fix race") != null);
+    try std.testing.expect(score(hay, "fix nonsense") == null);
+    // An empty query keeps everything, at a neutral score.
+    try std.testing.expectEqual(@as(?i32, 0), score(hay, ""));
+}
+
+test "cyrillic query matches an uppercase title" {
+    const hay = "PE-300 ВИПРАВИТИ ПАДІННЯ КАРТИ feature/pe-300 Todo";
+    try std.testing.expect(score(hay, "виправити") != null);
+    try std.testing.expect(score(hay, "ПАДІННЯ") != null);
+    try std.testing.expect(score(hay, "карти падіння") != null);
+}
+
+test "identifier beats word start beats mid-word" {
+    const identifier = "PE-247 Fix a thing";
+    const word_start = "PE-100 Something pe-ish here";
+    const mid_word = "PE-100 Nope typewriter";
+
+    // Leading match on the identifier.
+    try std.testing.expectEqual(@as(?i32, 100), score(identifier, "PE-247"));
+    // "pe-ish" starts a word.
+    try std.testing.expectEqual(@as(?i32, 50), score(word_start, "pe-i"));
+    // "pe" inside "typewriter" is buried.
+    try std.testing.expectEqual(@as(?i32, 10), score(mid_word, "pew"));
+}
+
+test "ranking puts the identifier match first and is stable otherwise" {
+    var items = [_]Ranked{
+        .{ .index = 0, .score = 10 },
+        .{ .index = 1, .score = 100 },
+        .{ .index = 2, .score = 10 },
+        .{ .index = 3, .score = 50 },
+    };
+    std.mem.sort(Ranked, &items, {}, Ranked.better);
+    try std.testing.expectEqual(@as(usize, 1), items[0].index);
+    try std.testing.expectEqual(@as(usize, 3), items[1].index);
+    // Equal scores keep their original relative order.
+    try std.testing.expectEqual(@as(usize, 0), items[2].index);
+    try std.testing.expectEqual(@as(usize, 2), items[3].index);
 }
 
 /// Drops one whole codepoint from the end of a growable buffer.
@@ -206,6 +282,7 @@ pub fn search(
 
     var query: std.ArrayList(u8) = .empty;
     var filtered: std.ArrayList(usize) = .empty;
+    var ranked: std.ArrayList(Ranked) = .empty;
     for (items, 0..) |_, i| try filtered.append(gpa, i);
 
     var cursor: usize = 0;
@@ -288,10 +365,16 @@ pub fn search(
         }
 
         if (refilter) {
-            filtered.clearRetainingCapacity();
+            ranked.clearRetainingCapacity();
             for (items, 0..) |item, i| {
-                if (matches(item.haystack, query.items)) try filtered.append(gpa, i);
+                if (score(item.haystack, query.items)) |s| {
+                    try ranked.append(gpa, .{ .index = i, .score = s });
+                }
             }
+            std.mem.sort(Ranked, ranked.items, {}, Ranked.better);
+
+            filtered.clearRetainingCapacity();
+            for (ranked.items) |entry| try filtered.append(gpa, entry.index);
             cursor = 0;
             offset = 0;
         }

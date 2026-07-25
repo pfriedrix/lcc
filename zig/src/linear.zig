@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const fold = @import("fold.zig");
 const oauth = @import("oauth.zig");
 
 pub const endpoint = "https://api.linear.app/graphql";
@@ -183,7 +184,7 @@ const SortContext = struct {
 
     fn stateRank(self: SortContext, name: []const u8) usize {
         for (self.order, 0..) |candidate, i| {
-            if (std.ascii.eqlIgnoreCase(candidate, name)) return i;
+            if (fold.eql(candidate, name)) return i;
         }
         return 99;
     }
@@ -216,7 +217,7 @@ pub fn fetchActiveIssues(
         var wanted = include_all;
         if (!wanted) {
             for (active_states) |candidate| {
-                if (std.ascii.eqlIgnoreCase(candidate, state_name)) {
+                if (fold.eql(candidate, state_name)) {
                     wanted = true;
                     break;
                 }

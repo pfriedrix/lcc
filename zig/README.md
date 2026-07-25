@@ -32,6 +32,7 @@ ln -sf "$PWD/zig-out/bin/lcc" /opt/homebrew/bin/lcc
 | `execa` | `exec.zig` — `std.process.run` / `spawn` |
 | `commander` | argv parsing in `main.zig` |
 | `picocolors` | `ui.zig` — ANSI escapes, honours `NO_COLOR` and non-tty |
+| `String.toLowerCase()` | `fold.zig` — case folding for ASCII, Latin-1, Cyrillic |
 | `open` | `open(1)` via `exec.zig` |
 
 `@cImport` deliberately pulls in five narrow CoreFoundation/Security headers
@@ -50,9 +51,12 @@ non-pointer `uuid_t`.
 - **Picker rows are plain text.** The prompt pads and truncates labels by
   codepoint, which ANSI escapes inside a row would break. `lcc list`, which does
   not go through the picker, keeps its colours.
-- **Search filtering is ASCII case-insensitive.** JavaScript's `toLowerCase()`
-  folded Cyrillic too, so a lowercase Ukrainian query no longer matches an
-  uppercase title.
+- **Picker results are ranked, not left in list order.** Every whitespace-
+  separated token still has to match, as before, but survivors are ordered by
+  where they matched: start of the haystack (the issue identifier) beats the
+  start of a word beats mid-word. Equal scores keep the incoming
+  state-then-recency order. Typing `log` now surfaces `logout()` and
+  `logAllValues()` above issues that merely happen to sit in `Backlog`.
 - **Sizing runs one `du -sk` over every folder** instead of eight concurrent
   `du` processes.
 - **Personal API tokens go in the `Authorization` header raw**, matching the

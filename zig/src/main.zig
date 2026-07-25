@@ -197,6 +197,7 @@ test {
     _ = @import("derived_data.zig");
     _ = @import("env.zig");
     _ = @import("exec.zig");
+    _ = @import("fold.zig");
     _ = @import("git.zig");
     _ = @import("keychain.zig");
     _ = @import("linear.zig");
