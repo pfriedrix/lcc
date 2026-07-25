@@ -1,7 +1,7 @@
 # lcc
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen.svg)](#install)
+[![Zig](https://img.shields.io/badge/zig-0.16-orange.svg)](#build)
 
 One command to go from "I should work on PE-N" to a clean git worktree with `.env` symlinks and Claude Code already running.
 
@@ -10,22 +10,33 @@ $ lcc
   PE-42   H   In Progress   Migrate notification scheduler off Redis
   PE-51       Todo          Add Liquid Glass to settings sheet
 > PE-47   M   Todo          Backfill missing receipt categories
-  ...
+  feature/pe-47-backfill-receipts — https://linear.app/…/PE-47/…
+  3/165 · ↑↓ move · enter select · esc cancel
 ✓ Worktree created: /Users/me/Documents/Projects/Pantry/.lcc/worktrees/PE-47-backfill-receipts
 ✓ Linked .env
 ✓ Linked .env.local
 [claude opens in worktree]
 ```
 
-## Install
+A single ~1.5 MB binary with no runtime. It shells out to `git`, `claude`, `open`, `du`, `defaults` and `plutil` — everything else is the Zig standard library plus macOS's own Security framework.
+
+## Build
+
+Requires [Zig 0.16](https://ziglang.org/download/) and macOS.
 
 ```bash
-git clone <this repo> ~/Documents/Projects/lcc
+git clone https://github.com/pfriedrix/lcc ~/Documents/Projects/lcc
 cd ~/Documents/Projects/lcc
-npm install
-npm run build
-npm link    # makes `lcc` available globally
+zig build -Doptimize=ReleaseFast
+ln -sf "$PWD/zig-out/bin/lcc" /opt/homebrew/bin/lcc
 ```
+
+```bash
+zig build test           # unit tests
+zig build run -- list    # run without installing
+```
+
+Editing anything under `src/` changes nothing on your `PATH` until you re-run `zig build -Doptimize=ReleaseFast`. A plain `zig build` installs a debug binary to the same path — slower, and noisier on unexpected errors.
 
 ## Authenticate
 
@@ -34,12 +45,15 @@ lcc auth
 # Browser opens → click Authorize → done.
 ```
 
-`lcc` uses OAuth 2.0 with PKCE — like `gh auth login`. No API keys pasted into the terminal, no shell history secrets. The OAuth token is stored in your OS keychain (macOS Keychain / Windows Credential Manager / libsecret) and refreshed automatically when it expires.
+`lcc` uses OAuth 2.0 with PKCE — like `gh auth login`. No API keys pasted into the terminal, no shell history secrets. The token is stored in the macOS Keychain and refreshed automatically when it expires. The callback listener gives up after five minutes if you never finish in the browser.
+
+For headless machines, `lcc auth --token <pat>` stores a Linear personal API token instead.
 
 ## Usage
 
 ```bash
 lcc                  # pick an issue, bootstrap worktree, launch Claude
+lcc --all            # ignore the activeStates filter
 lcc setup            # configure startTaskCommand, worktreeTemplate, activeStates
 lcc list             # list all worktrees
 lcc open             # pick a worktree and resume Claude in it (--no-resume for fresh)
@@ -47,109 +61,85 @@ lcc open xcode       # pick a worktree and open it in Xcode instead
 lcc remove           # pick a worktree, remove it + its branch + Xcode build data
 lcc clean            # reclaim build data left by worktrees that no longer exist
 lcc auth             # log in
-lcc auth --status    # who am I, when does token expire
-lcc auth --logout    # clear token from keychain
+lcc auth --status    # who am I, when does the token expire
+lcc auth --logout    # clear the token from the Keychain
 ```
 
-`lcc open xcode` (alias `lcc o xcode`) uses the same worktree picker as `lcc open`, then launches Xcode instead of Claude. It looks for the shallowest `.xcworkspace`, `.xcodeproj`, or `Package.swift` in the worktree (workspace > project > package when several sit at the same depth) and opens it with `open -a Xcode`.
+`ls`, `o` and `rm` are accepted as aliases for `list`, `open` and `remove`.
+
+### Picking
+
+Type to filter. Every whitespace-separated word has to appear somewhere in the row — identifier, title, branch, state, assignee or team — and matching is case-insensitive across Latin and Cyrillic alike.
+
+Results are ordered by *where* the match landed: the start of the identifier ranks above the start of a word, which ranks above something buried mid-word. Typing `log` therefore surfaces `logout()` and `logAllValues()` ahead of issues that merely sit in `Backlog`. Rows scoring the same keep their original order — your `activeStates` order first, most recently updated first within each state.
+
+`↑`/`↓` move, `enter` selects, `esc` or `Ctrl-C` cancels with exit code 130.
+
+### `lcc open xcode`
+
+Uses the same worktree picker, then launches Xcode instead of Claude. It looks for the shallowest `.xcworkspace`, `.xcodeproj`, or `Package.swift` in the worktree (workspace > project > package when several sit at the same depth) and opens it with `open -a Xcode`.
 
 ## Branch cleanup
 
 `lcc remove` deletes the branch along with the worktree — but only when the commits survive somewhere else. Two things count as safe:
 
 - The branch is an ancestor of the default branch (an ordinary merge).
-- The branch was pushed and its remote branch is now gone (`[gone]` upstream). This is what a **squash-merged** PR looks like locally: the commits are in the default branch under different SHAs, so ancestry can never prove it.
+- The branch was pushed and its upstream is now `[gone]` — what a squash-merged PR looks like locally, where ancestry can never prove the commits survived.
 
-Anything else is kept, with the count of what would have been lost:
-
-```
-✓ Removed worktree feature/pe-251-wip-experiment
-! Branch feature/pe-251-wip-experiment has 3 unmerged commits — kept.
-  Delete anyway with: git branch -D feature/pe-251-wip-experiment
-```
-
-The default branch is never deleted, and neither is anything in a detached worktree (there is no branch to delete). `--keep-branch` skips this entirely. The remote branch is left alone — GitHub already deletes it on merge.
+Anything else is kept, and `lcc` reports how many unmerged commits it found and prints the `git branch -D` you would need. `--keep-branch` skips the check entirely.
 
 ## Xcode build data
 
-Every worktree Xcode builds gets its **own** DerivedData folder — build products plus the source index, routinely 5–10 GB each. Removing the worktree does not remove them, so a few months of branches quietly turns into a hundred gigabytes.
+A worktree that gets built in Xcode leaves a DerivedData folder behind, and removing the worktree does not remove it. `lcc remove` matches folders to the worktree by the `WorkspacePath` recorded in each `info.plist`, shows their size in the confirmation, and deletes them along with the worktree. `--keep-derived-data` skips that.
 
-`lcc remove` now takes the build data with it. Folders are matched by reading `info.plist` in each DerivedData directory and comparing its `WorkspacePath` against the worktree — never by guessing Xcode's name hash — so only folders belonging to the worktree you picked are touched:
+`lcc clean` handles the backlog: every DerivedData folder whose project no longer exists on disk, sorted biggest first, with a checkbox list so you choose what goes. Folders without an `info.plist` — Xcode's own shared caches — are never touched, and deletion refuses any path that is not a direct child of the DerivedData root.
+
+Set `LCC_DERIVED_DATA` to override the location; otherwise `lcc` honours Xcode's own `IDECustomDerivedDataLocation` when it is absolute.
+
+## Configuration
+
+`~/.config/lcc/config.json`, written by `lcc setup`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `worktreeTemplate` | `{repoRoot}/.lcc/worktrees/{branchLeaf}` | Where worktrees go. Placeholders: `{repoRoot}`, `{repoParent}`, `{repoName}`, `{branch}`, `{branchLeaf}` |
+| `activeStates` | `["Todo", "In Progress"]` | Which Linear states to offer, in this order |
+| `startTaskCommand` | `""` | Passed to `claude` as its first argument. Placeholders: `{identifier}`, `{branch}`, `{url}` |
+| `envPatterns` | `[".env", ".env.*"]` | Which root files to symlink into the worktree |
+| `envExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
+| `clientId` | built-in | Linear OAuth application. Override with `LCC_CLIENT_ID` or `lcc auth setup --client-id <id>` |
+
+A worktree nested inside the repo is added to `.git/info/exclude`, so it never shows up as untracked.
+
+## Layout
 
 ```
-? Remove worktree feature/PE-227-disable-external-auth?
-    worktree   ~/Projects/App.worktrees/pe-227-disable-external-auth
-    build data App-ahchusvekwlwlwhdubkhblbxcyis  (7.9 GB)
-    branch     feature/PE-227-disable-external-auth  (merged — will be deleted)
- (y/N)
+build.zig             build, run and test steps
+src/main.zig          argv parsing and dispatch
+src/commands/         one file per command
+src/linear.zig        GraphQL over std.http.Client
+src/oauth.zig         PKCE, callback listener, token refresh
+src/keychain.zig      Security.framework SecItem*
+src/prompt.zig        raw-mode search, confirm, checkbox, input
+src/git.zig           worktrees, branches, branch disposition
+src/fold.zig          case folding for ASCII, Latin-1, Cyrillic
+src/derived_data.zig  DerivedData discovery and reclamation
 ```
 
-One prompt covers everything that is about to go. Declining deletes nothing. `--keep-derived-data` removes the worktree only.
+`src/keychain.zig` deliberately `@cImport`s five narrow CoreFoundation/Security headers rather than the umbrella ones: on the macOS 26.5 SDK, `CoreFoundation/CoreFoundation.h` drags in mach headers whose bitfield structs translate-c turns opaque (tripping their own `_Static_assert`s), and `Security/Security.h` drags in `xpc.h`, which puts nullability attributes on the non-pointer `uuid_t`.
 
-`lcc clean` handles what earlier removals left behind: it lists every DerivedData folder whose project path no longer exists on disk, largest first, and lets you pick which to delete. `-y` takes them all without prompting.
+## Scope
 
-Two things are deliberately never deleted:
+macOS only. The Keychain layer talks to Security.framework directly, so Linux (libsecret) and Windows (Credential Manager) would each need their own backend.
 
-- **Xcode's shared caches** — `ModuleCache.noindex`, `SDKStatCaches.noindex`, `CompilationCache.noindex` and friends carry no `info.plist`, belong to no single project, and are skipped. Deletion is also hard-limited to direct children of the DerivedData root.
-- **Caches that aren't per-worktree** — `~/Library/Developer/Xcode/UserData/Previews` and `~/Library/Caches/org.swift.swiftpm` are shared across all your projects, so removing one worktree is never a reason to clear them.
+Pinned to Zig 0.16. That release moved `std.fs.File` to `std.Io.File`, threads an `Io` parameter through every I/O call, and changed the `main` signature — expect edits on the next Zig release.
 
-The DerivedData root is read from Xcode's own `IDECustomDerivedDataLocation` preference when you've set an absolute custom location, otherwise `~/Library/Developer/Xcode/DerivedData`. `LCC_DERIVED_DATA` overrides both.
+Case folding covers ASCII, Latin-1 Supplement and Cyrillic. Latin Extended-A is left out on purpose: its case pairs are irregular and some foldings are multi-codepoint, so covering it half-correctly would be worse than not covering it.
 
-## How it works
+## History
 
-1. Fetches your **active** Linear issues (assigned to you, state Todo or In Progress) via the official `@linear/sdk`.
-2. Shows a searchable picker (`@inquirer/prompts`).
-3. Runs `git worktree add` using the branch name Linear computes for the issue (`feature/PE-N-slug`). Base = `origin/HEAD` (or `main` / `master`). Worktrees live at `<repo>/.lcc/worktrees/<branchLeaf>` by default; `.lcc/` is appended to `.git/info/exclude` so git status stays clean.
-4. Symlinks every `.env*` from the repo root into the new worktree (skips `.env.example`, `.env.sample`, `.env.template`).
-5. Spawns `claude` in the worktree with `stdio: 'inherit'` so you land directly in the session.
-
-## Config
-
-`~/.config/lcc/config.json`
-
-```json
-{
-  "worktreeTemplate": "{repoRoot}/.lcc/worktrees/{branchLeaf}",
-  "envPatterns": [".env", ".env.*"],
-  "envExclude": [".env.example", ".env.sample", ".env.template"]
-}
-```
-
-Tokens in `{worktreeTemplate}`: `{repoRoot}`, `{repoParent}`, `{repoName}`, `{branch}`, `{branchLeaf}`.
-
-### Use your own OAuth application (optional)
-
-`lcc` ships with a built-in public OAuth `client_id`. If you fork lcc or want to point at your own Linear OAuth application (e.g., self-hosted variant), either:
-
-```bash
-lcc auth setup --client-id <your-client-id>
-# or
-export LCC_CLIENT_ID=<your-client-id>
-```
-
-`client_id` is public information by OAuth design — PKCE protects the flow without a client secret.
-
-## Headless / CI fallback
-
-If you can't use a browser (CI, remote shell):
-
-```bash
-lcc auth --token <personal-api-key>
-```
-
-This stores a personal API token directly. No refresh, no expiry tracking — use OAuth wherever possible.
-
-## Contributing
-
-PRs welcome. Run `npm run typecheck && npm run build` before opening a PR.
+Everything up to 0.1.0 was TypeScript on Node, built on `@linear/sdk`, `@inquirer/prompts`, `@napi-rs/keyring`, `commander`, `execa`, `open` and `picocolors`. It was replaced wholesale by this implementation after a command-by-command parity check, then deleted. `git log` still has it.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-## Troubleshooting
-
-- **"Port 39126 already in use"** — another `lcc auth` is running, or another process grabbed the port. Close it and retry.
-- **"Not inside a git repository"** — run `lcc` from inside your repo.
-- **"Worktree path already exists"** — remove it with `git worktree remove <path>` (or delete the directory).
-- **`claude` not found** — install Claude Code: https://docs.claude.com/en/docs/claude-code
+MIT
