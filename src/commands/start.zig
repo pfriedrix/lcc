@@ -176,6 +176,9 @@ fn pickIssue(app: app_mod.App, issues: []const linear.Issue) !?linear.Issue {
                 issue.assignee_name orelse "",
                 issue.team_key orelse "",
             }),
+            .description = try std.fmt.allocPrint(app.gpa, "{s} — {s}", .{
+                issue.branch_name, issue.url,
+            }),
         };
     }
 

@@ -123,6 +123,7 @@ fn reportAuthError(app: app_mod.App, err: anyerror) noreturn {
             .{config.redirect_port},
         ),
         error.StateMismatch => app.ui.fail("OAuth state mismatch (possible CSRF)", .{}),
+        error.CallbackTimedOut => app.ui.fail("Timed out waiting for browser authorization", .{}),
         error.AuthorizationDenied => app.ui.fail("Linear returned error: {s}", .{detail}),
         error.NotAuthenticated => app.ui.fail("Not authenticated. Run `lcc auth` first.", .{}),
         error.TokenExpiredNoRefresh => app.ui.fail(
