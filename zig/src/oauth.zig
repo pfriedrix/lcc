@@ -25,7 +25,11 @@ pub const Error = error{
     StateMismatch,
     PortInUse,
     AuthorizationDenied,
+    CallbackTimedOut,
 } || std.mem.Allocator.Error;
+
+/// How long to hold the callback port open before giving up on the browser.
+pub const callback_timeout_ms: i64 = 5 * 60 * 1000;
 
 /// Detail for the last failure, for messages worth reading.
 pub var last_detail: []const u8 = "";
@@ -33,6 +37,32 @@ pub var last_detail: []const u8 = "";
 pub fn nowSeconds(io: Io) i64 {
     const ts = Io.Timestamp.now(io, .real);
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
+}
+
+fn nowMillis(io: Io) i64 {
+    const ts = Io.Timestamp.now(io, .awake);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
+}
+
+/// Blocks until the socket has a connection waiting, or `deadline` passes.
+fn waitReadable(io: Io, handle: std.posix.fd_t, deadline: i64) Error!void {
+    while (true) {
+        const remaining = deadline - nowMillis(io);
+        if (remaining <= 0) return Error.CallbackTimedOut;
+
+        var fds = [_]std.posix.pollfd{.{
+            .fd = handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&fds, @intCast(@min(remaining, std.math.maxInt(i32)))) catch |err| {
+            last_detail = @errorName(err);
+            return Error.CallbackFailed;
+        };
+        if (ready > 0) return;
+        // Zero means the poll timed out; loop so a signal-interrupted wait
+        // still honours the full deadline.
+    }
 }
 
 fn base64url(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -194,7 +224,13 @@ pub fn awaitCallback(gpa: std.mem.Allocator, io: Io, expected_state: []const u8)
     };
     defer server.deinit(io);
 
+    const deadline = nowMillis(io) + callback_timeout_ms;
+
     while (true) {
+        // Bound the wait, so an abandoned browser tab does not leave lcc
+        // holding the port forever.
+        try waitReadable(io, server.socket.handle, deadline);
+
         var stream = server.accept(io) catch |err| {
             last_detail = @errorName(err);
             return Error.CallbackFailed;

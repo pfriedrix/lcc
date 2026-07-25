@@ -80,6 +80,7 @@ pub fn pickWorktree(app: App, choices: []const Choice, message: []const u8) !?Ch
                 choice.entry.branch orelse choice.entry.head,
                 choice.entry.path,
             }),
+            .description = choice.entry.path,
         };
     }
     app.ui.flush();

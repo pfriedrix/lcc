@@ -20,6 +20,9 @@ pub const Item = struct {
     label: []const u8,
     /// Matched against the query in `search`. Ignored by the other widgets.
     haystack: []const u8 = "",
+    /// Shown dimmed beneath the list while this row is highlighted, the way
+    /// inquirer's `search` renders a choice description.
+    description: []const u8 = "",
 };
 
 const csi = "\x1b[";
@@ -317,6 +320,16 @@ pub fn search(
                 } else {
                     out.print("  {s}\n", .{label}) catch {};
                 }
+                lines += 1;
+            }
+        }
+
+        if (filtered.items.len > 0) {
+            const description = items[filtered.items[cursor]].description;
+            if (description.len > 0) {
+                out.print("  {s}{s}{s}\n", .{
+                    p.dim, truncate(description, width -| 3), p.reset,
+                }) catch {};
                 lines += 1;
             }
         }
