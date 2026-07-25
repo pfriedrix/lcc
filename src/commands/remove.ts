@@ -1,11 +1,21 @@
 import path from 'node:path';
 import pc from 'picocolors';
+import {
+  derivedDataRoot,
+  forWorktree,
+  formatBytes,
+  listDerivedData,
+  removeDerivedData,
+  withSizes,
+  type SizedDerivedData,
+} from '../derived-data.js';
 import { listWorktrees, removeWorktree, repoRoot } from '../git.js';
 import { confirmForceRemove, confirmRemoveWorktree, log, pickWorktree } from '../ui.js';
 
 export interface RemoveOpts {
   force?: boolean;
   yes?: boolean;
+  keepDerivedData?: boolean;
 }
 
 export async function removeCmd(opts: RemoveOpts): Promise<void> {
@@ -31,7 +41,17 @@ export async function removeCmd(opts: RemoveOpts): Promise<void> {
   }
 
   const picked = await pickWorktree(candidates, 'Pick a worktree to remove:');
-  if (!opts.yes && !(await confirmRemoveWorktree(picked))) {
+
+  // Match before removing: once the directory is gone the folders still resolve by
+  // path, but the user needs to see what is about to go in the confirmation.
+  const root = await derivedDataRoot();
+  const derived = opts.keepDerivedData
+    ? []
+    : await forWorktree(await listDerivedData(root), picked.path);
+  if (derived.length > 0) log.step(`Measuring Xcode build data (${derived.length})…`);
+  const sized = await withSizes(derived);
+
+  if (!opts.yes && !(await confirmRemoveWorktree(picked, sized))) {
     log.dim('Aborted.');
     return;
   }
@@ -50,5 +70,21 @@ export async function removeCmd(opts: RemoveOpts): Promise<void> {
   }
 
   log.success(`Removed worktree ${pc.cyan(picked.branch ?? picked.head.slice(0, 8))}`);
+  await purge(sized, root);
   log.dim(`Branch left intact. Delete with: git branch -D ${picked.branch ?? '<branch>'}`);
+}
+
+async function purge(sized: SizedDerivedData[], root: string): Promise<void> {
+  if (sized.length === 0) return;
+  let reclaimed = 0;
+  for (const dd of sized) {
+    try {
+      await removeDerivedData(dd, root);
+      reclaimed += dd.size;
+      log.success(`Removed build data ${pc.dim(dd.name)} ${pc.yellow(`(${dd.sizeLabel})`)}`);
+    } catch (err) {
+      log.warn(`Could not remove ${dd.name}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (reclaimed > 0) log.success(`Reclaimed ${pc.bold(formatBytes(reclaimed))}.`);
 }

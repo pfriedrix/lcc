@@ -1,5 +1,6 @@
-import { confirm, search } from '@inquirer/prompts';
+import { checkbox, confirm, search } from '@inquirer/prompts';
 import pc from 'picocolors';
+import type { SizedDerivedData } from './derived-data.js';
 import type { ActiveIssue } from './issues.js';
 
 const PRIORITY_LABEL: Record<number, string> = {
@@ -91,11 +92,32 @@ export async function pickWorktree(entries: WorktreeChoice[], message: string): 
   });
 }
 
-export async function confirmRemoveWorktree(wt: WorktreeChoice): Promise<boolean> {
+export async function confirmRemoveWorktree(
+  wt: WorktreeChoice,
+  derived: SizedDerivedData[],
+): Promise<boolean> {
   const label = wt.branch ?? wt.head.slice(0, 8);
+  const lines = [`    ${pc.dim('worktree  ')} ${wt.path}`];
+  for (const dd of derived) {
+    lines.push(`    ${pc.dim('build data')} ${dd.name}  ${pc.yellow(`(${dd.sizeLabel})`)}`);
+  }
   return await confirm({
-    message: `Remove worktree ${pc.cyan(label)} at ${pc.dim(wt.path)}?`,
+    message: `Remove worktree ${pc.cyan(label)}?\n${lines.join('\n')}\n`,
     default: false,
+  });
+}
+
+export async function pickOrphans(orphans: SizedDerivedData[]): Promise<SizedDerivedData[]> {
+  const width = Math.max(...orphans.map((o) => o.sizeLabel.length));
+  const pageSize = Math.max(7, Math.min(30, (process.stdout.rows ?? 24) - 6));
+  return await checkbox<SizedDerivedData>({
+    message: 'Select build data to delete (space toggles, enter confirms):',
+    pageSize,
+    choices: orphans.map((o) => ({
+      name: `${pc.yellow(o.sizeLabel.padStart(width))}  ${o.name}  ${pc.dim(o.workspacePath)}`,
+      value: o,
+      checked: true,
+    })),
   });
 }
 

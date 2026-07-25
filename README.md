@@ -44,13 +44,38 @@ lcc setup            # configure startTaskCommand, worktreeTemplate, activeState
 lcc list             # list all worktrees
 lcc open             # pick a worktree and resume Claude in it (--no-resume for fresh)
 lcc open xcode       # pick a worktree and open it in Xcode instead
-lcc remove           # interactively pick and remove a worktree (--force)
+lcc remove           # pick a worktree, remove it + its Xcode build data (--force)
+lcc clean            # reclaim build data left by worktrees that no longer exist
 lcc auth             # log in
 lcc auth --status    # who am I, when does token expire
 lcc auth --logout    # clear token from keychain
 ```
 
 `lcc open xcode` (alias `lcc o xcode`) uses the same worktree picker as `lcc open`, then launches Xcode instead of Claude. It looks for the shallowest `.xcworkspace`, `.xcodeproj`, or `Package.swift` in the worktree (workspace > project > package when several sit at the same depth) and opens it with `open -a Xcode`.
+
+## Xcode build data
+
+Every worktree Xcode builds gets its **own** DerivedData folder — build products plus the source index, routinely 5–10 GB each. Removing the worktree does not remove them, so a few months of branches quietly turns into a hundred gigabytes.
+
+`lcc remove` now takes the build data with it. Folders are matched by reading `info.plist` in each DerivedData directory and comparing its `WorkspacePath` against the worktree — never by guessing Xcode's name hash — so only folders belonging to the worktree you picked are touched:
+
+```
+? Remove worktree feature/PE-227-disable-external-auth?
+    worktree   ~/Projects/App.worktrees/pe-227-disable-external-auth
+    build data App-ahchusvekwlwlwhdubkhblbxcyis  (7.9 GB)
+ (y/N)
+```
+
+Declining deletes nothing. `--keep-derived-data` removes the worktree only.
+
+`lcc clean` handles what earlier removals left behind: it lists every DerivedData folder whose project path no longer exists on disk, largest first, and lets you pick which to delete. `-y` takes them all without prompting.
+
+Two things are deliberately never deleted:
+
+- **Xcode's shared caches** — `ModuleCache.noindex`, `SDKStatCaches.noindex`, `CompilationCache.noindex` and friends carry no `info.plist`, belong to no single project, and are skipped. Deletion is also hard-limited to direct children of the DerivedData root.
+- **Caches that aren't per-worktree** — `~/Library/Developer/Xcode/UserData/Previews` and `~/Library/Caches/org.swift.swiftpm` are shared across all your projects, so removing one worktree is never a reason to clear them.
+
+The DerivedData root is read from Xcode's own `IDECustomDerivedDataLocation` preference when you've set an absolute custom location, otherwise `~/Library/Developer/Xcode/DerivedData`. `LCC_DERIVED_DATA` overrides both.
 
 ## How it works
 
