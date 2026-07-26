@@ -1,4 +1,4 @@
-//! `lcc` / `lcc start` — pick an issue, bootstrap a worktree, launch Claude.
+//! `lcc start` — pick an issue, bootstrap a worktree, launch Claude.
 
 const std = @import("std");
 const app_mod = @import("../app.zig");
@@ -58,7 +58,7 @@ pub fn run(app: app_mod.App, all: bool) !void {
             .{ skipped_total, result.total, breakdown.items },
         );
         app.ui.hint(
-            "To include them, edit ~/.config/lcc/config.json → activeStates, or run `lcc --all`.",
+            "To include them, edit ~/.config/lcc/config.json → activeStates, or run `lcc start --all`.",
             .{},
         );
     }
