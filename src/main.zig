@@ -34,7 +34,8 @@ const usage =
     \\  list | ls                Dashboard of the worktrees in the current repo
     \\    --local                skip the PR and Linear columns (no network)
     \\  open | o [claude|xcode]  Open a worktree — Claude Code (default) or Xcode
-    \\    --no-resume            launch Claude without --resume (fresh session)
+    \\                           resumes when the worktree has transcripts, else starts fresh
+    \\    --no-resume            never pass --resume, even when it has them
     \\  remove | rm              Remove a worktree, its branch, and its Xcode build data
     \\    --merged               bulk: every worktree and branch already merged
     \\    -f, --force            force remove even with uncommitted changes

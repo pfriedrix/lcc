@@ -60,7 +60,7 @@ lcc start            # pick an issue, bootstrap worktree, launch Claude
 lcc start --all      # ignore the activeStates filter
 lcc setup            # configure startTaskCommand, worktreeTemplate, activeStates, linkPatterns
 lcc list             # dashboard of every worktree (--local to skip the network columns)
-lcc open             # pick a worktree and resume Claude in it (--no-resume for fresh)
+lcc open             # pick a worktree and resume Claude in it, if it has sessions (--no-resume for fresh)
 lcc open xcode       # pick a worktree and open it in Xcode instead
 lcc remove           # pick a worktree, remove it + its branch + Xcode build data
 lcc remove --merged  # bulk: every worktree and branch whose work already landed
