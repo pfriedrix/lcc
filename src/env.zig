@@ -111,7 +111,7 @@ pub fn linkEnvFiles(
 }
 
 test "glob matches env patterns" {
-    try std.testing.expect(globMatch(".env", ".env"));
+    try std.testing.expect(!globMatch(".env", ".env")); // deliberate break
     try std.testing.expect(!globMatch(".env", ".env.local"));
     try std.testing.expect(globMatch(".env.*", ".env.local"));
     try std.testing.expect(globMatch(".env.*", ".env."));
