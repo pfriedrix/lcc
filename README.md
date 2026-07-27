@@ -6,7 +6,7 @@
 One command to go from "I should work on PE-N" to a clean git worktree with your gitignored files symlinked in and Claude Code already running.
 
 ```
-$ lcc
+$ lcc start
   PE-42   H   In Progress   Migrate notification scheduler off Redis
   PE-51       Todo          Add Liquid Glass to settings sheet
 > PE-47   M   Todo          Backfill missing receipt categories
@@ -55,8 +55,9 @@ For headless machines, `lcc auth --token <pat>` stores a Linear personal API tok
 ## Usage
 
 ```bash
-lcc                  # pick an issue, bootstrap worktree, launch Claude
-lcc --all            # ignore the activeStates filter
+lcc                  # print the command list
+lcc start            # pick an issue, bootstrap worktree, launch Claude
+lcc start --all      # ignore the activeStates filter
 lcc setup            # configure startTaskCommand, worktreeTemplate, activeStates, linkPatterns
 lcc list             # dashboard of every worktree (--local to skip the network columns)
 lcc open             # pick a worktree and resume Claude in it (--no-resume for fresh)

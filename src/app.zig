@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const config = @import("config.zig");
 const git = @import("git.zig");
 const prompt = @import("prompt.zig");
 const ui = @import("ui.zig");
@@ -30,15 +31,17 @@ pub const Choice = struct {
 /// Worktrees other than the main one, tagged with whether lcc created them.
 pub fn worktreeChoices(app: App, repo: git.Repo) ![]Choice {
     const entries = try repo.listWorktrees();
-    const managed_root = try std.fs.path.join(app.gpa, &.{ repo.root, ".lcc", "worktrees" });
-    const managed_prefix = try std.fmt.allocPrint(app.gpa, "{s}{c}", .{ managed_root, std.fs.path.sep });
+    const cfg = try config.load(app.gpa, app.io, app.environ);
+    const managed_prefix = try git.worktreePathPrefix(app.gpa, cfg.worktreeTemplate, repo.root);
 
     var out: std.ArrayList(Choice) = .empty;
     for (entries) |entry| {
         if (entry.is_main) continue;
         try out.append(app.gpa, .{
             .entry = entry,
-            .managed = std.mem.startsWith(u8, entry.path, managed_prefix),
+            // An empty prefix matches everything, which would tag every worktree.
+            .managed = managed_prefix.len > 0 and
+                std.mem.startsWith(u8, entry.path, managed_prefix),
         });
     }
     return out.toOwnedSlice(app.gpa);

@@ -17,12 +17,12 @@ const ui = @import("ui.zig");
 const version = "0.1.0";
 
 const usage =
-    \\Usage: lcc [command] [options]
+    \\Usage: lcc <command> [options]
     \\
     \\Pick a Linear issue → git worktree + symlinked local files + Claude Code
     \\
     \\Commands:
-    \\  start                    Pick an active Linear issue and bootstrap a worktree (default)
+    \\  start                    Pick an active Linear issue and bootstrap a worktree
     \\    --all                  show all assigned issues regardless of activeStates filter
     \\  auth                     Authenticate with Linear (OAuth browser flow)
     \\    --logout               remove stored token
@@ -84,27 +84,31 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn dispatch(app: app_mod.App, args: []const []const u8) !void {
-    if (args.len > 0) {
-        const first = args[0];
-        if (eq(first, "-h") or eq(first, "--help") or eq(first, "help")) {
-            app.ui.info("{s}", .{usage});
-            return;
-        }
-        if (eq(first, "-V") or eq(first, "--version")) {
-            app.ui.info("{s}", .{version});
-            return;
-        }
-        if (eq(first, "auth")) return authCommand(app, args[1..]);
-        if (eq(first, "setup")) return setup_cmd.run(app);
-        if (eq(first, "list") or eq(first, "ls")) return listCommand(app, args[1..]);
-        if (eq(first, "open") or eq(first, "o")) return openCommand(app, args[1..]);
-        if (eq(first, "remove") or eq(first, "rm")) return removeCommand(app, args[1..]);
-        if (eq(first, "clean")) return cleanCommand(app, args[1..]);
-        if (eq(first, "start")) return startCommand(app, args[1..]);
-        if (!std.mem.startsWith(u8, first, "-")) return error.UnknownCommand;
+    // No arguments prints the command list. Every action is named explicitly —
+    // there is no default command, so `lcc` alone never touches a repository.
+    if (args.len == 0) {
+        app.ui.info("{s}", .{usage});
+        return;
     }
-    // No command, or only flags: `start` is the default, as in commander.
-    return startCommand(app, args);
+
+    const first = args[0];
+    if (eq(first, "-h") or eq(first, "--help") or eq(first, "help")) {
+        app.ui.info("{s}", .{usage});
+        return;
+    }
+    if (eq(first, "-V") or eq(first, "--version")) {
+        app.ui.info("{s}", .{version});
+        return;
+    }
+    if (eq(first, "auth")) return authCommand(app, args[1..]);
+    if (eq(first, "setup")) return setup_cmd.run(app);
+    if (eq(first, "list") or eq(first, "ls")) return listCommand(app, args[1..]);
+    if (eq(first, "open") or eq(first, "o")) return openCommand(app, args[1..]);
+    if (eq(first, "remove") or eq(first, "rm")) return removeCommand(app, args[1..]);
+    if (eq(first, "clean")) return cleanCommand(app, args[1..]);
+    if (eq(first, "start")) return startCommand(app, args[1..]);
+    if (std.mem.startsWith(u8, first, "-")) return error.UnknownOption;
+    return error.UnknownCommand;
 }
 
 fn startCommand(app: app_mod.App, args: []const []const u8) !void {

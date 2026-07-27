@@ -472,6 +472,23 @@ pub fn renderWorktreePath(
     return out.toOwnedSlice(gpa);
 }
 
+/// The leading part of `template` that does not depend on the branch, i.e. the
+/// prefix shared by every path it renders. Tells worktrees lcc created from ones
+/// added by hand. Comes back empty for a template that opens with a branch
+/// placeholder — such a template attributes nothing.
+pub fn worktreePathPrefix(
+    gpa: std.mem.Allocator,
+    template: []const u8,
+    repo_root: []const u8,
+) ![]u8 {
+    // NUL cannot appear in a path, so it cannot collide with whatever the
+    // repo placeholders expand to.
+    const rendered = try renderWorktreePath(gpa, template, repo_root, "\x00");
+    const cut = std.mem.indexOfScalar(u8, rendered, 0) orelse return rendered;
+    defer gpa.free(rendered);
+    return gpa.dupe(u8, rendered[0..cut]);
+}
+
 fn lessThan(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.lessThan(u8, a, b);
 }
@@ -507,6 +524,32 @@ test "parseTrack covers every shape for-each-ref emits" {
     );
     // Junk must read as "no information", never as a bogus count.
     try std.testing.expectEqual(Drift{}, parseTrack("[ahead]"));
+}
+
+test "worktreePathPrefix cuts the template at the branch" {
+    const gpa = std.testing.allocator;
+
+    const sibling = try worktreePathPrefix(gpa, "{repoParent}/{repoName}.worktrees/{branchLeaf}", "/tmp/proj");
+    defer gpa.free(sibling);
+    try std.testing.expectEqualStrings("/tmp/proj.worktrees/", sibling);
+
+    const nested = try worktreePathPrefix(gpa, "{repoRoot}/.lcc/worktrees/{branchLeaf}", "/tmp/proj");
+    defer gpa.free(nested);
+    try std.testing.expectEqualStrings("/tmp/proj/.lcc/worktrees/", nested);
+
+    // A branch baked into the directory name, not just a segment of its own.
+    const infix = try worktreePathPrefix(gpa, "{repoRoot}/wt-{branch}-x", "/tmp/proj");
+    defer gpa.free(infix);
+    try std.testing.expectEqualStrings("/tmp/proj/wt-", infix);
+
+    // No branch placeholder at all: the whole rendered path is the prefix.
+    const fixed = try worktreePathPrefix(gpa, "{repoRoot}/wt", "/tmp/proj");
+    defer gpa.free(fixed);
+    try std.testing.expectEqualStrings("/tmp/proj/wt", fixed);
+
+    const leading = try worktreePathPrefix(gpa, "{branchLeaf}", "/tmp/proj");
+    defer gpa.free(leading);
+    try std.testing.expectEqualStrings("", leading);
 }
 
 test "repoRoot answers the main worktree from inside a linked worktree" {
