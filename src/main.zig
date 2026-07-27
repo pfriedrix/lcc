@@ -1,5 +1,5 @@
-//! lcc — pick a Linear issue, get a git worktree with .env symlinks and
-//! Claude Code running.
+//! lcc — pick a Linear issue, get a git worktree with the gitignored files
+//! symlinked in and Claude Code running.
 
 const std = @import("std");
 const Io = std.Io;
@@ -19,7 +19,7 @@ const version = "0.1.0";
 const usage =
     \\Usage: lcc <command> [options]
     \\
-    \\Pick a Linear issue → git worktree + .env symlinks + Claude Code
+    \\Pick a Linear issue → git worktree + symlinked local files + Claude Code
     \\
     \\Commands:
     \\  start                    Pick an active Linear issue and bootstrap a worktree
@@ -31,15 +31,20 @@ const usage =
     \\  auth setup --client-id <id>
     \\                           Configure OAuth client_id (one-time)
     \\  setup                    Interactively configure lcc
-    \\  list | ls                List worktrees in the current repo
+    \\  list | ls                Dashboard of the worktrees in the current repo
+    \\    --local                skip the PR and Linear columns (no network)
     \\  open | o [claude|xcode]  Open a worktree — Claude Code (default) or Xcode
     \\    --no-resume            launch Claude without --resume (fresh session)
     \\  remove | rm              Remove a worktree, its branch, and its Xcode build data
+    \\    --merged               bulk: every worktree and branch already merged
     \\    -f, --force            force remove even with uncommitted changes
     \\    -y, --yes              skip the confirmation prompt
     \\    --keep-derived-data    leave the Xcode DerivedData folder in place
     \\    --keep-branch          leave the git branch in place
-    \\  clean                    Delete Xcode build data left by worktrees that no longer exist
+    \\    --sessions             also delete the Claude Code session transcripts
+    \\  clean                    Delete what worktrees that no longer exist left behind
+    \\    --build-data           only Xcode DerivedData
+    \\    --sessions             only Claude Code session transcripts
     \\    -y, --yes              delete every orphaned folder without prompting
     \\
     \\  -h, --help               show this help
@@ -97,7 +102,7 @@ fn dispatch(app: app_mod.App, args: []const []const u8) !void {
     }
     if (eq(first, "auth")) return authCommand(app, args[1..]);
     if (eq(first, "setup")) return setup_cmd.run(app);
-    if (eq(first, "list") or eq(first, "ls")) return list_cmd.run(app);
+    if (eq(first, "list") or eq(first, "ls")) return listCommand(app, args[1..]);
     if (eq(first, "open") or eq(first, "o")) return openCommand(app, args[1..]);
     if (eq(first, "remove") or eq(first, "rm")) return removeCommand(app, args[1..]);
     if (eq(first, "clean")) return cleanCommand(app, args[1..]);
@@ -164,6 +169,14 @@ fn openCommand(app: app_mod.App, args: []const []const u8) !void {
     return open_cmd.run(app, target, no_resume);
 }
 
+fn listCommand(app: app_mod.App, args: []const []const u8) !void {
+    var opts: list_cmd.Opts = .{};
+    for (args) |arg| {
+        if (eq(arg, "--local")) opts.local = true else return error.UnknownOption;
+    }
+    return list_cmd.run(app, opts);
+}
+
 fn removeCommand(app: app_mod.App, args: []const []const u8) !void {
     var opts: remove_cmd.Opts = .{};
     for (args) |arg| {
@@ -175,17 +188,27 @@ fn removeCommand(app: app_mod.App, args: []const []const u8) !void {
             opts.keep_derived_data = true;
         } else if (eq(arg, "--keep-branch")) {
             opts.keep_branch = true;
+        } else if (eq(arg, "--sessions")) {
+            opts.sessions = true;
+        } else if (eq(arg, "--merged")) {
+            opts.merged = true;
         } else return error.UnknownOption;
     }
     return remove_cmd.run(app, opts);
 }
 
 fn cleanCommand(app: app_mod.App, args: []const []const u8) !void {
-    var yes = false;
+    var opts: clean_cmd.Opts = .{};
     for (args) |arg| {
-        if (eq(arg, "-y") or eq(arg, "--yes")) yes = true else return error.UnknownOption;
+        if (eq(arg, "-y") or eq(arg, "--yes")) {
+            opts.yes = true;
+        } else if (eq(arg, "--build-data")) {
+            opts.build_data = true;
+        } else if (eq(arg, "--sessions")) {
+            opts.sessions = true;
+        } else return error.UnknownOption;
     }
-    return clean_cmd.run(app, yes);
+    return clean_cmd.run(app, opts);
 }
 
 fn eq(a: []const u8, b: []const u8) bool {
@@ -197,18 +220,22 @@ test {
     // analysis, so name every module here or `zig build test` runs nothing.
     _ = @import("app.zig");
     _ = @import("claude.zig");
+    _ = @import("claude_projects.zig");
     _ = @import("config.zig");
     _ = @import("derived_data.zig");
-    _ = @import("env.zig");
+    _ = @import("disk.zig");
     _ = @import("exec.zig");
     _ = @import("fold.zig");
     _ = @import("git.zig");
+    _ = @import("github.zig");
     _ = @import("keychain.zig");
     _ = @import("linear.zig");
+    _ = @import("link.zig");
     _ = @import("oauth.zig");
     _ = @import("prompt.zig");
     _ = @import("ui.zig");
     _ = @import("xcode.zig");
+    _ = @import("commands/list.zig");
 }
 
 fn describe(err: anyerror) []const u8 {

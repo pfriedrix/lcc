@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.16-orange.svg)](#build)
 
-One command to go from "I should work on PE-N" to a clean git worktree with `.env` symlinks and Claude Code already running.
+One command to go from "I should work on PE-N" to a clean git worktree with your gitignored files symlinked in and Claude Code already running.
 
 ```
 $ lcc start
@@ -13,12 +13,13 @@ $ lcc start
   feature/pe-47-backfill-receipts — https://linear.app/…/PE-47/…
   3/165 · ↑↓ move · enter select · esc cancel
 ✓ Worktree created: /Users/me/Documents/Projects/Pantry/.lcc/worktrees/PE-47-backfill-receipts
+✓ Linked .claude/settings.local.json
 ✓ Linked .env
 ✓ Linked .env.local
 [claude opens in worktree]
 ```
 
-A single ~1.5 MB binary with no runtime. It shells out to `git`, `claude`, `open`, `du`, `defaults` and `plutil` — everything else is the Zig standard library plus macOS's own Security framework.
+A single ~1.5 MB binary with no runtime. It shells out to `git`, `claude`, `gh`, `open`, `du`, `defaults` and `plutil` — everything else is the Zig standard library plus macOS's own Security framework.
 
 ## Build
 
@@ -57,18 +58,41 @@ For headless machines, `lcc auth --token <pat>` stores a Linear personal API tok
 lcc                  # print the command list
 lcc start            # pick an issue, bootstrap worktree, launch Claude
 lcc start --all      # ignore the activeStates filter
-lcc setup            # configure startTaskCommand, worktreeTemplate, activeStates
-lcc list             # list all worktrees
+lcc setup            # configure startTaskCommand, worktreeTemplate, activeStates, linkPatterns
+lcc list             # dashboard of every worktree (--local to skip the network columns)
 lcc open             # pick a worktree and resume Claude in it (--no-resume for fresh)
 lcc open xcode       # pick a worktree and open it in Xcode instead
 lcc remove           # pick a worktree, remove it + its branch + Xcode build data
-lcc clean            # reclaim build data left by worktrees that no longer exist
+lcc remove --merged  # bulk: every worktree and branch whose work already landed
+lcc clean            # reclaim build data and transcripts left by worktrees that are gone
 lcc auth             # log in
 lcc auth --status    # who am I, when does the token expire
 lcc auth --logout    # clear the token from the Keychain
 ```
 
 `ls`, `o` and `rm` are accepted as aliases for `list`, `open` and `remove`.
+
+### The dashboard
+
+`lcc list` is the "what am I in the middle of" view — one row per worktree:
+
+```
+$ lcc list
+BRANCH                   STATUS   SYNC   AGE  PR          LINEAR       PATH
+feature/pe-256-app-hangs 3 dirty  ↑2 ↓0  2h   #412 open   In Progress  ~/…/pe-256-app-hangs
+feature/pe-247-exc-bad   clean    ↑0 ↓14 6d   #398 merged In Build     ~/…/pe-247-exc-bad
+feature/pe-224-history   clean    gone   11d  —           In Review    ~/…/pe-224-history
+```
+
+| Column | Where it comes from |
+|---|---|
+| `STATUS` | `git status --porcelain` in the worktree — entry count, or `missing` when the directory is gone |
+| `SYNC` | `%(upstream:track)` — `↑ahead ↓behind`, `unpushed` with no upstream, `gone` once the remote branch is deleted |
+| `AGE` | how long ago the branch tip was committed |
+| `PR` | `gh pr list` for the repo, matched on head branch; open beats merged beats closed |
+| `LINEAR` | the state of the issue the branch names, e.g. `PE-256` out of `feature/pe-256-…` |
+
+Everything local is two `git` calls plus one `git status` per worktree — about 0.2s on a large iOS repo with five worktrees. `PR` and `LINEAR` are one batched request each and are the whole rest of the cost: roughly 1.9s in total, more on the first call of the day while Linear warms up. `--local` drops both columns, as does a missing `gh` or an expired Linear token — those print a hint and leave the rest of the table intact.
 
 ### Picking
 
@@ -91,13 +115,51 @@ Uses the same worktree picker, then launches Xcode instead of Claude. It looks f
 
 Anything else is kept, and `lcc` reports how many unmerged commits it found and prints the `git branch -D` you would need. `--keep-branch` skips the check entirely.
 
+`lcc remove --merged` runs that check across the whole repo and offers everything that passes in one checkbox list — including branches that outlived their worktree, which nothing else ever cleans up:
+
+```
+$ lcc remove --merged
+? Select what to remove (space toggles, enter confirms):
+❯ ◉ feature/pe-101-shipped  merged       2.4 GB   ~/…/.lcc/worktrees/pe-101-shipped
+  ◉ feature/pe-103-squashed remote gone  —        branch only — no worktree left
+  3/3 selected · space toggles · enter confirms · esc cancel
+```
+
+A branch checked out anywhere — including the main worktree — is never offered, and a worktree with uncommitted changes is reported and skipped rather than forced. `-y` takes everything without asking; `--force`, `--keep-branch` and `--keep-derived-data` mean the same as they do for a single removal.
+
 ## Xcode build data
 
 A worktree that gets built in Xcode leaves a DerivedData folder behind, and removing the worktree does not remove it. `lcc remove` matches folders to the worktree by the `WorkspacePath` recorded in each `info.plist`, shows their size in the confirmation, and deletes them along with the worktree. `--keep-derived-data` skips that.
 
-`lcc clean` handles the backlog: every DerivedData folder whose project no longer exists on disk, sorted biggest first, with a checkbox list so you choose what goes. Folders without an `info.plist` — Xcode's own shared caches — are never touched, and deletion refuses any path that is not a direct child of the DerivedData root.
+Folders without an `info.plist` — Xcode's own shared caches — are never touched, and deletion refuses any path that is not a direct child of the DerivedData root.
 
 Set `LCC_DERIVED_DATA` to override the location; otherwise `lcc` honours Xcode's own `IDECustomDerivedDataLocation` when it is absolute.
+
+## Claude Code session transcripts
+
+`~/.claude/projects` grows a directory per working directory Claude Code was launched in, and worktrees make a lot of those — a few hundred MB of transcripts for worktrees deleted months ago is normal.
+
+Claude Code names each directory after a flattened cwd, and that flattening is lossy: `/` and `.` both become `-`, so the original path cannot be recovered from the name. `lcc` reads the `cwd` field out of a transcript instead, which records the real path. A directory whose transcripts never name one is left out entirely — `lcc` cannot tell whether its worktree still exists, so it never offers to delete it.
+
+Transcripts are treated as more valuable than build data, because they are: a DerivedData folder comes back on the next build and a transcript is what `claude --resume` replays. So `lcc remove` **lists** the matching folders in its confirmation and keeps them; `--sessions` is what actually deletes them.
+
+Set `LCC_CLAUDE_PROJECTS` to override the location.
+
+## `lcc clean`
+
+The backlog of both: every DerivedData folder and every session directory whose worktree no longer exists on disk, biggest first, in one checkbox list.
+
+```
+$ lcc clean
+› Measuring 31 orphaned folders…
+14 GB in 31 folders whose worktree no longer exists.
+Session transcripts are what `claude --resume` replays — check before deleting.
+? Select what to delete (space toggles, enter confirms):
+❯ ◉  2.4 GB  build data  LocationTracker-fmqzbi…  ~/…/pe-224-history-empty-states
+  ◉   12 MB  sessions    -Users-…-pe-224-history  ~/…/pe-224-history-empty-states
+```
+
+`--build-data` and `--sessions` narrow it to one category; `-y` takes everything without asking.
 
 ## Configuration
 
@@ -108,27 +170,48 @@ Set `LCC_DERIVED_DATA` to override the location; otherwise `lcc` honours Xcode's
 | `worktreeTemplate` | `{repoRoot}/.lcc/worktrees/{branchLeaf}` | Where worktrees go. Placeholders: `{repoRoot}`, `{repoParent}`, `{repoName}`, `{branch}`, `{branchLeaf}` |
 | `activeStates` | `["Todo", "In Progress"]` | Which Linear states to offer, in this order |
 | `startTaskCommand` | `""` | Passed to `claude` as its first argument. Placeholders: `{identifier}`, `{branch}`, `{url}` |
-| `envPatterns` | `[".env", ".env.*"]` | Which root files to symlink into the worktree |
-| `envExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
+| `linkPatterns` | `[".env", ".env.*", ".claude/settings.local.json"]` | Which files to symlink into each worktree |
+| `linkExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
 | `clientId` | built-in | Linear OAuth application. Override with `LCC_CLIENT_ID` or `lcc auth setup --client-id <id>` |
 
 `{repoRoot}` and `{repoParent}` always resolve against the **main** worktree, so running `lcc` from inside a worktree puts the next one beside its siblings instead of nesting it one level deeper.
 
 A worktree nested inside the repo is added to `.git/info/exclude`, so it never shows up as untracked.
 
+### Link patterns
+
+A pattern is a path relative to the repo root whose every segment may glob, so it reaches things that do not sit at the top level:
+
+| Pattern | Matches |
+|---|---|
+| `.env` | a root-level `.env`, and nothing in a subdirectory |
+| `.env.*` | `.env.local`, `.env.production` |
+| `.claude/settings.local.json` | exactly that file |
+| `*/credentials.plist` | `Config/credentials.plist`, but not `a/b/credentials.plist` |
+
+`*` and `?` never cross a `/`, so a pattern only ever opens the directories it names — nothing walks the repository. Missing parent directories are created in the worktree, an existing entry of any kind is left alone (the worktree's own file wins), and a pattern that is absolute or contains `..` is skipped rather than clamped.
+
+`.claude/settings.local.json` is in the defaults because it holds the permission allowlist: without it, every new worktree re-asks for approvals already granted in the main checkout. Linking it means one allowlist shared by every worktree.
+
+`envPatterns` and `envExclude` are the pre-nested-path names for these two keys. An existing config keeps working; `linkPatterns`/`linkExclude` win when both are present, and `lcc setup` rewrites the old key to the new one.
+
 ## Layout
 
 ```
-build.zig             build, run and test steps
-src/main.zig          argv parsing and dispatch
-src/commands/         one file per command
-src/linear.zig        GraphQL over std.http.Client
-src/oauth.zig         PKCE, callback listener, token refresh
-src/keychain.zig      Security.framework SecItem*
-src/prompt.zig        raw-mode search, confirm, checkbox, input
-src/git.zig           worktrees, branches, branch disposition
-src/fold.zig          case folding for ASCII, Latin-1, Cyrillic
-src/derived_data.zig  DerivedData discovery and reclamation
+build.zig                build, run and test steps
+src/main.zig             argv parsing and dispatch
+src/commands/            one file per command
+src/linear.zig           GraphQL over std.http.Client
+src/oauth.zig            PKCE, callback listener, token refresh
+src/keychain.zig         Security.framework SecItem*
+src/github.zig           pull-request state via the `gh` CLI
+src/prompt.zig           raw-mode search, confirm, checkbox, input
+src/git.zig              worktrees, branches, branch disposition, drift
+src/fold.zig             case folding for ASCII, Latin-1, Cyrillic
+src/link.zig             pattern matching and symlinking into a worktree
+src/disk.zig             path containment and batched `du`
+src/derived_data.zig     DerivedData discovery and reclamation
+src/claude_projects.zig  ~/.claude/projects discovery and reclamation
 ```
 
 `src/keychain.zig` deliberately `@cImport`s five narrow CoreFoundation/Security headers rather than the umbrella ones: on the macOS 26.5 SDK, `CoreFoundation/CoreFoundation.h` drags in mach headers whose bitfield structs translate-c turns opaque (tripping their own `_Static_assert`s), and `Security/Security.h` drags in `xpc.h`, which puts nullability attributes on the non-pointer `uuid_t`.

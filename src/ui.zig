@@ -187,3 +187,72 @@ pub const Bytes = struct {
 pub fn bytes(value: u64) Bytes {
     return .{ .value = value };
 }
+
+/// Coarse elapsed time in one or two characters plus a unit — `2h`, `6d`, `3w`.
+/// A dashboard column wants "roughly how stale", not a duration.
+pub const Age = struct {
+    seconds: i64,
+
+    pub fn format(self: Age, w: *Io.Writer) Io.Writer.Error!void {
+        // A tip committed in the future (clock skew, a rebase with an old date)
+        // is not worth a negative number.
+        if (self.seconds <= 0) return w.writeAll("now");
+        const s: u64 = @intCast(self.seconds);
+        const minute = 60;
+        const hour = 60 * minute;
+        const day = 24 * hour;
+        const week = 7 * day;
+        const month = 30 * day;
+        const year = 365 * day;
+
+        if (s < minute) return w.writeAll("now");
+        if (s < hour) return w.print("{d}m", .{s / minute});
+        if (s < day) return w.print("{d}h", .{s / hour});
+        if (s < week) return w.print("{d}d", .{s / day});
+        if (s < month) return w.print("{d}w", .{s / week});
+        if (s < year) return w.print("{d}mo", .{s / month});
+        return w.print("{d}y", .{s / year});
+    }
+};
+
+pub fn age(seconds: i64) Age {
+    return .{ .seconds = seconds };
+}
+
+test "age renders the coarsest unit that fits" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { seconds: i64, want: []const u8 }{
+        .{ .seconds = -30, .want = "now" },
+        .{ .seconds = 0, .want = "now" },
+        .{ .seconds = 59, .want = "now" },
+        .{ .seconds = 60, .want = "1m" },
+        .{ .seconds = 59 * 60, .want = "59m" },
+        .{ .seconds = 2 * 3600, .want = "2h" },
+        .{ .seconds = 23 * 3600, .want = "23h" },
+        .{ .seconds = 6 * 24 * 3600, .want = "6d" },
+        .{ .seconds = 11 * 24 * 3600, .want = "1w" },
+        .{ .seconds = 29 * 24 * 3600, .want = "4w" },
+        .{ .seconds = 90 * 24 * 3600, .want = "3mo" },
+        .{ .seconds = 800 * 24 * 3600, .want = "2y" },
+    };
+    for (cases) |case| {
+        const got = try std.fmt.allocPrint(gpa, "{f}", .{age(case.seconds)});
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(case.want, got);
+    }
+}
+
+test "bytes keeps one decimal only below ten units" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { value: u64, want: []const u8 }{
+        .{ .value = 512, .want = "512 B" },
+        .{ .value = 1536, .want = "1.5 KB" },
+        .{ .value = 12 * 1024, .want = "12 KB" },
+        .{ .value = 2 * 1024 * 1024 * 1024, .want = "2.0 GB" },
+    };
+    for (cases) |case| {
+        const got = try std.fmt.allocPrint(gpa, "{f}", .{bytes(case.value)});
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(case.want, got);
+    }
+}

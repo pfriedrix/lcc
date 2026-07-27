@@ -4,8 +4,8 @@ const std = @import("std");
 const app_mod = @import("../app.zig");
 const claude = @import("../claude.zig");
 const config = @import("../config.zig");
-const env = @import("../env.zig");
 const git = @import("../git.zig");
+const link = @import("../link.zig");
 const linear = @import("../linear.zig");
 const oauth = @import("../oauth.zig");
 const prompt = @import("../prompt.zig");
@@ -124,16 +124,15 @@ pub fn run(app: app_mod.App, all: bool) !void {
     };
     app.ui.success("Worktree {s}: {s}", .{ summary, wt.path });
 
-    const env_files = try env.findEnvFiles(app.gpa, app.io, repo.root, cfg.envPatterns, cfg.envExclude);
-    if (env_files.len == 0) {
-        app.ui.hint("No .env files found at repo root — skipping symlinks.", .{});
+    const to_link = try link.findFiles(app.gpa, app.io, repo.root, cfg.linkPatterns, cfg.linkExclude);
+    if (to_link.len == 0) {
+        app.ui.hint("Nothing matched linkPatterns in the repo — skipping symlinks.", .{});
     } else {
-        const linked = try env.linkEnvFiles(app.gpa, app.io, env_files, worktree_path);
+        const linked = try link.linkFiles(app.gpa, app.io, to_link, worktree_path);
         for (linked) |r| {
-            const name = std.fs.path.basename(r.target);
             switch (r.status) {
-                .linked => app.ui.success("Linked {s}", .{name}),
-                .skipped_exists => app.ui.hint("Skipped {s} (already exists in worktree)", .{name}),
+                .linked => app.ui.success("Linked {s}", .{r.rel}),
+                .skipped_exists => app.ui.hint("Skipped {s} (already exists in worktree)", .{r.rel}),
             }
         }
     }
