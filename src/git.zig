@@ -44,6 +44,9 @@ pub const Repo = struct {
     /// Where lcc was actually invoked, which is what "the current branch" means
     /// when that place is a linked worktree. Null inherits the process cwd.
     cwd: ?[]const u8 = null,
+    /// stdout is carrying a machine-readable payload, so no child may write to it.
+    /// Set by `--json`, where a stray line of git progress would corrupt the output.
+    stdout_reserved: bool = false,
 
     fn captureIn(self: Repo, cwd: ?[]const u8, argv: []const []const u8) ?[]u8 {
         return exec.capture(self.gpa, self.io, argv, cwd) catch null;
@@ -202,7 +205,18 @@ pub const Repo = struct {
         return .{ .path = worktree_path, .branch = branch, .created = .new };
     }
 
+    /// git's progress belongs to the user, so its stdio is the terminal's — unless
+    /// stdout is spoken for, in which case the run is captured and only its failure
+    /// is passed on, through `last_error`.
     fn runInherit(self: Repo, argv: []const []const u8) Error!void {
+        if (self.stdout_reserved) {
+            const out = exec.run(self.gpa, self.io, argv, self.root) catch return Error.GitFailed;
+            if (!out.ok()) {
+                last_error = exec.message(out);
+                return Error.GitFailed;
+            }
+            return;
+        }
         const code = exec.inherit(self.io, argv, self.root) catch return Error.GitFailed;
         if (code != 0) return Error.GitFailed;
     }
@@ -374,6 +388,17 @@ pub const WorktreeEntry = struct {
     prunable: bool,
     is_main: bool,
 };
+
+/// The worktree `branch` is checked out in, wherever it sits. Not derived from the
+/// path template: a worktree created before the template changed, or by hand, is
+/// still the one place that branch can be checked out — git allows only one.
+pub fn worktreeForBranch(entries: []const WorktreeEntry, branch: []const u8) ?WorktreeEntry {
+    for (entries) |entry| {
+        const name = entry.branch orelse continue;
+        if (std.mem.eql(u8, name, branch)) return entry;
+    }
+    return null;
+}
 
 pub const BranchStatus = struct {
     branch: []const u8,
@@ -550,6 +575,22 @@ test "worktreePathPrefix cuts the template at the branch" {
     const leading = try worktreePathPrefix(gpa, "{branchLeaf}", "/tmp/proj");
     defer gpa.free(leading);
     try std.testing.expectEqualStrings("", leading);
+}
+
+test "worktreeForBranch matches on the branch, not the path" {
+    const entries = [_]WorktreeEntry{
+        .{ .path = "/r", .branch = "main", .head = "a", .locked = false, .prunable = false, .is_main = true },
+        // The path is no longer what the template would render — a renamed issue,
+        // or a worktree added by hand. The branch is what settles it.
+        .{ .path = "/elsewhere/old", .branch = "feature/pe-1-x", .head = "b", .locked = false, .prunable = false, .is_main = false },
+        .{ .path = "/r/detached", .branch = null, .head = "c", .locked = false, .prunable = false, .is_main = false },
+    };
+
+    try std.testing.expectEqualStrings("/elsewhere/old", worktreeForBranch(&entries, "feature/pe-1-x").?.path);
+    try std.testing.expect(worktreeForBranch(&entries, "main").?.is_main);
+    try std.testing.expect(worktreeForBranch(&entries, "feature/pe-2-y") == null);
+    // A prefix of a branch name is a different branch.
+    try std.testing.expect(worktreeForBranch(&entries, "feature/pe-1") == null);
 }
 
 test "repoRoot answers the main worktree from inside a linked worktree" {

@@ -22,8 +22,10 @@ const usage =
     \\Pick a Linear issue → git worktree + symlinked local files + Claude Code
     \\
     \\Commands:
-    \\  start                    Pick an active Linear issue and bootstrap a worktree
+    \\  start [PE-N]             Bootstrap a worktree for an issue — picker when none is named
     \\    --all                  show all assigned issues regardless of activeStates filter
+    \\    --json                 print what was resolved instead of launching Claude (needs PE-N)
+    \\    --base <ref>           base a new branch on <ref> instead of asking
     \\  auth                     Authenticate with Linear (OAuth browser flow)
     \\    --logout               remove stored token
     \\    --status               show current authentication state
@@ -113,11 +115,30 @@ fn dispatch(app: app_mod.App, args: []const []const u8) !void {
 }
 
 fn startCommand(app: app_mod.App, args: []const []const u8) !void {
-    var all = false;
-    for (args) |arg| {
-        if (eq(arg, "--all")) all = true else return error.UnknownOption;
+    var opts: start_cmd.Opts = .{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (eq(arg, "--all")) {
+            opts.all = true;
+        } else if (eq(arg, "--json")) {
+            opts.json = true;
+        } else if (eq(arg, "--base")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.base = args[i];
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return error.UnknownOption;
+        } else if (opts.issue == null) {
+            opts.issue = arg;
+        } else return error.TooManyArguments;
     }
-    return start_cmd.run(app, all);
+
+    // stdout belongs to the payload in machine mode; the progress lines still go
+    // somewhere a human can see them.
+    var machine = app;
+    machine.ui.divert = opts.json;
+    return start_cmd.run(machine, opts);
 }
 
 fn authCommand(app: app_mod.App, args: []const []const u8) !void {
@@ -237,6 +258,7 @@ test {
     _ = @import("ui.zig");
     _ = @import("xcode.zig");
     _ = @import("commands/list.zig");
+    _ = @import("commands/start.zig");
 }
 
 fn describe(err: anyerror) []const u8 {
