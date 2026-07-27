@@ -173,6 +173,8 @@ Session transcripts are what `claude --resume` replays — check before deleting
 | `linkExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
 | `clientId` | built-in | Linear OAuth application. Override with `LCC_CLIENT_ID` or `lcc auth setup --client-id <id>` |
 
+`{repoRoot}` and `{repoParent}` always resolve against the **main** worktree, so running `lcc` from inside a worktree puts the next one beside its siblings instead of nesting it one level deeper.
+
 A worktree nested inside the repo is added to `.git/info/exclude`, so it never shows up as untracked.
 
 ### Link patterns
