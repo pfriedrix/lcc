@@ -39,6 +39,8 @@ zig build run -- list    # run without installing
 
 Editing anything under `src/` changes nothing on your `PATH` until you re-run `zig build -Doptimize=ReleaseFast`. A plain `zig build` installs a debug binary to the same path — slower, and noisier on unexpected errors.
 
+`.github/workflows/ci.yml` runs both of those on every pull request into `master` and is a required status check, so a red suite blocks the merge button. It pins the Zig version and the runner image on purpose — the gate should only ever go red because of a change in this repo, never because a toolchain or runner image rolled forward underneath it. Both pins are one-line bumps.
+
 ## Authenticate
 
 ```bash
