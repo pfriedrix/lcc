@@ -108,7 +108,24 @@ Results are ordered by *where* the match landed: the start of the identifier ran
 
 `lcc start PE-256` skips the picker. The issue is fetched by identifier rather than filtered out of your assigned list, so `activeStates` and the assignee do not apply — naming an issue is a more specific answer than either. `--base <ref>` cuts a new branch from `<ref>` instead of asking.
 
-Either way, a worktree the issue already has is reused rather than duplicated. It is found by exact branch name first, then by the `PE-N` in it — because Linear derives `branchName` from the title, so renaming an issue changes the branch it suggests while the commits stay on the branch cut from the old name. Matching on the ref is what keeps a renamed issue from getting a second, empty worktree beside the real one. The branch checked out there wins over the suggestion, and the reuse is reported (`matched_by`, `renamed`).
+### Which repository
+
+An identifier names work without naming a checkout, and nothing in Linear closes that gap: the team is one team, the project is a release, and `branchName` is derived from the title. Answering it with the current directory alone is right until you are standing somewhere else — and then lcc cuts a branch and builds a worktree that look entirely correct in a repo that has nothing to do with the issue, which is noticed only once the first file is nowhere to be found.
+
+So the question is answered in order of how much each answer can be trusted:
+
+| | |
+|---|---|
+| `--repo <path>` | said outright, and nothing else is consulted |
+| what lcc remembers | the answer this issue got last time, which is why `lcc start PE-256` works from any directory at all — including one that is not a repository |
+| where the work already is | a branch for `PE-256` in a repository lcc knows *is* the answer: that is where the commits are |
+| the question | a picker over the repositories lcc knows, plus the ones sitting beside the current checkout, so the first run has something to offer instead of demanding a path |
+
+Never a guess from the issue text. The words in a title are exactly the words that turn up in unrelated repositories — this repo's own README mentions `logAllValues`, which is enough to attract an issue that belongs to an iOS app.
+
+Answers are kept in `~/.config/lcc/repos.json` (override with `LCC_REPOS`) and written once a worktree exists, so the picker appears once per issue and never again. `lcc start --json` never falls back to the current directory: with nothing remembered and no branch anywhere, it fails with `repo_unconfirmed` rather than creating a worktree somewhere plausible.
+
+Work the issue already has is reused rather than duplicated, at two levels. A worktree is found by exact branch name first, then by the `PE-N` in it; failing that, a *branch* carrying the same `PE-N` under an older name is checked out instead of a second one being cut beside it — Linear changes what it suggests when an issue is renamed, while the commits stay where they were. Both reuses are reported (`matched_by`, `renamed`, `created: reused_local`), and the most recently committed branch wins when a rename happened more than once.
 
 Running `lcc start PE-256` twice therefore opens the same worktree twice, whatever the template or the title has done since.
 
@@ -129,7 +146,9 @@ $ lcc start PE-256 --json
                  "is_main_checkout": false, "is_cwd": true },
   "repo":      { "root": "/Users/me/…/App", "default_branch": "main" },
   "links":     { "linked": [".env"], "skipped": [".claude/settings.local.json"] },
-  "start_task_command": "/start-task PE-256"
+  "start_task_command": "/start-task PE-256",
+  "mcp":       { "config": "/Users/me/.config/lcc/mcp/-Users-me-Projects-App.json",
+                 "servers": ["linear-server", "xcode"] }
 }
 ```
 
@@ -144,6 +163,7 @@ Every key is always present; absent values are `null`, never dropped.
 | `worktree.matched_by` | how an existing worktree was recognised — `branch` (exact name) or `issue` (the `PE-N` matched, i.e. the issue was renamed). `null` for one this run created |
 | `worktree.is_cwd` | whether this very process is standing in it, which is what tells a caller there is nothing left to open |
 | `worktree.created` / `base` | the strategy (`new`, `reused_local`, `tracking_remote`) and what a new branch was cut from; `null` when the worktree already existed |
+| `mcp` | the local-scope MCP servers a session launched through lcc would get, and the file passed as `--mcp-config`; `null` when the repo has none. A caller that is already running cannot be handed servers retroactively — this is here so it can tell whether a missing server is one lcc would have supplied |
 
 Failures come back in the same shape, on stdout, with exit code 1:
 
@@ -151,7 +171,7 @@ Failures come back in the same shape, on stdout, with exit code 1:
 { "error": { "code": "issue_not_found", "message": "No issue PE-999 in Linear." } }
 ```
 
-Codes: `usage`, `not_authenticated`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`, `worktree_path_exists`, `git_failed`. Progress lines and the human-readable error go to stderr, so stdout holds nothing but the payload — including git's own output, which is captured rather than inherited in this mode.
+Codes: `usage`, `not_authenticated`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`, `worktree_path_exists`, `git_failed`, `bad_repo`, `repo_unconfirmed` — the last one is the picker above in a mode with nobody to ask: pass `--repo <path>`, or run it once interactively and the answer is remembered. Progress lines and the human-readable error go to stderr, so stdout holds nothing but the payload — including git's own output, which is captured rather than inherited in this mode.
 
 ### `lcc open xcode`
 
@@ -246,6 +266,37 @@ A pattern is a path relative to the repo root whose every segment may glob, so i
 
 `envPatterns` and `envExclude` are the pre-nested-path names for these two keys. An existing config keeps working; `linkPatterns`/`linkExclude` win when both are present, and `lcc setup` rewrites the old key to the new one.
 
+### Code signing and the Keychain
+
+The Linear token lives in the login Keychain (`generic password`, service `lcc`, account `linear-token`), and the Keychain decides who may read it from the program's **code signature** — not its path. Zig's linker only ad-hoc signs, and an ad-hoc signature carries no identity beyond the hash of the binary itself, so every rebuild arrives as a *changed* program: macOS then asks for the login password and the process blocks, with no output and no child process, until the dialog is answered. One "Always Allow" only ever covers the exact build it was granted for.
+
+So the build signs the installed binary itself, with nothing to configure:
+
+```
+$ zig build -Doptimize=ReleaseFast
+info: signing lcc with "Apple Development: …"
+```
+
+*Which* certificate it is does not matter — only that it stays the same between builds — so the build takes whatever the machine already has: a certificate named `lcc-dev` if you made one on purpose, otherwise an Apple Development certificate, which a machine that builds apps already has. The chosen name is printed rather than picked silently. Finding nothing is not an error either; the build then leaves the ad-hoc signature alone and the prompts come back.
+
+The designated requirement becomes `identifier lcc and … certificate leaf[subject.CN] = "<identity>"`, which does not mention the binary's contents at all — two different builds produce the same requirement, so the Keychain keeps recognising lcc and one "Always Allow" holds.
+
+| Override | |
+|---|---|
+| `-Dsign="<identity>"` | sign with that certificate |
+| `LCC_CODESIGN_IDENTITY="<identity>"` | the same, from the environment |
+| `-Dsign=none` | opt out, keep the ad-hoc signature |
+
+A self-signed certificate works and never expires on someone else's schedule (Keychain Access → Certificate Assistant → *Create a Certificate*, type *Code Signing*); name it `lcc-dev` and it is preferred automatically. An Apple Development certificate is equally fine, with the caveat that it expires — the requirement changes with the certificate, so the first run after a renewal asks once more.
+
+### MCP servers
+
+Symlinks cannot solve the same problem for MCP servers, because they are not in the repository. `claude mcp add` without `-s user` stores a server under `projects["<absolute cwd>"].mcpServers` in `~/.claude.json` — the key *is* the directory. A worktree is a different directory, so it starts with none of them: the checkout where `linear-server` was added is the only place it exists.
+
+So `lcc start` and `lcc open` read the repo's local-scope servers and pass them to Claude Code as `--mcp-config <file>`, generated per repo under `~/.config/lcc/mcp/`. Without `--strict-mcp-config` they add to the user, global and plugin scopes rather than replacing them, and the servers keep whatever authentication they already had. `~/.claude.json` itself is only ever read: it is Claude Code's own working state, rewritten whole when a session ends, so an outside write survives only until the next exit.
+
+Two things this cannot do. A server that was never authenticated stays unauthenticated — `/mcp` in a session is the only thing that fixes that, and the worktree is not why it is dark. And a session that is *already* running cannot be handed servers retroactively, which is why `lcc start --json` reports what a launch would have carried instead of carrying it.
+
 ## Layout
 
 ```
@@ -258,6 +309,8 @@ src/keychain.zig         Security.framework SecItem*
 src/github.zig           pull-request state via the `gh` CLI
 src/prompt.zig           raw-mode search, confirm, checkbox, input
 src/git.zig              worktrees, branches, branch disposition, drift
+src/mcp.zig              local-scope MCP servers, carried into a worktree
+src/repos.zig            which repository an issue belongs to, remembered
 src/fold.zig             case folding for ASCII, Latin-1, Cyrillic
 src/link.zig             pattern matching and symlinking into a worktree
 src/disk.zig             path containment and batched `du`

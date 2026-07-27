@@ -26,6 +26,9 @@ const usage =
     \\    --all                  show all assigned issues regardless of activeStates filter
     \\    --json                 print what was resolved instead of launching Claude (needs PE-N)
     \\    --base <ref>           base a new branch on <ref> instead of asking
+    \\    --repo <path>          the repository the issue's code is in, when lcc cannot
+    \\                           tell — it remembers the answer per issue, and finds a
+    \\                           repo that already has a branch for it on its own
     \\  auth                     Authenticate with Linear (OAuth browser flow)
     \\    --logout               remove stored token
     \\    --status               show current authentication state
@@ -127,6 +130,10 @@ fn startCommand(app: app_mod.App, args: []const []const u8) !void {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.base = args[i];
+        } else if (eq(arg, "--repo")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.repo = args[i];
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownOption;
         } else if (opts.issue == null) {
@@ -253,8 +260,10 @@ test {
     _ = @import("keychain.zig");
     _ = @import("linear.zig");
     _ = @import("link.zig");
+    _ = @import("mcp.zig");
     _ = @import("oauth.zig");
     _ = @import("prompt.zig");
+    _ = @import("repos.zig");
     _ = @import("ui.zig");
     _ = @import("xcode.zig");
     _ = @import("commands/list.zig");

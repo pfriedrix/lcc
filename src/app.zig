@@ -14,8 +14,16 @@ pub const App = struct {
     ui: ui.Ui,
 
     pub fn repo(self: App) !git.Repo {
-        const root = try git.repoRoot(self.gpa, self.io, null);
-        return .{ .gpa = self.gpa, .io = self.io, .root = root };
+        return self.repoAt(null);
+    }
+
+    /// The repository containing `cwd`, for `--repo`. The path is carried into
+    /// `Repo.cwd` as well: once a caller has named a repository, "the current
+    /// branch" means the one checked out *there*, not in the directory lcc
+    /// happens to have been run from.
+    pub fn repoAt(self: App, cwd: ?[]const u8) !git.Repo {
+        const root = try git.repoRoot(self.gpa, self.io, cwd);
+        return .{ .gpa = self.gpa, .io = self.io, .root = root, .cwd = cwd };
     }
 };
 
