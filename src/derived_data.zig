@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const disk = @import("disk.zig");
 const exec = @import("exec.zig");
 
 pub const Entry = struct {
@@ -141,11 +142,11 @@ pub fn forWorktree(
     worktree_path: []const u8,
 ) ![]Entry {
     // Xcode records the resolved path; `git worktree list` does not resolve symlinks.
-    const resolved = realPath(gpa, io, worktree_path);
+    const resolved = disk.realPath(gpa, io, worktree_path);
 
     var matched: std.ArrayList(Entry) = .empty;
     for (entries) |entry| {
-        if (try isInside(gpa, resolved, entry.workspace_path)) try matched.append(gpa, entry);
+        if (disk.isInside(gpa, resolved, entry.workspace_path)) try matched.append(gpa, entry);
     }
     return matched.toOwnedSlice(gpa);
 }
@@ -162,34 +163,14 @@ pub fn orphans(gpa: std.mem.Allocator, io: Io, entries: []const Entry) ![]Entry 
     return dead.toOwnedSlice(gpa);
 }
 
-/// Attaches disk usage to each entry. One `du` covers every folder — walking
-/// millions of build artifacts in-process is far slower, and one child process
-/// beats the eight the TypeScript version ran concurrently.
+/// Attaches disk usage to each entry.
 pub fn withSizes(gpa: std.mem.Allocator, io: Io, entries: []const Entry) ![]Sized {
+    const paths = try gpa.alloc([]const u8, entries.len);
+    for (entries, 0..) |entry, i| paths[i] = entry.path;
+    const sizes = try disk.usage(gpa, io, paths);
+
     const sized = try gpa.alloc(Sized, entries.len);
-    for (entries, 0..) |entry, i| sized[i] = .{ .entry = entry, .size = 0 };
-    if (entries.len == 0) return sized;
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(gpa, &.{ "du", "-sk" });
-    for (entries) |entry| try argv.append(gpa, entry.path);
-
-    // `du` exits non-zero on unreadable subdirectories but still prints totals.
-    const out = exec.run(gpa, io, argv.items, null) catch return sized;
-    defer out.deinit(gpa);
-
-    var lines = std.mem.splitScalar(u8, out.stdout, '\n');
-    while (lines.next()) |line| {
-        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
-        const kb = std.fmt.parseInt(u64, std.mem.trim(u8, line[0..tab], " "), 10) catch continue;
-        const path = std.mem.trim(u8, line[tab + 1 ..], " \r");
-        for (sized) |*s| {
-            if (std.mem.eql(u8, s.entry.path, path)) {
-                s.size = kb * 1024;
-                break;
-            }
-        }
-    }
+    for (entries, 0..) |entry, i| sized[i] = .{ .entry = entry, .size = sizes[i] };
     return sized;
 }
 
@@ -197,31 +178,8 @@ pub fn withSizes(gpa: std.mem.Allocator, io: Io, entries: []const Entry) ![]Size
 /// `dir_path`, so the root itself and Xcode's shared caches can never be hit.
 pub fn remove(gpa: std.mem.Allocator, io: Io, entry: Entry, dir_path: []const u8) !void {
     _ = gpa;
-    const parent = std.fs.path.dirname(entry.path) orelse return Error.RefusingToDelete;
-    const trimmed_root = std.mem.trimEnd(u8, dir_path, "/");
-    if (!std.mem.eql(u8, parent, trimmed_root) or entry.name.len == 0) {
-        return Error.RefusingToDelete;
-    }
-    try Io.Dir.cwd().deleteTree(io, entry.path);
-}
-
-fn realPath(gpa: std.mem.Allocator, io: Io, target: []const u8) []const u8 {
-    return Io.Dir.cwd().realPathFileAlloc(io, target, gpa) catch target;
-}
-
-fn isInside(gpa: std.mem.Allocator, parent: []const u8, child: []const u8) !bool {
-    const rel = std.fs.path.relativePosix(gpa, parent, parent, child) catch return false;
-    return rel.len != 0 and !std.mem.startsWith(u8, rel, "..") and !std.fs.path.isAbsolute(rel);
-}
-
-pub fn totalSize(entries: []const Sized) u64 {
-    var total: u64 = 0;
-    for (entries) |e| total += e.size;
-    return total;
-}
-
-pub fn sizeDesc(_: void, a: Sized, b: Sized) bool {
-    return a.size > b.size;
+    if (entry.name.len == 0) return Error.RefusingToDelete;
+    disk.removeChild(io, dir_path, entry.path) catch return Error.RefusingToDelete;
 }
 
 test "workspace path is pulled out of plist xml" {
