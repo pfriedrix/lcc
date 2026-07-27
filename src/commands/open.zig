@@ -4,6 +4,8 @@ const std = @import("std");
 const app_mod = @import("../app.zig");
 const claude = @import("../claude.zig");
 const claude_projects = @import("../claude_projects.zig");
+const git = @import("../git.zig");
+const mcp = @import("../mcp.zig");
 const ui = @import("../ui.zig");
 const xcode = @import("../xcode.zig");
 
@@ -33,15 +35,24 @@ pub fn run(app: app_mod.App, target: Target, no_resume: bool) !void {
 
     switch (target) {
         .xcode => try openInXcode(app, picked),
-        .claude => try openInClaude(app, picked, no_resume),
+        .claude => try openInClaude(app, repo, picked, no_resume),
     }
 }
 
-fn openInClaude(app: app_mod.App, picked: app_mod.Choice, no_resume: bool) !void {
+fn openInClaude(
+    app: app_mod.App,
+    repo: git.Repo,
+    picked: app_mod.Choice,
+    no_resume: bool,
+) !void {
     // `--resume` in a directory Claude Code has never run in opens a picker with
     // nothing to pick, so only ask for it once a transcript exists.
     const resumable = !no_resume and
         claude_projects.hasSessionsFor(app.gpa, app.io, app.environ, picked.entry.path);
+
+    // Same reason `lcc start` does it: local-scope MCP servers are keyed on the
+    // directory they were added in, so a worktree sees none of the repo's own.
+    const carried = try mcp.carry(app.gpa, app.io, app.environ, repo.root);
 
     const label = picked.entry.branch orelse app_mod.shortHead(picked.entry.head);
     app.ui.info("{f} in {f} {f}", .{
@@ -50,10 +61,20 @@ fn openInClaude(app: app_mod.App, picked: app_mod.Choice, no_resume: bool) !void
         ui.cyan(label),
     });
     if (!resumable and !no_resume) app.ui.hint("No sessions here yet — starting fresh.", .{});
+    if (carried) |c| {
+        app.ui.hint("MCP: carrying {d} local server(s) from {s} — {s}", .{
+            c.names.len,
+            std.fs.path.basename(repo.root),
+            try std.mem.join(app.gpa, ", ", c.names),
+        });
+    }
     app.ui.flush();
 
-    const extra: []const []const u8 = if (resumable) &.{"--resume"} else &.{};
-    const code = try claude.launch(app.gpa, app.io, picked.entry.path, extra);
+    var extra: std.ArrayList([]const u8) = .empty;
+    if (carried) |c| try extra.appendSlice(app.gpa, &.{ "--mcp-config", c.path });
+    if (resumable) try extra.append(app.gpa, "--resume");
+
+    const code = try claude.launch(app.gpa, app.io, picked.entry.path, extra.items);
     std.process.exit(code);
 }
 

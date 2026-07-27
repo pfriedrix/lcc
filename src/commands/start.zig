@@ -15,8 +15,10 @@ const disk = @import("../disk.zig");
 const git = @import("../git.zig");
 const link = @import("../link.zig");
 const linear = @import("../linear.zig");
+const mcp = @import("../mcp.zig");
 const oauth = @import("../oauth.zig");
 const prompt = @import("../prompt.zig");
+const repos = @import("../repos.zig");
 const ui = @import("../ui.zig");
 
 const priority_label = [_][]const u8{ "   ", "U  ", "H  ", "M  ", "L  " };
@@ -31,6 +33,9 @@ pub const Opts = struct {
     /// Base for a branch that does not exist yet. Interactive mode asks when it
     /// cannot tell; `--json` has nobody to ask, so it takes this or the default branch.
     base: ?[]const u8 = null,
+    /// The repository the issue's code lives in, when neither what lcc remembers nor
+    /// where the work already is can answer that — see `resolveRepo`.
+    repo: ?[]const u8 = null,
 };
 
 pub fn run(app: app_mod.App, opts: Opts) !void {
@@ -40,13 +45,18 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     if (opts.json and opts.all) {
         bail(app, opts.json, "usage", "--all only affects the picker, which --json does not use.", .{});
     }
+    // Said before the read, not after: the Keychain grants access to a binary by its
+    // code signature, so a freshly built lcc can block here on a system dialog for
+    // the login password. Announced, that is a wait with a reason; unannounced, it
+    // is a process sitting silently with no output and no child, which is
+    // indistinguishable from a hang in lcc itself.
+    app.ui.hint("Reading the Linear token from the Keychain...", .{});
+    app.ui.flush();
     if (oauth.getToken(app.gpa) == null) {
         bail(app, opts.json, "not_authenticated", "Not authenticated. Run `lcc auth` first.", .{});
     }
 
     const cfg = try config.load(app.gpa, app.io, app.environ);
-    var repo = try app.repo();
-    repo.stdout_reserved = opts.json;
 
     const token = oauth.ensureFreshToken(app.gpa, app.io, cfg.clientId) catch |err| {
         bail(app, opts.json, "auth_failed", "{s}: {s}", .{ @errorName(err), oauth.last_detail });
@@ -60,22 +70,57 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     const suggested = try git.rewriteBranchName(app.gpa, selected.branch_name, "feature");
     if (!opts.json) app.ui.hint("Selected {s} — branch {s}", .{ selected.identifier, suggested });
 
+    // Which repository, before anything is created in one. Resolved after the issue
+    // is known, because the issue is what the answer is remembered against.
+    var repo = try resolveRepo(app, opts, selected.identifier);
+    repo.stdout_reserved = opts.json;
+
     const wt = try bootstrap(app, opts, cfg, repo, suggested);
 
+    // Written down only now: an answer is worth keeping once it produced a worktree.
+    const learned = try repos.remember(
+        app.gpa,
+        repos.load(app.gpa, app.io, app.environ),
+        selected.identifier,
+        repo.root,
+    );
+    repos.save(app.gpa, app.io, app.environ, learned) catch {};
+
+    // The main checkout already *is* the directory those servers are keyed on, so
+    // handing them back would only duplicate what Claude Code loads by itself.
+    const carried = if (wt.is_main_checkout)
+        null
+    else
+        try mcp.carry(app.gpa, app.io, app.environ, repo.root);
+
     if (opts.json) {
-        try report(app, cfg, repo, selected, suggested, wt);
+        try report(app, cfg, repo, selected, suggested, wt, carried);
         return;
     }
 
     app.ui.info("", .{});
     app.ui.info("{f} in {f}", .{ ui.bold("Launching Claude Code"), ui.dim(wt.path) });
     app.ui.hint("Linear: {s}", .{selected.url});
+    if (carried) |c| {
+        app.ui.hint("MCP: carrying {d} local server(s) from {s} — {s}", .{
+            c.names.len,
+            std.fs.path.basename(repo.root),
+            try std.mem.join(app.gpa, ", ", c.names),
+        });
+    }
     app.ui.info("", .{});
     app.ui.flush();
 
     var extra: std.ArrayList([]const u8) = .empty;
+    if (carried) |c| try extra.appendSlice(app.gpa, &.{ "--mcp-config", c.path });
+
     const trimmed_command = std.mem.trim(u8, cfg.startTaskCommand, " \t");
     if (trimmed_command.len > 0) {
+        // `--mcp-config` takes a *list* of files, so it swallows any plain argument
+        // that follows — the prompt included, which then fails to be found as a
+        // config file. `--` ends the list. Only emitted alongside a flag, so a
+        // launch without MCP servers passes the prompt exactly as it always has.
+        if (extra.items.len > 0) try extra.append(app.gpa, "--");
         try extra.append(app.gpa, try expandCommand(app.gpa, cfg.startTaskCommand, selected, wt.branch));
     }
 
@@ -213,6 +258,20 @@ fn findWorktree(entries: []const git.WorktreeEntry, branch: []const u8) ?Match {
     return null;
 }
 
+/// A local branch carrying the same issue as `suggested` under a different name —
+/// what a rename in Linear leaves behind, since `branchName` is derived from the
+/// title while the commits stay where they were. The most recently committed one when
+/// there are several: renames can happen more than once, and the newest is the work.
+fn newestBranchForIssue(statuses: []const git.BranchStatus, suggested: []const u8) ?[]const u8 {
+    var best: ?git.BranchStatus = null;
+    for (statuses) |status| {
+        if (std.mem.eql(u8, status.branch, suggested)) continue;
+        if (!linear.sameIssue(status.branch, suggested)) continue;
+        if (best == null or status.committed_at > best.?.committed_at) best = status;
+    }
+    return if (best) |status| status.branch else null;
+}
+
 /// The worktree for `suggested`, made if the issue has none yet. Finding one is a
 /// normal outcome, not a failure: `lcc start PE-256` twice, or once from inside the
 /// worktree it made the first time, both land here.
@@ -254,6 +313,19 @@ fn bootstrap(
             }
         }
     } else {
+        // No worktree, but the branch may still be there under an older name — the
+        // same rename that `findWorktree` deals with, one step earlier. Cutting a
+        // second branch beside it would leave the commits behind.
+        if (repo.resolveStrategy(branch) == .new) {
+            if (newestBranchForIssue(try repo.branchStatuses(), branch)) |existing| {
+                if (!opts.json) app.ui.warn(
+                    "The issue was renamed in Linear — its branch is {s}, while Linear now suggests {s}.",
+                    .{ existing, branch },
+                );
+                branch = existing;
+            }
+        }
+
         path = try git.renderWorktreePath(app.gpa, cfg.worktreeTemplate, repo.root, branch);
         base = try resolveBase(app, opts, repo, branch);
 
@@ -327,6 +399,100 @@ fn bootstrap(
     };
 }
 
+/// Which repository the issue's work belongs in — the question `git` cannot answer
+/// and Linear does not carry, so getting it wrong builds a branch and a worktree that
+/// look entirely correct in a repo that has nothing to do with the issue.
+///
+/// Answered in order of how much it can be trusted: what lcc was told before, then
+/// work that already exists, then a question. Never a guess from the issue text —
+/// the words in a title are exactly the words that turn up in unrelated repos.
+fn resolveRepo(app: app_mod.App, opts: Opts, identifier: []const u8) !git.Repo {
+    if (opts.repo) |given| return app.repoAt(given) catch bail(
+        app,
+        opts.json,
+        "bad_repo",
+        "--repo {s} is not inside a git repository.",
+        .{given},
+    );
+
+    const state = repos.load(app.gpa, app.io, app.environ);
+
+    // The answer from last time. This is what makes `lcc start PE-236` work from
+    // anywhere, including a directory that is not a repository at all.
+    if (repos.recall(state, identifier)) |remembered| {
+        if (app.repoAt(remembered)) |found| {
+            if (!opts.json) app.ui.hint("{s} lives in {f}", .{
+                identifier,
+                ui.bold(std.fs.path.basename(found.root)),
+            });
+            return found;
+        } else |_| {
+            // The repo moved or was deleted; fall through and ask again.
+        }
+    }
+
+    // Standing in a repository is the ordinary way of saying which one is meant, so
+    // it leads the shortlist and is checked for existing work first.
+    const here: ?[]const u8 = if (app.repo()) |found| found.root else |_| null;
+    const known = try repos.candidates(app.gpa, app.io, state, here, here);
+
+    // A branch for this issue somewhere is the answer, without anyone being asked:
+    // that is where the commits are.
+    const started = try repos.withIssueBranch(app.gpa, app.io, known, identifier);
+    if (started.len == 1) {
+        const found = try app.repoAt(started[0]);
+        if (!opts.json and (here == null or !std.mem.eql(u8, found.root, here.?))) {
+            app.ui.hint("{s} already has a branch in {f}", .{
+                identifier,
+                ui.bold(std.fs.path.basename(found.root)),
+            });
+        }
+        return found;
+    }
+
+    // Nothing knows, and `--json` has nobody to ask. Refusing beats creating a
+    // worktree in whichever repository the caller happened to be standing in.
+    if (opts.json) bail(
+        app,
+        opts.json,
+        "repo_unconfirmed",
+        "Nothing says which repository {s} belongs to: no answer remembered for it, and " ++
+            "no branch for it in any repository lcc knows{s}. --json will not fall back to the " ++
+            "current directory — re-run with --repo <path>, or once interactively to answer it.",
+        .{ identifier, if (here) |root| root else "" },
+    );
+
+    // Several repositories hold a branch for this issue — rare, and exactly when the
+    // shortlist is worth more than the full list.
+    const offer = if (started.len > 1) started else known;
+    if (offer.len == 0) return error.NotAGitRepository;
+    return app.repoAt(try pickRepo(app, identifier, offer));
+}
+
+fn pickRepo(app: app_mod.App, identifier: []const u8, roots: []const []const u8) ![]const u8 {
+    const items = try app.gpa.alloc(prompt.Item, roots.len);
+    for (roots, 0..) |root, i| {
+        items[i] = .{
+            .label = try std.fmt.allocPrint(app.gpa, "{f}  {f}", .{
+                ui.pad(std.fs.path.basename(root), 28),
+                ui.dim(root),
+            }),
+            .haystack = root,
+            .description = root,
+        };
+    }
+
+    app.ui.flush();
+    const message = try std.fmt.allocPrint(
+        app.gpa,
+        "Which repository does {s} live in? (asked once — lcc remembers)",
+        .{identifier},
+    );
+    const index = try prompt.search(app.gpa, app.io, message, items) orelse
+        std.process.exit(app_mod.cancelled_exit_code);
+    return roots[index];
+}
+
 /// What a branch that does not exist yet gets cut from. An explicit `--base` wins;
 /// otherwise the default branch, unless standing somewhere else is worth asking about.
 fn resolveBase(app: app_mod.App, opts: Opts, repo: git.Repo, branch: []const u8) ![]const u8 {
@@ -366,6 +532,16 @@ const Report = struct {
     /// What lcc would hand Claude Code, placeholders expanded. Null when
     /// `startTaskCommand` is unset.
     start_task_command: ?[]const u8,
+    /// The local-scope MCP servers lcc would carry into the worktree, and the file
+    /// it would pass as `--mcp-config`. Null when the repo has none. A caller that
+    /// is *already* running cannot be given servers retroactively — this is here so
+    /// it can say what a session launched through lcc would have.
+    mcp: ?ReportMcp,
+};
+
+const ReportMcp = struct {
+    config: []const u8,
+    servers: []const []const u8,
 };
 
 const ReportIssue = struct {
@@ -425,6 +601,7 @@ const Facts = struct {
     default_branch: []const u8,
     is_cwd: bool,
     start_task_command: ?[]const u8,
+    carried: ?mcp.Carried,
 };
 
 fn buildReport(
@@ -472,6 +649,10 @@ fn buildReport(
             .skipped = wt.skipped,
         },
         .start_task_command = facts.start_task_command,
+        .mcp = if (facts.carried) |c|
+            .{ .config = c.path, .servers = c.names }
+        else
+            null,
     };
 }
 
@@ -482,6 +663,7 @@ fn report(
     issue: linear.Issue,
     suggested: []const u8,
     wt: Bootstrapped,
+    carried: ?mcp.Carried,
 ) !void {
     // The branch that exists, not the one Linear suggests: a renamed issue has its
     // upstream and its drift on the branch the commits are actually on.
@@ -502,6 +684,7 @@ fn report(
             null
         else
             try expandCommand(app.gpa, cfg.startTaskCommand, issue, wt.branch),
+        .carried = carried,
     });
 
     const body = try std.json.Stringify.valueAlloc(app.gpa, value, .{ .whitespace = .indent_2 });
@@ -630,6 +813,23 @@ test "findWorktree prefers the exact branch, then the issue behind it" {
     try std.testing.expect(findWorktree(entries[0..1], "feature/pe-250-x") == null);
 }
 
+test "newestBranchForIssue reuses the renamed branch, and only the right issue's" {
+    const statuses = [_]git.BranchStatus{
+        .{ .branch = "main", .upstream = null, .ahead = 0, .behind = 0, .gone = false, .committed_at = 900 },
+        // Two names for PE-250, from two renames; the newer one holds the work.
+        .{ .branch = "feature/pe-250-first-name", .upstream = null, .ahead = 0, .behind = 0, .gone = false, .committed_at = 100 },
+        .{ .branch = "feature/pe-250-second-name", .upstream = null, .ahead = 0, .behind = 0, .gone = false, .committed_at = 200 },
+        .{ .branch = "feature/pe-25-different-issue", .upstream = null, .ahead = 0, .behind = 0, .gone = false, .committed_at = 999 },
+    };
+
+    const found = newestBranchForIssue(&statuses, "feature/pe-250-what-linear-suggests-now").?;
+    try std.testing.expectEqualStrings("feature/pe-250-second-name", found);
+
+    // PE-25 must not soak up PE-250, and the suggestion itself is not a rename of itself.
+    try std.testing.expect(newestBranchForIssue(&statuses, "feature/pe-9-nothing-here") == null);
+    try std.testing.expect(newestBranchForIssue(&statuses, "feature/pe-25-different-issue") == null);
+}
+
 test "the --json payload keeps the shape a caller parses" {
     const gpa = std.testing.allocator;
 
@@ -672,6 +872,7 @@ test "the --json payload keeps the shape a caller parses" {
         .default_branch = "main",
         .is_cwd = true,
         .start_task_command = "/start-task PE-250",
+        .carried = .{ .path = "/cfg/mcp/-r.json", .names = &.{ "linear-server", "xcode" } },
     });
 
     const body = try std.json.Stringify.valueAlloc(gpa, value, .{ .whitespace = .indent_2 });
@@ -713,6 +914,7 @@ test "the --json payload keeps the shape a caller parses" {
         repo: struct { root: []const u8, default_branch: []const u8 },
         links: struct { linked: [][]const u8, skipped: [][]const u8 },
         start_task_command: ?[]const u8,
+        mcp: ?struct { config: []const u8, servers: [][]const u8 },
     };
 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -733,6 +935,10 @@ test "the --json payload keeps the shape a caller parses" {
     try std.testing.expect(parsed.worktree.is_cwd);
     try std.testing.expectEqualStrings(".env", parsed.links.linked[0]);
     try std.testing.expectEqualStrings("/start-task PE-250", parsed.start_task_command.?);
+    // The servers a session launched through lcc would get, named so a caller that
+    // is missing one can tell whether lcc would have supplied it.
+    try std.testing.expectEqualStrings("/cfg/mcp/-r.json", parsed.mcp.?.config);
+    try std.testing.expectEqualStrings("linear-server", parsed.mcp.?.servers[0]);
 }
 
 test "a created worktree reports no match and its base" {
@@ -771,6 +977,7 @@ test "a created worktree reports no match and its base" {
         .default_branch = "main",
         .is_cwd = false,
         .start_task_command = null,
+        .carried = null,
     });
 
     try std.testing.expect(!value.branch.renamed);
@@ -790,6 +997,7 @@ test "a created worktree reports no match and its base" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"matched_by\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"upstream\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"start_task_command\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"mcp\":null") != null);
 }
 
 fn expandCommand(
