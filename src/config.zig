@@ -15,14 +15,21 @@ pub const default_scopes = "read,write";
 pub const default_client_id = "6bf6dd7b761b5ce6539cf5a9ed99b4fb";
 
 const default_worktree_template = "{repoRoot}/.lcc/worktrees/{branchLeaf}";
-const default_env_patterns = [_][]const u8{ ".env", ".env.*" };
-const default_env_exclude = [_][]const u8{ ".env.example", ".env.sample", ".env.template" };
+/// Gitignored files worth sharing with every worktree. `.claude/settings.local.json`
+/// is the permission allowlist: without it, each new worktree re-asks for approvals
+/// that were already granted in the main checkout.
+const default_link_patterns = [_][]const u8{ ".env", ".env.*", ".claude/settings.local.json" };
+const default_link_exclude = [_][]const u8{ ".env.example", ".env.sample", ".env.template" };
 const default_active_states = [_][]const u8{ "Todo", "In Progress" };
 
 /// What the file may contain. Every field optional: absence means "use the default".
 pub const Stored = struct {
     clientId: ?[]const u8 = null,
     worktreeTemplate: ?[]const u8 = null,
+    linkPatterns: ?[]const []const u8 = null,
+    linkExclude: ?[]const []const u8 = null,
+    /// Pre-nested-path names for the two above. Still read so an existing
+    /// config keeps working; `linkPatterns`/`linkExclude` win when both are set.
     envPatterns: ?[]const []const u8 = null,
     envExclude: ?[]const []const u8 = null,
     activeStates: ?[]const []const u8 = null,
@@ -32,8 +39,8 @@ pub const Stored = struct {
 pub const Config = struct {
     clientId: []const u8,
     worktreeTemplate: []const u8,
-    envPatterns: []const []const u8,
-    envExclude: []const []const u8,
+    linkPatterns: []const []const u8,
+    linkExclude: []const []const u8,
     activeStates: []const []const u8,
     startTaskCommand: []const u8,
 };
@@ -85,8 +92,8 @@ pub fn load(
     return .{
         .clientId = env_client_id orelse stored.clientId orelse default_client_id,
         .worktreeTemplate = stored.worktreeTemplate orelse default_worktree_template,
-        .envPatterns = stored.envPatterns orelse &default_env_patterns,
-        .envExclude = stored.envExclude orelse &default_env_exclude,
+        .linkPatterns = stored.linkPatterns orelse stored.envPatterns orelse &default_link_patterns,
+        .linkExclude = stored.linkExclude orelse stored.envExclude orelse &default_link_exclude,
         .activeStates = stored.activeStates orelse &default_active_states,
         .startTaskCommand = stored.startTaskCommand orelse "",
     };
@@ -103,8 +110,15 @@ pub fn save(
     var merged = try loadStored(gpa, io, environ);
     if (patch.clientId) |v| merged.clientId = v;
     if (patch.worktreeTemplate) |v| merged.worktreeTemplate = v;
-    if (patch.envPatterns) |v| merged.envPatterns = v;
-    if (patch.envExclude) |v| merged.envExclude = v;
+    if (patch.linkPatterns) |v| {
+        merged.linkPatterns = v;
+        // Drop the superseded key rather than leave two sources of truth on disk.
+        merged.envPatterns = null;
+    }
+    if (patch.linkExclude) |v| {
+        merged.linkExclude = v;
+        merged.envExclude = null;
+    }
     if (patch.activeStates) |v| merged.activeStates = v;
     if (patch.startTaskCommand) |v| merged.startTaskCommand = v;
 
@@ -129,4 +143,22 @@ pub fn save(
     try writer.interface.writeAll(body);
     try writer.interface.writeAll("\n");
     try writer.interface.flush();
+}
+
+/// The precedence `load` applies, without touching the filesystem.
+fn resolveLinkPatterns(stored: Stored) []const []const u8 {
+    return stored.linkPatterns orelse stored.envPatterns orelse &default_link_patterns;
+}
+
+test "linkPatterns wins over the older envPatterns, which still works alone" {
+    const old: Stored = .{ .envPatterns = &.{".env"} };
+    try std.testing.expectEqualStrings(".env", resolveLinkPatterns(old)[0]);
+
+    const both: Stored = .{ .linkPatterns = &.{"x"}, .envPatterns = &.{".env"} };
+    try std.testing.expectEqualStrings("x", resolveLinkPatterns(both)[0]);
+
+    const neither: Stored = .{};
+    const defaults = resolveLinkPatterns(neither);
+    try std.testing.expectEqual(@as(usize, 3), defaults.len);
+    try std.testing.expectEqualStrings(".claude/settings.local.json", defaults[2]);
 }

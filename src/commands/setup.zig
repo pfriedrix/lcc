@@ -36,19 +36,31 @@ pub fn run(app: app_mod.App) !void {
         joined_states,
     ) orelse std.process.exit(app_mod.cancelled_exit_code);
 
-    var states: std.ArrayList([]const u8) = .empty;
-    var it = std.mem.splitScalar(u8, states_raw, ',');
-    while (it.next()) |part| {
-        const trimmed = std.mem.trim(u8, part, " \t");
-        if (trimmed.len > 0) try states.append(app.gpa, trimmed);
-    }
+    const joined_patterns = try std.mem.join(app.gpa, ", ", cfg.linkPatterns);
+    const patterns_raw = try prompt.input(
+        app.gpa,
+        app.io,
+        "Files to symlink into each worktree (comma-separated, paths may nest):",
+        joined_patterns,
+    ) orelse std.process.exit(app_mod.cancelled_exit_code);
 
     try config.save(app.gpa, app.io, app.environ, .{
         .startTaskCommand = start_task_command,
         .worktreeTemplate = worktree_template,
-        .activeStates = states.items,
+        .activeStates = try splitList(app.gpa, states_raw),
+        .linkPatterns = try splitList(app.gpa, patterns_raw),
     });
 
     const where = try config.path(app.gpa, app.environ);
     app.ui.success("Saved to {s}", .{where});
+}
+
+fn splitList(gpa: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
+    var items: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        if (trimmed.len > 0) try items.append(gpa, trimmed);
+    }
+    return items.toOwnedSlice(gpa);
 }

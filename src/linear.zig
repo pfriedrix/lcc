@@ -112,12 +112,65 @@ fn authHeader(gpa: std.mem.Allocator, token: oauth.Token) ![]u8 {
     return std.fmt.allocPrint(gpa, "Bearer {s}", .{token.access_token});
 }
 
-fn fetchAllRaw(gpa: std.mem.Allocator, io: Io, token: oauth.Token) Error![]RawIssue {
+/// One GraphQL round trip. `body` is the already-serialised request; the raw
+/// response body comes back, with `last_status`/`last_message` set either way.
+fn post(gpa: std.mem.Allocator, io: Io, token: oauth.Token, body: []const u8) Error![]const u8 {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
     const auth = try authHeader(gpa, token);
+    var response: Io.Writer.Allocating = .init(gpa);
 
+    const res = client.fetch(.{
+        .location = .{ .url = endpoint },
+        .method = .POST,
+        .payload = body,
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+            .authorization = .{ .override = auth },
+            .user_agent = .{ .override = "lcc/0.1.0" },
+        },
+        .response_writer = &response.writer,
+    }) catch |err| {
+        last_message = @errorName(err);
+        return Error.HttpFailed;
+    };
+
+    const raw = response.written();
+    last_status = @intFromEnum(res.status);
+    if (last_status < 200 or last_status >= 300) {
+        last_message = try gpa.dupe(u8, raw[0..@min(raw.len, 400)]);
+        return Error.BadStatus;
+    }
+    return raw;
+}
+
+/// Parses a GraphQL envelope, turning both transport-level `errors` and a
+/// missing `data` into `GraphQLFailed` with the message worth showing.
+fn unwrap(comptime T: type, gpa: std.mem.Allocator, raw: []const u8) Error!T {
+    const Wrapper = struct {
+        data: ?T = null,
+        errors: ?[]GraphQLError = null,
+    };
+    const envelope = std.json.parseFromSliceLeaky(Wrapper, gpa, raw, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        last_message = try gpa.dupe(u8, raw[0..@min(raw.len, 400)]);
+        return Error.GraphQLFailed;
+    };
+    if (envelope.errors) |errs| {
+        if (errs.len > 0) {
+            last_message = errs[0].message;
+            return Error.GraphQLFailed;
+        }
+    }
+    return envelope.data orelse {
+        last_message = "Linear API returned no data";
+        return Error.GraphQLFailed;
+    };
+}
+
+fn fetchAllRaw(gpa: std.mem.Allocator, io: Io, token: oauth.Token) Error![]RawIssue {
     var collected: std.ArrayList(RawIssue) = .empty;
     var after: ?[]const u8 = null;
 
@@ -128,47 +181,8 @@ fn fetchAllRaw(gpa: std.mem.Allocator, io: Io, token: oauth.Token) Error![]RawIs
             .variables = .{ .after = after },
         }, .{}) catch return Error.HttpFailed;
 
-        var response: Io.Writer.Allocating = .init(gpa);
-
-        const res = client.fetch(.{
-            .location = .{ .url = endpoint },
-            .method = .POST,
-            .payload = body,
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .authorization = .{ .override = auth },
-                .user_agent = .{ .override = "lcc/0.1.0" },
-            },
-            .response_writer = &response.writer,
-        }) catch |err| {
-            last_message = @errorName(err);
-            return Error.HttpFailed;
-        };
-
-        const raw = response.written();
-        last_status = @intFromEnum(res.status);
-        if (last_status < 200 or last_status >= 300) {
-            last_message = try gpa.dupe(u8, raw[0..@min(raw.len, 400)]);
-            return Error.BadStatus;
-        }
-
-        const envelope = std.json.parseFromSliceLeaky(Envelope, gpa, raw, .{
-            .ignore_unknown_fields = true,
-        }) catch {
-            last_message = try gpa.dupe(u8, raw[0..@min(raw.len, 400)]);
-            return Error.GraphQLFailed;
-        };
-
-        if (envelope.errors) |errs| {
-            if (errs.len > 0) {
-                last_message = errs[0].message;
-                return Error.GraphQLFailed;
-            }
-        }
-        const data = envelope.data orelse {
-            last_message = "Linear API returned no data";
-            return Error.GraphQLFailed;
-        };
+        const raw = try post(gpa, io, token, body);
+        const data = try unwrap(Data, gpa, raw);
 
         try collected.appendSlice(gpa, data.issues.nodes);
 
@@ -261,15 +275,6 @@ fn countDesc(_: void, a: StateCount, b: StateCount) bool {
     return a.count > b.count;
 }
 
-const Viewer = struct {
-    data: ?struct {
-        viewer: struct {
-            name: []const u8,
-            email: []const u8,
-        },
-    } = null,
-};
-
 pub const Me = struct {
     name: []const u8,
     email: []const u8,
@@ -277,46 +282,190 @@ pub const Me = struct {
 
 /// `client.viewer` — used by `lcc auth` to confirm who the token belongs to.
 pub fn viewer(gpa: std.mem.Allocator, io: Io, token: oauth.Token) Error!Me {
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
-
-    const auth = try authHeader(gpa, token);
     const body = std.json.Stringify.valueAlloc(gpa, .{
         .query = "query { viewer { name email } }",
     }, .{}) catch return Error.HttpFailed;
 
-    var response: Io.Writer.Allocating = .init(gpa);
-    const res = client.fetch(.{
-        .location = .{ .url = endpoint },
-        .method = .POST,
-        .payload = body,
-        .headers = .{
-            .content_type = .{ .override = "application/json" },
-            .authorization = .{ .override = auth },
-            .user_agent = .{ .override = "lcc/0.1.0" },
-        },
-        .response_writer = &response.writer,
-    }) catch |err| {
-        last_message = @errorName(err);
-        return Error.HttpFailed;
-    };
+    const raw = try post(gpa, io, token, body);
+    const data = try unwrap(struct { viewer: Me }, gpa, raw);
+    return data.viewer;
+}
 
-    const raw = response.written();
-    last_status = @intFromEnum(res.status);
-    if (last_status < 200 or last_status >= 300) {
-        last_message = try gpa.dupe(u8, raw[0..@min(raw.len, 400)]);
-        return Error.BadStatus;
+/// Both halves of the filter matter for speed as well as correctness: numbers are
+/// only unique within a team, and filtering on the team key too lets Linear answer
+/// from the team's own index instead of every issue the token can see.
+///
+/// `first` is a variable, and the field list is as short as the caller needs, because
+/// Linear prices a request on how much it *could* return: asking for a fixed 100 rows
+/// of every field made a five-branch lookup swing between a third of a second and a
+/// minute.
+const issue_statuses_query =
+    \\query LccIssueStatuses($numbers: [Float!], $teams: [String!], $limit: Int) {
+    \\  issues(
+    \\    filter: { number: { in: $numbers }, team: { key: { in: $teams } } }
+    \\    first: $limit
+    \\  ) {
+    \\    nodes {
+    \\      identifier
+    \\      state { name type }
+    \\    }
+    \\  }
+    \\}
+;
+
+const RawStatus = struct {
+    identifier: []const u8,
+    state: ?State = null,
+};
+
+const StatusConnection = struct { nodes: []RawStatus };
+const StatusData = struct { issues: StatusConnection };
+
+pub const IssueStatus = struct {
+    identifier: []const u8,
+    state_name: []const u8,
+    state_type: []const u8,
+};
+
+/// `PE-224` as it appears inside a branch name.
+pub const Ref = struct {
+    team: []const u8,
+    number: u32,
+};
+
+/// Longest team key lcc will believe. Linear's own keys are a handful of letters;
+/// the cap is what keeps `checkout-3` from being read as issue 3 of team CHECKOUT.
+const max_team_key = 8;
+
+/// The issue a branch belongs to, read out of names like `feature/pe-224-do-thing`.
+/// Only the shape is checked here — whether `PE-224` is a real issue is settled by
+/// matching the identifiers Linear returns, so a false positive costs nothing.
+pub fn refFromBranch(branch: []const u8) ?Ref {
+    var i: usize = 0;
+    while (i < branch.len) {
+        // The key has to start a word, so `feature/pe-224` matches and `2pe-3` does not.
+        if (i > 0 and std.ascii.isAlphanumeric(branch[i - 1])) {
+            i += 1;
+            continue;
+        }
+        var end = i;
+        while (end < branch.len and std.ascii.isAlphabetic(branch[end])) end += 1;
+        if (end > i and end - i <= max_team_key and end < branch.len and branch[end] == '-') {
+            var digits = end + 1;
+            while (digits < branch.len and std.ascii.isDigit(branch[digits])) digits += 1;
+            if (digits > end + 1) {
+                const number = std.fmt.parseInt(u32, branch[end + 1 .. digits], 10) catch {
+                    i = digits;
+                    continue;
+                };
+                return .{ .team = branch[i..end], .number = number };
+            }
+        }
+        i = if (end > i) end + 1 else i + 1;
+    }
+    return null;
+}
+
+/// State and title for the issues a set of branches names, in one request.
+/// Team keys and numbers are sent as independent sets, so the response can hold
+/// issues no branch asked about — callers settle it with `statusForBranch`.
+pub fn fetchIssueStatuses(
+    gpa: std.mem.Allocator,
+    io: Io,
+    token: oauth.Token,
+    refs: []const Ref,
+) Error![]IssueStatus {
+    if (refs.len == 0) return &.{};
+
+    var numbers: std.ArrayList(u32) = .empty;
+    var teams: std.ArrayList([]const u8) = .empty;
+    for (refs) |ref| {
+        for (numbers.items) |seen| {
+            if (seen == ref.number) break;
+        } else try numbers.append(gpa, ref.number);
+
+        // Linear stores keys uppercase; branch names carry them lowercased.
+        const key = try std.ascii.allocUpperString(gpa, ref.team);
+        for (teams.items) |seen| {
+            if (std.mem.eql(u8, seen, key)) break;
+        } else try teams.append(gpa, key);
     }
 
-    const parsed = std.json.parseFromSliceLeaky(Viewer, gpa, raw, .{
-        .ignore_unknown_fields = true,
-    }) catch {
-        last_message = try gpa.dupe(u8, raw[0..@min(raw.len, 400)]);
-        return Error.GraphQLFailed;
+    // A number can exist in every team asked about, so that product is the ceiling
+    // on rows; anything more would be paying for rows that cannot come back.
+    const limit = numbers.items.len * teams.items.len;
+
+    const body = std.json.Stringify.valueAlloc(gpa, .{
+        .query = issue_statuses_query,
+        .variables = .{
+            .numbers = numbers.items,
+            .teams = teams.items,
+            .limit = limit,
+        },
+    }, .{}) catch return Error.HttpFailed;
+
+    const raw = try post(gpa, io, token, body);
+    const data = try unwrap(StatusData, gpa, raw);
+
+    const out = try gpa.alloc(IssueStatus, data.issues.nodes.len);
+    for (data.issues.nodes, 0..) |node, i| {
+        out[i] = .{
+            .identifier = node.identifier,
+            .state_name = if (node.state) |s| std.mem.trim(u8, s.name, " \t") else "Unknown",
+            .state_type = if (node.state) |s| s.type else "unknown",
+        };
+    }
+    return out;
+}
+
+/// The issue whose identifier matches `PE-224` for this branch, case-insensitively.
+pub fn statusForBranch(statuses: []const IssueStatus, branch: []const u8) ?IssueStatus {
+    const ref = refFromBranch(branch) orelse return null;
+    for (statuses) |status| {
+        const dash = std.mem.lastIndexOfScalar(u8, status.identifier, '-') orelse continue;
+        if (!fold.eql(status.identifier[0..dash], ref.team)) continue;
+        const number = std.fmt.parseInt(u32, status.identifier[dash + 1 ..], 10) catch continue;
+        if (number == ref.number) return status;
+    }
+    return null;
+}
+
+test "refFromBranch finds the issue key wherever it sits" {
+    const feature = refFromBranch("feature/pe-224-implement-history-empty-states").?;
+    try std.testing.expectEqualStrings("pe", feature.team);
+    try std.testing.expectEqual(@as(u32, 224), feature.number);
+
+    const bare = refFromBranch("PE-42").?;
+    try std.testing.expectEqualStrings("PE", bare.team);
+    try std.testing.expectEqual(@as(u32, 42), bare.number);
+
+    const nested = refFromBranch("pfriedrix/eng-7-thing").?;
+    try std.testing.expectEqualStrings("eng", nested.team);
+    try std.testing.expectEqual(@as(u32, 7), nested.number);
+
+    // The key can sit after another dashed segment.
+    const later = refFromBranch("feature/abc-pe-224-thing").?;
+    try std.testing.expectEqualStrings("pe", later.team);
+    try std.testing.expectEqual(@as(u32, 224), later.number);
+
+    try std.testing.expect(refFromBranch("master") == null);
+    try std.testing.expect(refFromBranch("release/2.4.1") == null);
+    // The key has to start a word.
+    try std.testing.expect(refFromBranch("2pe-3") == null);
+    // And be short enough to be a team key, so ordinary words are not mistaken
+    // for one: `typewriter-2` is a branch name, not issue 2 of team TYPEWRITER.
+    try std.testing.expect(refFromBranch("typewriter-2") == null);
+}
+
+test "statusForBranch matches on team and number, not position" {
+    const statuses = [_]IssueStatus{
+        .{ .identifier = "ENG-224", .state_name = "Todo", .state_type = "unstarted" },
+        .{ .identifier = "PE-224", .state_name = "In Review", .state_type = "started" },
     };
-    const data = parsed.data orelse {
-        last_message = try gpa.dupe(u8, raw[0..@min(raw.len, 400)]);
-        return Error.GraphQLFailed;
-    };
-    return .{ .name = data.viewer.name, .email = data.viewer.email };
+
+    const hit = statusForBranch(&statuses, "feature/pe-224-thing").?;
+    try std.testing.expectEqualStrings("In Review", hit.state_name);
+
+    try std.testing.expect(statusForBranch(&statuses, "feature/pe-999-thing") == null);
+    try std.testing.expect(statusForBranch(&statuses, "master") == null);
 }

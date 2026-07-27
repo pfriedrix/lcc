@@ -75,6 +75,59 @@ pub const Repo = struct {
         return names;
     }
 
+    /// One `for-each-ref` for every local branch: its upstream, how far the two
+    /// have drifted, and when the tip was committed. A single call, so the cost
+    /// does not grow with the number of worktrees on screen.
+    pub fn branchStatuses(self: Repo) Error![]BranchStatus {
+        const out = self.capture(&.{
+            "git",
+            "for-each-ref",
+            "--format=%(refname:short)%09%(upstream:short)%09%(upstream:track)%09%(committerdate:unix)",
+            "refs/heads/",
+        }) orelse return Error.GitFailed;
+
+        var statuses: std.ArrayList(BranchStatus) = .empty;
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \r");
+            if (line.len == 0) continue;
+
+            var fields = std.mem.splitScalar(u8, line, '\t');
+            const name = fields.next() orelse continue;
+            const upstream = fields.next() orelse "";
+            const track = fields.next() orelse "";
+            const committed = fields.next() orelse "";
+            if (name.len == 0) continue;
+
+            const drift = parseTrack(track);
+            try statuses.append(self.gpa, .{
+                .branch = name,
+                .upstream = if (upstream.len == 0) null else upstream,
+                .ahead = drift.ahead,
+                .behind = drift.behind,
+                .gone = drift.gone,
+                .committed_at = std.fmt.parseInt(i64, committed, 10) catch 0,
+            });
+        }
+        return statuses.toOwnedSlice(self.gpa);
+    }
+
+    /// Number of entries `git status --porcelain` reports in a worktree, or null
+    /// when the worktree cannot be inspected — a prunable one whose directory
+    /// has already been deleted, say.
+    pub fn dirtyCount(self: Repo, worktree_path: []const u8) ?u32 {
+        const out = exec.capture(self.gpa, self.io, &.{
+            "git", "status", "--porcelain",
+        }, worktree_path) catch return null;
+
+        var count: u32 = 0;
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.trim(u8, line, " \t\r").len > 0) count += 1;
+        }
+        return count;
+    }
+
     fn localBranchExists(self: Repo, branch: []const u8) bool {
         const ref = std.fmt.allocPrint(self.gpa, "refs/heads/{s}", .{branch}) catch return false;
         return self.succeeds(&.{ "git", "show-ref", "--verify", "--quiet", ref });
@@ -292,6 +345,44 @@ pub const WorktreeEntry = struct {
     is_main: bool,
 };
 
+pub const BranchStatus = struct {
+    branch: []const u8,
+    /// `origin/feature/x`, or null when the branch was never pushed.
+    upstream: ?[]const u8,
+    ahead: u32,
+    behind: u32,
+    /// The upstream existed and has since been deleted — what a squash-merged PR
+    /// looks like locally.
+    gone: bool,
+    /// Commit timestamp of the branch tip, Unix seconds. 0 when unknown.
+    committed_at: i64,
+};
+
+pub const Drift = struct { ahead: u32 = 0, behind: u32 = 0, gone: bool = false };
+
+/// `%(upstream:track)` renders as `[ahead 2]`, `[behind 3]`, `[ahead 2, behind 3]`,
+/// `[gone]`, or nothing at all — the last meaning either in sync or no upstream,
+/// which `%(upstream:short)` tells apart.
+pub fn parseTrack(track: []const u8) Drift {
+    const body = std.mem.trim(u8, track, " \t[]");
+    if (body.len == 0) return .{};
+    if (std.mem.eql(u8, body, "gone")) return .{ .gone = true };
+
+    var drift: Drift = .{};
+    var parts = std.mem.splitScalar(u8, body, ',');
+    while (parts.next()) |part| {
+        var words = std.mem.tokenizeAny(u8, part, " \t");
+        const label = words.next() orelse continue;
+        const count = std.fmt.parseInt(u32, words.next() orelse continue, 10) catch continue;
+        if (std.mem.eql(u8, label, "ahead")) {
+            drift.ahead = count;
+        } else if (std.mem.eql(u8, label, "behind")) {
+            drift.behind = count;
+        }
+    }
+    return drift;
+}
+
 pub const DispositionReason = enum { merged, upstream_gone, unmerged, default_branch };
 
 pub const BranchDisposition = struct {
@@ -373,6 +464,19 @@ test "renderWorktreePath expands every placeholder" {
     const whole = try renderWorktreePath(gpa, "{repoRoot}/wt/{branch}", "/tmp/proj", "feature/x");
     defer gpa.free(whole);
     try std.testing.expectEqualStrings("/tmp/proj/wt/feature/x", whole);
+}
+
+test "parseTrack covers every shape for-each-ref emits" {
+    try std.testing.expectEqual(Drift{}, parseTrack(""));
+    try std.testing.expectEqual(Drift{ .gone = true }, parseTrack("[gone]"));
+    try std.testing.expectEqual(Drift{ .ahead = 2 }, parseTrack("[ahead 2]"));
+    try std.testing.expectEqual(Drift{ .behind = 14 }, parseTrack("[behind 14]"));
+    try std.testing.expectEqual(
+        Drift{ .ahead = 5, .behind = 14 },
+        parseTrack("[ahead 5, behind 14]"),
+    );
+    // Junk must read as "no information", never as a bogus count.
+    try std.testing.expectEqual(Drift{}, parseTrack("[ahead]"));
 }
 
 test "rewriteBranchName keeps only the tail" {

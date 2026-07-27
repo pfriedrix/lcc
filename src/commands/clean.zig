@@ -1,73 +1,129 @@
-//! `lcc clean` — reclaim build data left by worktrees that no longer exist.
+//! `lcc clean` — reclaim what worktrees leave behind after they are gone:
+//! Xcode build data and Claude Code session transcripts.
 
 const std = @import("std");
 const app_mod = @import("../app.zig");
+const cp = @import("../claude_projects.zig");
 const dd = @import("../derived_data.zig");
+const disk = @import("../disk.zig");
 const prompt = @import("../prompt.zig");
 const ui = @import("../ui.zig");
 
-pub fn run(app: app_mod.App, yes: bool) !void {
-    const root = try dd.root(app.gpa, app.io, app.environ);
-    const entries = try dd.list(app.gpa, app.io, root);
-    if (entries.len == 0) {
-        app.ui.warn("No Xcode build data found in {f}.", .{ui.dim(root)});
-        return;
+pub const Opts = struct {
+    yes: bool = false,
+    /// Which categories to consider. Neither flag means both.
+    build_data: bool = false,
+    sessions: bool = false,
+
+    fn wants(self: Opts, kind: Kind) bool {
+        if (!self.build_data and !self.sessions) return true;
+        return switch (kind) {
+            .build_data => self.build_data,
+            .sessions => self.sessions,
+        };
+    }
+};
+
+const Kind = enum { build_data, sessions };
+
+/// One removable thing, whichever category it came from. The two roots differ,
+/// so each variant carries the entry its own module knows how to delete safely.
+const Target = union(Kind) {
+    build_data: dd.Entry,
+    sessions: cp.Entry,
+};
+
+const Candidate = struct {
+    target: Target,
+    size: u64,
+
+    /// The folder name, as Xcode or Claude Code chose it.
+    fn name(self: Candidate) []const u8 {
+        return switch (self.target) {
+            .build_data => |e| e.name,
+            .sessions => |e| e.name,
+        };
     }
 
-    const dead = try dd.orphans(app.gpa, app.io, entries);
-    if (dead.len == 0) {
+    fn path(self: Candidate) []const u8 {
+        return switch (self.target) {
+            .build_data => |e| e.path,
+            .sessions => |e| e.path,
+        };
+    }
+
+    /// The project or worktree that no longer exists.
+    fn origin(self: Candidate) []const u8 {
+        return switch (self.target) {
+            .build_data => |e| e.workspace_path,
+            .sessions => |e| e.cwd,
+        };
+    }
+
+    fn label(self: Candidate) []const u8 {
+        return switch (self.target) {
+            .build_data => "build data",
+            .sessions => "sessions  ",
+        };
+    }
+
+    fn sizeDesc(_: void, a: Candidate, b: Candidate) bool {
+        return a.size > b.size;
+    }
+};
+
+pub fn run(app: app_mod.App, opts: Opts) !void {
+    const dd_root = try dd.root(app.gpa, app.io, app.environ);
+    const cp_root = try cp.root(app.gpa, app.environ);
+
+    var scanned: usize = 0;
+    var dead: std.ArrayList(Target) = .empty;
+
+    if (opts.wants(.build_data)) {
+        const entries = try dd.list(app.gpa, app.io, dd_root);
+        scanned += entries.len;
+        for (try dd.orphans(app.gpa, app.io, entries)) |entry| {
+            try dead.append(app.gpa, .{ .build_data = entry });
+        }
+    }
+    if (opts.wants(.sessions)) {
+        const entries = try cp.list(app.gpa, app.io, cp_root);
+        scanned += entries.len;
+        for (try cp.orphans(app.gpa, app.io, entries)) |entry| {
+            try dead.append(app.gpa, .{ .sessions = entry });
+        }
+    }
+
+    if (scanned == 0) {
+        app.ui.warn("Nothing to scan — no build data in {f} and no sessions in {f}.", .{
+            ui.dim(disk.abbreviate(app.gpa, app.environ, dd_root)),
+            ui.dim(disk.abbreviate(app.gpa, app.environ, cp_root)),
+        });
+        return;
+    }
+    if (dead.items.len == 0) {
         app.ui.success("Nothing to clean — no orphans among {d} folder{s}.", .{
-            entries.len, plural(entries.len),
+            scanned, plural(scanned),
         });
         return;
     }
 
-    app.ui.step("Measuring {d} orphaned folder{s}…", .{ dead.len, plural(dead.len) });
+    app.ui.step("Measuring {d} orphaned folder{s}…", .{ dead.items.len, plural(dead.items.len) });
     app.ui.flush();
 
-    const sized = try dd.withSizes(app.gpa, app.io, dead);
-    std.mem.sort(dd.Sized, sized, {}, dd.sizeDesc);
+    const candidates = try measure(app, dead.items);
+    std.mem.sort(Candidate, candidates, {}, Candidate.sizeDesc);
 
-    app.ui.info("{f} in {d} folder{s} whose project no longer exists.", .{
-        ui.bold(try std.fmt.allocPrint(app.gpa, "{f}", .{ui.bytes(dd.totalSize(sized))})),
-        sized.len,
-        plural(sized.len),
+    app.ui.info("{f} in {d} folder{s} whose worktree no longer exists.", .{
+        ui.bold(try std.fmt.allocPrint(app.gpa, "{f}", .{ui.bytes(totalSize(candidates))})),
+        candidates.len,
+        plural(candidates.len),
     });
+    if (opts.wants(.sessions)) {
+        app.ui.hint("Session transcripts are what `claude --resume` replays — check before deleting.", .{});
+    }
 
-    const picked: []const dd.Sized = if (yes) sized else blk: {
-        var width: usize = 0;
-        const labels = try app.gpa.alloc([]const u8, sized.len);
-        for (sized, 0..) |item, i| {
-            labels[i] = try std.fmt.allocPrint(app.gpa, "{f}", .{ui.bytes(item.size)});
-            width = @max(width, labels[i].len);
-        }
-
-        const items = try app.gpa.alloc(prompt.Item, sized.len);
-        for (sized, 0..) |item, i| {
-            items[i] = .{
-                .label = try std.fmt.allocPrint(app.gpa, "{s}{s}  {s}  {s}", .{
-                    labels[i],
-                    try blanks(app.gpa, width - labels[i].len),
-                    item.entry.name,
-                    item.entry.workspace_path,
-                }),
-            };
-        }
-
-        app.ui.flush();
-        const chosen = try prompt.checkbox(
-            app.gpa,
-            app.io,
-            "Select build data to delete (space toggles, enter confirms):",
-            items,
-            true,
-        ) orelse std.process.exit(app_mod.cancelled_exit_code);
-
-        const subset = try app.gpa.alloc(dd.Sized, chosen.len);
-        for (chosen, 0..) |index, i| subset[i] = sized[index];
-        break :blk subset;
-    };
-
+    const picked: []const Candidate = if (opts.yes) candidates else try select(app, candidates);
     if (picked.len == 0) {
         app.ui.hint("Nothing selected.", .{});
         return;
@@ -76,19 +132,83 @@ pub fn run(app: app_mod.App, yes: bool) !void {
     app.ui.step("Deleting {d} folder{s}…", .{ picked.len, plural(picked.len) });
     var reclaimed: u64 = 0;
     for (picked) |item| {
-        dd.remove(app.gpa, app.io, item.entry, root) catch |err| {
-            app.ui.warn("Could not remove {s}: {s}", .{ item.entry.name, @errorName(err) });
+        const result = switch (item.target) {
+            .build_data => |e| dd.remove(app.gpa, app.io, e, dd_root),
+            .sessions => |e| cp.remove(app.gpa, app.io, e, cp_root),
+        };
+        result catch |err| {
+            app.ui.warn("Could not remove {s}: {s}", .{ item.name(), @errorName(err) });
             continue;
         };
         reclaimed += item.size;
-        app.ui.success("{s} {f}", .{
-            item.entry.name,
+        app.ui.success("{s} {s} {f}", .{
+            item.label(),
+            item.name(),
             ui.yellow(try std.fmt.allocPrint(app.gpa, "({f})", .{ui.bytes(item.size)})),
         });
     }
     app.ui.success("Reclaimed {f}.", .{
         ui.bold(try std.fmt.allocPrint(app.gpa, "{f}", .{ui.bytes(reclaimed)})),
     });
+}
+
+/// One `du` across both categories, so the wait does not double when cleaning both.
+fn measure(app: app_mod.App, targets: []const Target) ![]Candidate {
+    const paths = try app.gpa.alloc([]const u8, targets.len);
+    for (targets, 0..) |target, i| {
+        paths[i] = switch (target) {
+            .build_data => |e| e.path,
+            .sessions => |e| e.path,
+        };
+    }
+    const sizes = try disk.usage(app.gpa, app.io, paths);
+
+    const candidates = try app.gpa.alloc(Candidate, targets.len);
+    for (targets, 0..) |target, i| candidates[i] = .{ .target = target, .size = sizes[i] };
+    return candidates;
+}
+
+fn select(app: app_mod.App, candidates: []const Candidate) ![]const Candidate {
+    var size_width: usize = 0;
+    var name_width: usize = 0;
+    const sizes = try app.gpa.alloc([]const u8, candidates.len);
+    for (candidates, 0..) |item, i| {
+        sizes[i] = try std.fmt.allocPrint(app.gpa, "{f}", .{ui.bytes(item.size)});
+        size_width = @max(size_width, sizes[i].len);
+        name_width = @max(name_width, ui.displayWidth(item.name()));
+    }
+
+    const items = try app.gpa.alloc(prompt.Item, candidates.len);
+    for (candidates, 0..) |item, i| {
+        items[i] = .{
+            .label = try std.fmt.allocPrint(app.gpa, "{s}{s}  {s}  {f}  {s}", .{
+                try blanks(app.gpa, size_width - sizes[i].len),
+                sizes[i],
+                item.label(),
+                ui.pad(item.name(), name_width),
+                disk.abbreviate(app.gpa, app.environ, item.origin()),
+            }),
+        };
+    }
+
+    app.ui.flush();
+    const chosen = try prompt.checkbox(
+        app.gpa,
+        app.io,
+        "Select what to delete (space toggles, enter confirms):",
+        items,
+        true,
+    ) orelse std.process.exit(app_mod.cancelled_exit_code);
+
+    const subset = try app.gpa.alloc(Candidate, chosen.len);
+    for (chosen, 0..) |index, i| subset[i] = candidates[index];
+    return subset;
+}
+
+fn totalSize(candidates: []const Candidate) u64 {
+    var total: u64 = 0;
+    for (candidates) |c| total += c.size;
+    return total;
 }
 
 fn plural(n: usize) []const u8 {
