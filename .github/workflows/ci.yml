@@ -1,0 +1,48 @@
+name: CI
+
+# The gate for merging: a pull request into master has to compile and pass the
+# unit tests. `push` runs it again on master itself, so a broken merge is caught
+# even if a PR was force-merged past a red check.
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+# A new push to a PR supersedes the run in flight; no point paying for both.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests
+    # macOS only, and not by choice: the keychain layer links Security.framework
+    # and CoreFoundation, so this cannot be cross-compiled or run on Linux.
+    # Pinned rather than `macos-latest` so a runner-image rollout cannot turn the
+    # merge gate red on its own — bump it deliberately.
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Pinned to a commit: a third-party action guarding merges should not be
+      # able to change under us. v2.2.1.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          # Must match the version in README's Build section. Zig 0.16 moved
+          # std.fs.File to std.Io.File and changed the `main` signature, so a
+          # different minor will not build.
+          version: 0.16.0
+
+      - name: zig build test
+        run: zig build test --summary all
+
+      # `zig build test` compiles every module but never links the executable,
+      # so this is what proves `lcc` itself still builds.
+      - name: zig build
+        run: zig build
