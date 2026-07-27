@@ -11,19 +11,46 @@ pub const Error = error{
     GitFailed,
 } || std.mem.Allocator.Error;
 
-/// Absolute path of the repository containing `cwd` (or the process cwd).
+/// Absolute path of the *main* worktree of the repository containing `cwd` (or
+/// the process cwd).
+///
+/// Deliberately not `--show-toplevel`: inside a linked worktree that answers the
+/// worktree itself, and everything lcc derives from the root — the worktree path
+/// template, `.git/info/exclude`, the repo-root `.env` files — has to hang off
+/// the main checkout. `--git-common-dir` is the shared `.git` either way, so its
+/// parent is the main worktree.
 pub fn repoRoot(gpa: std.mem.Allocator, io: Io, cwd: ?[]const u8) Error![]u8 {
-    return exec.capture(gpa, io, &.{ "git", "rev-parse", "--show-toplevel" }, cwd) catch
+    const toplevel = exec.capture(gpa, io, &.{ "git", "rev-parse", "--show-toplevel" }, cwd) catch
         return Error.NotAGitRepository;
+
+    const common = exec.capture(gpa, io, &.{
+        "git", "rev-parse", "--path-format=absolute", "--git-common-dir",
+    }, cwd) catch return toplevel;
+    defer gpa.free(common);
+
+    // `<main-worktree>/.git` is the only shape whose parent is the checkout; a
+    // bare repo or `--separate-git-dir` puts the common dir somewhere unrelated.
+    if (!std.mem.eql(u8, std.fs.path.basename(common), ".git")) return toplevel;
+    const main_root = std.fs.path.dirname(common) orelse return toplevel;
+    gpa.free(toplevel);
+    return gpa.dupe(u8, main_root);
 }
 
 pub const Repo = struct {
     gpa: std.mem.Allocator,
     io: Io,
+    /// Main worktree — the anchor for derived paths and `.git` writes.
     root: []const u8,
+    /// Where lcc was actually invoked, which is what "the current branch" means
+    /// when that place is a linked worktree. Null inherits the process cwd.
+    cwd: ?[]const u8 = null,
+
+    fn captureIn(self: Repo, cwd: ?[]const u8, argv: []const []const u8) ?[]u8 {
+        return exec.capture(self.gpa, self.io, argv, cwd) catch null;
+    }
 
     fn capture(self: Repo, argv: []const []const u8) ?[]u8 {
-        return exec.capture(self.gpa, self.io, argv, self.root) catch null;
+        return self.captureIn(self.root, argv);
     }
 
     fn succeeds(self: Repo, argv: []const []const u8) bool {
@@ -45,9 +72,11 @@ pub const Repo = struct {
             return Error.GitFailed;
     }
 
+    /// The branch checked out where lcc was invoked — not `root`'s, which is a
+    /// different branch whenever the user is standing in a linked worktree.
     /// Null when HEAD is detached.
     pub fn currentBranch(self: Repo) Error!?[]const u8 {
-        const out = self.capture(&.{ "git", "rev-parse", "--abbrev-ref", "HEAD" }) orelse
+        const out = self.captureIn(self.cwd, &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" }) orelse
             return Error.GitFailed;
         if (std.mem.eql(u8, out, "HEAD")) return null;
         return out;
@@ -416,6 +445,67 @@ test "worktreePathPrefix cuts the template at the branch" {
     const leading = try worktreePathPrefix(gpa, "{branchLeaf}", "/tmp/proj");
     defer gpa.free(leading);
     try std.testing.expectEqualStrings("", leading);
+}
+
+test "repoRoot answers the main worktree from inside a linked worktree" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(base);
+
+    const main = try std.fs.path.join(gpa, &.{ base, "proj" });
+    defer gpa.free(main);
+    const linked = try std.fs.path.join(gpa, &.{ base, "proj.worktrees", "x" });
+    defer gpa.free(linked);
+
+    try runGit(gpa, io, base, &.{ "init", "-q", "-b", "master", "proj" });
+    try runGit(gpa, io, main, &.{ "commit", "-q", "--allow-empty", "-m", "init" });
+    try runGit(gpa, io, main, &.{ "worktree", "add", "-q", linked, "-b", "feature/x" });
+
+    const from_main = try repoRoot(gpa, io, main);
+    defer gpa.free(from_main);
+    const from_linked = try repoRoot(gpa, io, linked);
+    defer gpa.free(from_linked);
+
+    // The bug this pins: `--show-toplevel` answers the worktree, so a template
+    // like `{repoParent}/{repoName}.worktrees/…` nested itself one level deeper
+    // on every start from inside a worktree.
+    const toplevel = try exec.capture(gpa, io, &.{ "git", "rev-parse", "--show-toplevel" }, linked);
+    defer gpa.free(toplevel);
+    try std.testing.expect(!std.mem.eql(u8, toplevel, from_linked));
+
+    try std.testing.expectEqualStrings(from_main, from_linked);
+
+    // `root` anchors derived paths, but "the current branch" is still the one
+    // checked out where lcc was invoked — `start` offers it as the base.
+    const repo: Repo = .{ .gpa = gpa, .io = io, .root = from_main, .cwd = linked };
+    const branch = (try repo.currentBranch()).?;
+    defer gpa.free(branch);
+    try std.testing.expectEqualStrings("feature/x", branch);
+}
+
+fn runGit(gpa: std.mem.Allocator, io: Io, cwd: []const u8, args: []const []const u8) !void {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    // The test repo must not depend on the developer's global git config.
+    try argv.appendSlice(gpa, &.{
+        "git",
+        "-c", "user.email=lcc@example.com",
+        "-c", "user.name=lcc",
+        "-c", "commit.gpgsign=false",
+    });
+    try argv.appendSlice(gpa, args);
+
+    const out = try exec.run(gpa, io, argv.items, cwd);
+    defer out.deinit(gpa);
+    if (!out.ok()) {
+        std.debug.print("git {s} failed: {s}\n", .{ args[0], exec.message(out) });
+        return error.GitFailed;
+    }
 }
 
 test "rewriteBranchName keeps only the tail" {
