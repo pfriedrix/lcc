@@ -57,6 +57,58 @@ pub fn root(
     return std.fs.path.join(gpa, &.{ home, ".claude", "projects" });
 }
 
+/// The directory name Claude Code derives from a cwd: every byte that is not
+/// alphanumeric becomes `-`. Forward only — the note at the top of the file is
+/// about the inverse, which is what cannot be recovered.
+pub fn dirName(gpa: std.mem.Allocator, cwd: []const u8) ![]u8 {
+    const name = try gpa.dupe(u8, cwd);
+    for (name) |*c| {
+        if (!std.ascii.isAlphanumeric(c.*)) c.* = '-';
+    }
+    return name;
+}
+
+/// Whether Claude Code holds a transcript for `cwd` itself. `claude --resume`
+/// keys on the exact directory it is launched in, so this is the question that
+/// decides whether its picker would have anything to show; transcripts from a
+/// subdirectory live in their own project directory and do not count.
+pub fn hasSessionsFor(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    cwd: []const u8,
+) bool {
+    const projects = root(gpa, environ) catch return false;
+    // Claude Code names the directory after the resolved path, same as the `cwd`
+    // it records — and `git worktree list` can hand us an unresolved one.
+    const resolved = disk.realPath(gpa, io, cwd);
+    if (transcriptCount(gpa, io, projects, resolved) > 0) return true;
+    if (std.mem.eql(u8, resolved, cwd)) return false;
+    return transcriptCount(gpa, io, projects, cwd) > 0;
+}
+
+/// Transcripts in the project directory belonging to `cwd`. Counting only —
+/// unlike `scanSessions` it never opens a transcript.
+fn transcriptCount(
+    gpa: std.mem.Allocator,
+    io: Io,
+    projects: []const u8,
+    cwd: []const u8,
+) usize {
+    const name = dirName(gpa, cwd) catch return 0;
+    const dir_path = std.fs.path.join(gpa, &.{ projects, name }) catch return 0;
+
+    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+
+    var count: usize = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |dirent| {
+        if (dirent.kind == .file and std.mem.endsWith(u8, dirent.name, ".jsonl")) count += 1;
+    }
+    return count;
+}
+
 /// Every project directory under `dir_path` whose origin cwd could be read.
 /// A directory whose transcripts never name a cwd is left out entirely — lcc
 /// cannot tell whether its project still exists, so it must not offer to delete it.
@@ -272,6 +324,49 @@ test "extractCwd undoes escaping and refuses a truncated value" {
     try std.testing.expect((try extractCwd(gpa, "{\"cwd\":\"/Users/me/Proj")) == null);
     try std.testing.expect((try extractCwd(gpa, "{\"type\":\"mode\"}")) == null);
     try std.testing.expect((try extractCwd(gpa, "{\"cwd\":\"\"}")) == null);
+}
+
+test "hasSessionsFor answers for the launch directory only" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const projects = try std.fs.path.join(arena, &.{ base, "projects" });
+    const cwd = Io.Dir.cwd();
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("HOME", base);
+    try environ.put("LCC_CLAUDE_PROJECTS", projects);
+
+    // A worktree path with a `.` in it, to pin the flattening.
+    const worktree = try std.fs.path.join(arena, &.{ base, "App.worktrees", "pe-1" });
+    try cwd.createDirPath(io, worktree);
+    try std.testing.expect(!hasSessionsFor(arena, io, &environ, worktree));
+
+    // A directory holding no transcript is still no reason to resume.
+    const project_dir = try std.fs.path.join(arena, &.{ projects, try dirName(arena, worktree) });
+    try cwd.createDirPath(io, project_dir);
+    try cwd.createDirPath(io, try std.fs.path.join(arena, &.{ project_dir, "memory" }));
+    try std.testing.expect(!hasSessionsFor(arena, io, &environ, worktree));
+
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ project_dir, "a.jsonl" }),
+        .data = "{\"type\":\"mode\"}\n",
+    });
+    try std.testing.expect(hasSessionsFor(arena, io, &environ, worktree));
+
+    // A transcript from a subdirectory belongs to that subdirectory, and
+    // `claude --resume` at the parent would not list it.
+    const sub = try std.fs.path.join(arena, &.{ worktree, "Common" });
+    try cwd.createDirPath(io, sub);
+    try std.testing.expect(!hasSessionsFor(arena, io, &environ, sub));
 }
 
 test "list reads origins and skips directories with no discoverable cwd" {

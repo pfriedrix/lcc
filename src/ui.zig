@@ -97,29 +97,39 @@ pub const Ui = struct {
     io: Io,
     out: *Io.Writer,
     err: *Io.Writer,
+    /// Send the log vocabulary to stderr instead of stdout, leaving stdout for
+    /// `payload` alone. What `--json` turns on: a caller parsing stdout must not
+    /// have to filter progress lines out of it, and a human running the same
+    /// command still sees them.
+    divert: bool = false,
+
+    fn log(self: Ui) *Io.Writer {
+        return if (self.divert) self.err else self.out;
+    }
 
     pub fn info(self: Ui, comptime fmt: []const u8, args: anytype) void {
-        self.out.print(fmt ++ "\n", args) catch {};
+        self.log().print(fmt ++ "\n", args) catch {};
     }
 
     pub fn success(self: Ui, comptime fmt: []const u8, args: anytype) void {
-        self.out.print("{f} " ++ fmt ++ "\n", .{green("✓")} ++ args) catch {};
+        self.log().print("{f} " ++ fmt ++ "\n", .{green("✓")} ++ args) catch {};
     }
 
     pub fn warn(self: Ui, comptime fmt: []const u8, args: anytype) void {
-        self.out.print("{f} " ++ fmt ++ "\n", .{yellow("!")} ++ args) catch {};
+        self.log().print("{f} " ++ fmt ++ "\n", .{yellow("!")} ++ args) catch {};
     }
 
     pub fn step(self: Ui, comptime fmt: []const u8, args: anytype) void {
-        self.out.print("{f} " ++ fmt ++ "\n", .{cyan("›")} ++ args) catch {};
+        self.log().print("{f} " ++ fmt ++ "\n", .{cyan("›")} ++ args) catch {};
     }
 
     pub fn hint(self: Ui, comptime fmt: []const u8, args: anytype) void {
         // `log.dim` in the TypeScript version.
-        if (color_enabled) self.out.writeAll(Code.dim) catch {};
-        self.out.print(fmt, args) catch {};
-        if (color_enabled) self.out.writeAll(Code.reset) catch {};
-        self.out.writeAll("\n") catch {};
+        const w = self.log();
+        if (color_enabled) w.writeAll(Code.dim) catch {};
+        w.print(fmt, args) catch {};
+        if (color_enabled) w.writeAll(Code.reset) catch {};
+        w.writeAll("\n") catch {};
     }
 
     pub fn fail(self: Ui, comptime fmt: []const u8, args: anytype) void {
@@ -128,8 +138,15 @@ pub const Ui = struct {
         self.err.flush() catch {};
     }
 
+    /// Machine-readable output — never coloured, never diverted, always the only
+    /// thing on stdout when `divert` is set.
+    pub fn payload(self: Ui, comptime fmt: []const u8, args: anytype) void {
+        self.out.print(fmt, args) catch {};
+    }
+
     pub fn flush(self: Ui) void {
         self.out.flush() catch {};
+        if (self.divert) self.err.flush() catch {};
     }
 };
 

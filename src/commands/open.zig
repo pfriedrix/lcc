@@ -3,6 +3,7 @@
 const std = @import("std");
 const app_mod = @import("../app.zig");
 const claude = @import("../claude.zig");
+const claude_projects = @import("../claude_projects.zig");
 const ui = @import("../ui.zig");
 const xcode = @import("../xcode.zig");
 
@@ -37,15 +38,21 @@ pub fn run(app: app_mod.App, target: Target, no_resume: bool) !void {
 }
 
 fn openInClaude(app: app_mod.App, picked: app_mod.Choice, no_resume: bool) !void {
+    // `--resume` in a directory Claude Code has never run in opens a picker with
+    // nothing to pick, so only ask for it once a transcript exists.
+    const resumable = !no_resume and
+        claude_projects.hasSessionsFor(app.gpa, app.io, app.environ, picked.entry.path);
+
     const label = picked.entry.branch orelse app_mod.shortHead(picked.entry.head);
     app.ui.info("{f} in {f} {f}", .{
         ui.bold("Launching Claude Code"),
         ui.dim(picked.entry.path),
         ui.cyan(label),
     });
+    if (!resumable and !no_resume) app.ui.hint("No sessions here yet — starting fresh.", .{});
     app.ui.flush();
 
-    const extra: []const []const u8 = if (no_resume) &.{} else &.{"--resume"};
+    const extra: []const []const u8 = if (resumable) &.{"--resume"} else &.{};
     const code = try claude.launch(app.gpa, app.io, picked.entry.path, extra);
     std.process.exit(code);
 }

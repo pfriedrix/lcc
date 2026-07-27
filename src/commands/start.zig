@@ -1,9 +1,17 @@
-//! `lcc start` — pick an issue, bootstrap a worktree, launch Claude.
+//! `lcc start` — pick an issue (or name one), bootstrap a worktree, launch Claude.
+//!
+//! Two shapes, one path through the work. Interactively it asks what it needs and
+//! ends by handing the terminal to Claude Code. With `--json` it asks nothing,
+//! launches nothing, and prints what it resolved — the shape a caller that is
+//! *already* inside Claude Code can use, so `/start-task` can ask lcc where an
+//! issue lives instead of probing git for the branch and the worktree itself.
 
 const std = @import("std");
+const Io = std.Io;
 const app_mod = @import("../app.zig");
 const claude = @import("../claude.zig");
 const config = @import("../config.zig");
+const disk = @import("../disk.zig");
 const git = @import("../git.zig");
 const link = @import("../link.zig");
 const linear = @import("../linear.zig");
@@ -13,35 +21,123 @@ const ui = @import("../ui.zig");
 
 const priority_label = [_][]const u8{ "   ", "U  ", "H  ", "M  ", "L  " };
 
-pub fn run(app: app_mod.App, all: bool) !void {
+pub const Opts = struct {
+    /// Show every assigned issue in the picker, not just `activeStates`.
+    all: bool = false,
+    /// `PE-256` — resolve that issue directly and skip the picker.
+    issue: ?[]const u8 = null,
+    /// Machine mode: JSON on stdout, no prompts, no Claude Code.
+    json: bool = false,
+    /// Base for a branch that does not exist yet. Interactive mode asks when it
+    /// cannot tell; `--json` has nobody to ask, so it takes this or the default branch.
+    base: ?[]const u8 = null,
+};
+
+pub fn run(app: app_mod.App, opts: Opts) !void {
+    if (opts.json and opts.issue == null) {
+        bail(app, opts.json, "usage", "--json needs an issue to resolve, e.g. `lcc start PE-256 --json`.", .{});
+    }
+    if (opts.json and opts.all) {
+        bail(app, opts.json, "usage", "--all only affects the picker, which --json does not use.", .{});
+    }
     if (oauth.getToken(app.gpa) == null) {
-        app.ui.fail("Not authenticated. Run `lcc auth` first.", .{});
-        std.process.exit(1);
+        bail(app, opts.json, "not_authenticated", "Not authenticated. Run `lcc auth` first.", .{});
     }
 
     const cfg = try config.load(app.gpa, app.io, app.environ);
-    const repo = try app.repo();
+    var repo = try app.repo();
+    repo.stdout_reserved = opts.json;
 
-    const fetch_label = if (all)
+    const token = oauth.ensureFreshToken(app.gpa, app.io, cfg.clientId) catch |err| {
+        bail(app, opts.json, "auth_failed", "{s}: {s}", .{ @errorName(err), oauth.last_detail });
+    };
+
+    const selected = if (opts.issue) |raw|
+        try fetchNamed(app, opts, token, raw)
+    else
+        try pickFromActive(app, opts, cfg, token) orelse return;
+
+    const suggested = try git.rewriteBranchName(app.gpa, selected.branch_name, "feature");
+    if (!opts.json) app.ui.hint("Selected {s} — branch {s}", .{ selected.identifier, suggested });
+
+    const wt = try bootstrap(app, opts, cfg, repo, suggested);
+
+    if (opts.json) {
+        try report(app, cfg, repo, selected, suggested, wt);
+        return;
+    }
+
+    app.ui.info("", .{});
+    app.ui.info("{f} in {f}", .{ ui.bold("Launching Claude Code"), ui.dim(wt.path) });
+    app.ui.hint("Linear: {s}", .{selected.url});
+    app.ui.info("", .{});
+    app.ui.flush();
+
+    var extra: std.ArrayList([]const u8) = .empty;
+    const trimmed_command = std.mem.trim(u8, cfg.startTaskCommand, " \t");
+    if (trimmed_command.len > 0) {
+        try extra.append(app.gpa, try expandCommand(app.gpa, cfg.startTaskCommand, selected, wt.branch));
+    }
+
+    const code = try claude.launch(app.gpa, app.io, wt.path, extra.items);
+    std.process.exit(code);
+}
+
+/// The one issue an identifier names.
+fn fetchNamed(
+    app: app_mod.App,
+    opts: Opts,
+    token: oauth.Token,
+    raw: []const u8,
+) !linear.Issue {
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    const ref = linear.refFromBranch(trimmed) orelse bail(
+        app,
+        opts.json,
+        "bad_identifier",
+        "'{s}' is not an issue identifier — expected something like PE-256.",
+        .{trimmed},
+    );
+
+    if (!opts.json) {
+        app.ui.step("Fetching {s}...", .{trimmed});
+        app.ui.flush();
+    }
+
+    const found = linear.fetchIssue(app.gpa, app.io, token, ref) catch |err| bail(
+        app,
+        opts.json,
+        "linear_failed",
+        "Linear request failed ({s}, HTTP {d}): {s}",
+        .{ @errorName(err), linear.last_status, linear.last_message },
+    );
+    return found orelse bail(app, opts.json, "issue_not_found", "No issue {s} in Linear.", .{trimmed});
+}
+
+/// The picker over everything assigned, filtered by `activeStates`. Null when
+/// there was nothing to choose from — the reason is already on screen.
+fn pickFromActive(
+    app: app_mod.App,
+    opts: Opts,
+    cfg: config.Config,
+    token: oauth.Token,
+) !?linear.Issue {
+    const fetch_label = if (opts.all)
         try app.gpa.dupe(u8, "all states")
     else
         try std.mem.join(app.gpa, ", ", cfg.activeStates);
     app.ui.step("Fetching Linear issues ({s})...", .{fetch_label});
     app.ui.flush();
 
-    const token = oauth.ensureFreshToken(app.gpa, app.io, cfg.clientId) catch |err| {
-        app.ui.fail("{s}: {s}", .{ @errorName(err), oauth.last_detail });
-        std.process.exit(1);
-    };
+    const result = linear.fetchActiveIssues(app.gpa, app.io, token, cfg.activeStates, opts.all) catch |err| bail(
+        app,
+        opts.json,
+        "linear_failed",
+        "Linear request failed ({s}, HTTP {d}): {s}",
+        .{ @errorName(err), linear.last_status, linear.last_message },
+    );
 
-    const result = linear.fetchActiveIssues(app.gpa, app.io, token, cfg.activeStates, all) catch |err| {
-        app.ui.fail("Linear request failed ({s}, HTTP {d}): {s}", .{
-            @errorName(err), linear.last_status, linear.last_message,
-        });
-        std.process.exit(1);
-    };
-
-    if (!all and result.skipped.len > 0) {
+    if (!opts.all and result.skipped.len > 0) {
         var skipped_total: u32 = 0;
         for (result.skipped) |s| skipped_total += s.count;
 
@@ -64,93 +160,382 @@ pub fn run(app: app_mod.App, all: bool) !void {
     }
 
     if (result.matched.len == 0) {
-        if (all) {
+        if (opts.all) {
             app.ui.warn("No active issues assigned to you (excluding Completed/Canceled).", .{});
         } else {
             app.ui.warn("No issues assigned to you in: {s}.", .{fetch_label});
         }
-        return;
+        return null;
     }
 
-    const selected = try pickIssue(app, result.matched) orelse
+    return try pickIssue(app, result.matched) orelse
         std.process.exit(app_mod.cancelled_exit_code);
+}
 
-    const branch = try git.rewriteBranchName(app.gpa, selected.branch_name, "feature");
-    app.ui.hint("Selected {s} — branch {s}", .{ selected.identifier, branch });
+const MatchedBy = enum { branch, issue };
 
-    const worktree_path = try git.renderWorktreePath(app.gpa, cfg.worktreeTemplate, repo.root, branch);
+const Bootstrapped = struct {
+    /// The branch actually checked out there. Not always the one Linear suggests
+    /// today — see `matched_by`.
+    branch: []const u8,
+    path: []const u8,
+    /// Whether this run made it, or found it already there.
+    status: enum { created, existing },
+    /// How an existing worktree was recognised: `branch` for an exact name match,
+    /// `issue` when only the `PE-N` in it matched. Null for one this run created.
+    matched_by: ?MatchedBy,
+    /// How the branch came to be, for a worktree this run created.
+    created: ?git.Strategy,
+    /// What a new branch was cut from.
+    base: ?[]const u8,
+    /// The main checkout has the branch checked out, so no worktree was involved.
+    is_main_checkout: bool,
+    linked: []const []const u8,
+    skipped: []const []const u8,
+};
 
-    const strategy = repo.resolveStrategy(branch);
-    var base: []const u8 = undefined;
-    if (strategy == .new) {
-        const def = try repo.defaultBranch();
-        const cur = try repo.currentBranch();
-        if (cur == null or std.mem.eql(u8, cur.?, def)) {
-            base = def;
-        } else {
-            app.ui.flush();
-            const message = try std.fmt.allocPrint(app.gpa, "Base new branch on current '{s}'?", .{cur.?});
-            const use_current = try prompt.confirm(app.gpa, app.io, message, true) orelse
-                std.process.exit(app_mod.cancelled_exit_code);
-            if (use_current) {
-                base = cur.?;
+const Match = struct {
+    entry: git.WorktreeEntry,
+    by: MatchedBy,
+};
+
+/// The worktree an issue's work lives in. The exact branch name first, so a repo
+/// holding both the old and the new name resolves to the new one; then the `PE-N`
+/// ref, which is the half that survives the issue being renamed in Linear —
+/// otherwise a renamed issue looks like untouched work and gets a second, empty
+/// worktree while the real one sits next to it.
+fn findWorktree(entries: []const git.WorktreeEntry, branch: []const u8) ?Match {
+    if (git.worktreeForBranch(entries, branch)) |entry| return .{ .entry = entry, .by = .branch };
+    for (entries) |entry| {
+        const name = entry.branch orelse continue;
+        if (linear.sameIssue(name, branch)) return .{ .entry = entry, .by = .issue };
+    }
+    return null;
+}
+
+/// The worktree for `suggested`, made if the issue has none yet. Finding one is a
+/// normal outcome, not a failure: `lcc start PE-256` twice, or once from inside the
+/// worktree it made the first time, both land here.
+fn bootstrap(
+    app: app_mod.App,
+    opts: Opts,
+    cfg: config.Config,
+    repo: git.Repo,
+    suggested: []const u8,
+) !Bootstrapped {
+    var branch = suggested;
+    var path: []const u8 = undefined;
+    var status: @FieldType(Bootstrapped, "status") = .created;
+    var matched_by: ?MatchedBy = null;
+    var created: ?git.Strategy = null;
+    var base: ?[]const u8 = null;
+    var is_main_checkout = false;
+
+    const entries = try repo.listWorktrees();
+    if (findWorktree(entries, suggested)) |match| {
+        // git checks a branch out in one place at a time, so this is *the* place.
+        // The branch there wins over the suggestion: it is where the commits are.
+        branch = match.entry.branch.?;
+        path = match.entry.path;
+        status = .existing;
+        matched_by = match.by;
+        is_main_checkout = match.entry.is_main;
+        if (!opts.json) {
+            if (match.by == .issue) {
+                app.ui.warn(
+                    "The issue was renamed in Linear — its work is on {s}, while Linear now suggests {s}.",
+                    .{ branch, suggested },
+                );
+            }
+            if (match.entry.is_main) {
+                app.ui.warn("{s} is checked out in the main checkout — working there, not in a worktree.", .{branch});
             } else {
-                base = try pickBaseBranch(app, repo) orelse
-                    std.process.exit(app_mod.cancelled_exit_code);
+                app.ui.success("Worktree already exists: {s}", .{match.entry.path});
             }
         }
-        app.ui.step("Creating worktree at {f} (base: {f})", .{ ui.dim(worktree_path), ui.bold(base) });
     } else {
-        base = try repo.defaultBranch();
-        app.ui.step("Creating worktree at {f}", .{ui.dim(worktree_path)});
-    }
-    app.ui.flush();
+        path = try git.renderWorktreePath(app.gpa, cfg.worktreeTemplate, repo.root, branch);
+        base = try resolveBase(app, opts, repo, branch);
 
-    const wt = repo.createWorktree(branch, worktree_path, base) catch |err| {
-        if (err == git.Error.WorktreePathExists) {
-            app.ui.fail(
-                "Worktree path already exists: {s}\nRemove it first with: git worktree remove {s}  (or delete the directory).",
-                .{ worktree_path, worktree_path },
-            );
-            std.process.exit(1);
+        if (!opts.json) {
+            if (repo.resolveStrategy(branch) == .new) {
+                app.ui.step("Creating worktree at {f} (base: {f})", .{ ui.dim(path), ui.bold(base.?) });
+            } else {
+                app.ui.step("Creating worktree at {f}", .{ui.dim(path)});
+            }
+            app.ui.flush();
         }
-        return err;
-    };
 
-    const summary = switch (wt.created) {
-        .new => try std.fmt.allocPrint(app.gpa, "created from {s}", .{base}),
-        .reused_local => try app.gpa.dupe(u8, "reused local branch"),
-        .tracking_remote => try std.fmt.allocPrint(app.gpa, "tracking origin/{s}", .{branch}),
-    };
-    app.ui.success("Worktree {s}: {s}", .{ summary, wt.path });
+        const wt = repo.createWorktree(branch, path, base.?) catch |err| switch (err) {
+            git.Error.WorktreePathExists => bail(
+                app,
+                opts.json,
+                "worktree_path_exists",
+                "Worktree path already exists but no worktree is registered there: {s}\nRemove it first with: git worktree remove {s}  (or delete the directory).",
+                .{ path, path },
+            ),
+            // Captured in `--json` mode, already on the terminal otherwise.
+            git.Error.GitFailed => if (git.last_error.len > 0)
+                bail(app, opts.json, "git_failed", "git worktree add failed: {s}", .{git.last_error})
+            else
+                bail(app, opts.json, "git_failed", "git worktree add failed.", .{}),
+            else => return err,
+        };
+        created = wt.created;
+
+        if (!opts.json) {
+            const summary = switch (wt.created) {
+                .new => try std.fmt.allocPrint(app.gpa, "created from {s}", .{base.?}),
+                .reused_local => try app.gpa.dupe(u8, "reused local branch"),
+                .tracking_remote => try std.fmt.allocPrint(app.gpa, "tracking origin/{s}", .{branch}),
+            };
+            app.ui.success("Worktree {s}: {s}", .{ summary, wt.path });
+        }
+    }
+
+    var linked: std.ArrayList([]const u8) = .empty;
+    var skipped: std.ArrayList([]const u8) = .empty;
 
     const to_link = try link.findFiles(app.gpa, app.io, repo.root, cfg.linkPatterns, cfg.linkExclude);
     if (to_link.len == 0) {
-        app.ui.hint("Nothing matched linkPatterns in the repo — skipping symlinks.", .{});
+        if (!opts.json) app.ui.hint("Nothing matched linkPatterns in the repo — skipping symlinks.", .{});
     } else {
-        const linked = try link.linkFiles(app.gpa, app.io, to_link, worktree_path);
-        for (linked) |r| {
+        for (try link.linkFiles(app.gpa, app.io, to_link, path)) |r| {
             switch (r.status) {
-                .linked => app.ui.success("Linked {s}", .{r.rel}),
-                .skipped_exists => app.ui.hint("Skipped {s} (already exists in worktree)", .{r.rel}),
+                .linked => {
+                    try linked.append(app.gpa, r.rel);
+                    if (!opts.json) app.ui.success("Linked {s}", .{r.rel});
+                },
+                .skipped_exists => {
+                    try skipped.append(app.gpa, r.rel);
+                    if (!opts.json) app.ui.hint("Skipped {s} (already exists in worktree)", .{r.rel});
+                },
             }
         }
     }
 
-    app.ui.info("", .{});
-    app.ui.info("{f} in {f}", .{ ui.bold("Launching Claude Code"), ui.dim(worktree_path) });
-    app.ui.hint("Linear: {s}", .{selected.url});
-    app.ui.info("", .{});
-    app.ui.flush();
+    return .{
+        .branch = branch,
+        .path = path,
+        .status = status,
+        .matched_by = matched_by,
+        .created = created,
+        .base = base,
+        .is_main_checkout = is_main_checkout,
+        .linked = try linked.toOwnedSlice(app.gpa),
+        .skipped = try skipped.toOwnedSlice(app.gpa),
+    };
+}
 
-    var extra: std.ArrayList([]const u8) = .empty;
-    const trimmed_command = std.mem.trim(u8, cfg.startTaskCommand, " \t");
-    if (trimmed_command.len > 0) {
-        try extra.append(app.gpa, try expandCommand(app.gpa, cfg.startTaskCommand, selected, branch));
+/// What a branch that does not exist yet gets cut from. An explicit `--base` wins;
+/// otherwise the default branch, unless standing somewhere else is worth asking about.
+fn resolveBase(app: app_mod.App, opts: Opts, repo: git.Repo, branch: []const u8) ![]const u8 {
+    if (opts.base) |explicit| return explicit;
+
+    const def = try repo.defaultBranch();
+    // An existing branch is checked out as it is; nothing is cut from anything.
+    if (repo.resolveStrategy(branch) != .new) return def;
+
+    const cur = try repo.currentBranch();
+    if (cur == null or std.mem.eql(u8, cur.?, def)) return def;
+
+    // Nobody to ask in machine mode, and silently cutting from whatever branch the
+    // caller happens to stand on would be the wrong kind of guess.
+    if (opts.json) return def;
+
+    app.ui.flush();
+    const message = try std.fmt.allocPrint(app.gpa, "Base new branch on current '{s}'?", .{cur.?});
+    const use_current = try prompt.confirm(app.gpa, app.io, message, true) orelse
+        std.process.exit(app_mod.cancelled_exit_code);
+    if (use_current) return cur.?;
+
+    return try pickBaseBranch(app, repo) orelse
+        std.process.exit(app_mod.cancelled_exit_code);
+}
+
+/// What `--json` promises: where the issue lives, and the git facts a caller would
+/// otherwise have to shell out for. A declared type rather than a literal inside
+/// the printer, because it is a contract another program parses — the test at the
+/// bottom of this file is what keeps the field names from drifting.
+const Report = struct {
+    issue: ReportIssue,
+    branch: ReportBranch,
+    worktree: ReportWorktree,
+    repo: ReportRepo,
+    links: ReportLinks,
+    /// What lcc would hand Claude Code, placeholders expanded. Null when
+    /// `startTaskCommand` is unset.
+    start_task_command: ?[]const u8,
+};
+
+const ReportIssue = struct {
+    id: []const u8,
+    identifier: []const u8,
+    title: []const u8,
+    url: []const u8,
+    state: []const u8,
+    state_type: []const u8,
+    team: ?[]const u8,
+    assignee: ?[]const u8,
+};
+
+const ReportBranch = struct {
+    /// The branch to use — the one checked out where the work is.
+    name: []const u8,
+    /// What Linear's `branchName` implies today, which differs from `name` when the
+    /// issue was renamed after the branch was cut.
+    suggested: []const u8,
+    renamed: bool,
+    upstream: ?[]const u8,
+    /// No upstream means the Linear GitHub integration cannot have seen the branch.
+    pushed: bool,
+    ahead: u32,
+    behind: u32,
+    current: bool,
+};
+
+const ReportWorktree = struct {
+    path: []const u8,
+    status: []const u8,
+    matched_by: ?[]const u8,
+    created: ?[]const u8,
+    base: ?[]const u8,
+    is_main_checkout: bool,
+    /// Whether this very process is running inside it, which is what tells a caller
+    /// already in Claude Code that there is nothing left to open.
+    is_cwd: bool,
+};
+
+const ReportRepo = struct {
+    root: []const u8,
+    default_branch: []const u8,
+};
+
+const ReportLinks = struct {
+    linked: []const []const u8,
+    skipped: []const []const u8,
+};
+
+/// The git and config facts a report needs, gathered by the caller so that shaping
+/// them stays pure and testable.
+const Facts = struct {
+    current_branch: ?[]const u8,
+    branch_status: ?git.BranchStatus,
+    repo_root: []const u8,
+    default_branch: []const u8,
+    is_cwd: bool,
+    start_task_command: ?[]const u8,
+};
+
+fn buildReport(
+    issue: linear.Issue,
+    suggested: []const u8,
+    wt: Bootstrapped,
+    facts: Facts,
+) Report {
+    return .{
+        .issue = .{
+            .id = issue.id,
+            .identifier = issue.identifier,
+            .title = issue.title,
+            .url = issue.url,
+            .state = issue.state_name,
+            .state_type = issue.state_type,
+            .team = issue.team_key,
+            .assignee = issue.assignee_name,
+        },
+        .branch = .{
+            .name = wt.branch,
+            .suggested = suggested,
+            .renamed = !std.mem.eql(u8, wt.branch, suggested),
+            .upstream = if (facts.branch_status) |s| s.upstream else null,
+            .pushed = if (facts.branch_status) |s| s.upstream != null else false,
+            .ahead = if (facts.branch_status) |s| s.ahead else 0,
+            .behind = if (facts.branch_status) |s| s.behind else 0,
+            .current = if (facts.current_branch) |c| std.mem.eql(u8, c, wt.branch) else false,
+        },
+        .worktree = .{
+            .path = wt.path,
+            .status = @tagName(wt.status),
+            .matched_by = if (wt.matched_by) |m| @tagName(m) else null,
+            .created = if (wt.created) |c| @tagName(c) else null,
+            .base = wt.base,
+            .is_main_checkout = wt.is_main_checkout,
+            .is_cwd = facts.is_cwd,
+        },
+        .repo = .{
+            .root = facts.repo_root,
+            .default_branch = facts.default_branch,
+        },
+        .links = .{
+            .linked = wt.linked,
+            .skipped = wt.skipped,
+        },
+        .start_task_command = facts.start_task_command,
+    };
+}
+
+fn report(
+    app: app_mod.App,
+    cfg: config.Config,
+    repo: git.Repo,
+    issue: linear.Issue,
+    suggested: []const u8,
+    wt: Bootstrapped,
+) !void {
+    // The branch that exists, not the one Linear suggests: a renamed issue has its
+    // upstream and its drift on the branch the commits are actually on.
+    var branch_status: ?git.BranchStatus = null;
+    for (try repo.branchStatuses()) |status| {
+        if (!std.mem.eql(u8, status.branch, wt.branch)) continue;
+        branch_status = status;
+        break;
     }
 
-    const code = try claude.launch(app.gpa, app.io, worktree_path, extra.items);
-    std.process.exit(code);
+    const value = buildReport(issue, suggested, wt, .{
+        .current_branch = try repo.currentBranch(),
+        .branch_status = branch_status,
+        .repo_root = repo.root,
+        .default_branch = try repo.defaultBranch(),
+        .is_cwd = isCwd(app, wt.path),
+        .start_task_command = if (std.mem.trim(u8, cfg.startTaskCommand, " \t").len == 0)
+            null
+        else
+            try expandCommand(app.gpa, cfg.startTaskCommand, issue, wt.branch),
+    });
+
+    const body = try std.json.Stringify.valueAlloc(app.gpa, value, .{ .whitespace = .indent_2 });
+    app.ui.payload("{s}\n", .{body});
+    app.ui.flush();
+}
+
+/// Whether the process is standing in `path`, or below it. Both sides are resolved:
+/// `git worktree list` reports the path as it was given, symlinks and all.
+fn isCwd(app: app_mod.App, path: []const u8) bool {
+    const here = Io.Dir.cwd().realPathFileAlloc(app.io, ".", app.gpa) catch return false;
+    const there = disk.realPath(app.gpa, app.io, path);
+    return std.mem.eql(u8, here, there) or disk.isInside(app.gpa, there, here);
+}
+
+/// The exits a caller has to be able to react to, in the shape it asked for. JSON
+/// goes to stdout and the human line to stderr, so both readers get served.
+fn bail(
+    app: app_mod.App,
+    json: bool,
+    code: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) noreturn {
+    const message = std.fmt.allocPrint(app.gpa, fmt, args) catch "";
+    if (json) {
+        const body = std.json.Stringify.valueAlloc(app.gpa, .{
+            .@"error" = .{ .code = code, .message = message },
+        }, .{ .whitespace = .indent_2 }) catch "{\"error\":{\"code\":\"internal\"}}";
+        app.ui.payload("{s}\n", .{body});
+    }
+    app.ui.fail("{s}", .{message});
+    app.ui.flush();
+    std.process.exit(1);
 }
 
 fn pickIssue(app: app_mod.App, issues: []const linear.Issue) !?linear.Issue {
@@ -200,6 +585,211 @@ fn pickBaseBranch(app: app_mod.App, repo: git.Repo) !?[]const u8 {
     app.ui.flush();
     const index = try prompt.search(app.gpa, app.io, "Pick base branch:", items) orelse return null;
     return branches[index];
+}
+
+test "findWorktree prefers the exact branch, then the issue behind it" {
+    const entries = [_]git.WorktreeEntry{
+        .{ .path = "/r", .branch = "main", .head = "a", .locked = false, .prunable = false, .is_main = true },
+        // Cut when PE-250 had a different title; the work is here.
+        .{
+            .path = "/wt/old",
+            .branch = "feature/pe-250-fix-clvisit-handling-dedupe-arrivaldeparture-double-writes",
+            .head = "b",
+            .locked = false,
+            .prunable = false,
+            .is_main = false,
+        },
+        .{ .path = "/wt/other", .branch = "feature/pe-9-unrelated", .head = "c", .locked = false, .prunable = false, .is_main = false },
+    };
+
+    // What Linear suggests for PE-250 after the rename finds the old worktree anyway.
+    const renamed = findWorktree(&entries, "feature/pe-250-fix-clvisit-capture-dropped-visits").?;
+    try std.testing.expectEqualStrings("/wt/old", renamed.entry.path);
+    try std.testing.expectEqual(MatchedBy.issue, renamed.by);
+
+    // An exact name is an exact match, and reported as one.
+    const exact = findWorktree(&entries, "feature/pe-250-fix-clvisit-handling-dedupe-arrivaldeparture-double-writes").?;
+    try std.testing.expectEqualStrings("/wt/old", exact.entry.path);
+    try std.testing.expectEqual(MatchedBy.branch, exact.by);
+
+    // With both names present the current one wins over the ref match.
+    const both = entries ++ [_]git.WorktreeEntry{.{
+        .path = "/wt/new",
+        .branch = "feature/pe-250-fix-clvisit-capture-dropped-visits",
+        .head = "d",
+        .locked = false,
+        .prunable = false,
+        .is_main = false,
+    }};
+    const preferred = findWorktree(&both, "feature/pe-250-fix-clvisit-capture-dropped-visits").?;
+    try std.testing.expectEqualStrings("/wt/new", preferred.entry.path);
+    try std.testing.expectEqual(MatchedBy.branch, preferred.by);
+
+    try std.testing.expect(findWorktree(&entries, "feature/pe-251-nothing-here") == null);
+    // The main checkout on `main` must not soak up an issue branch.
+    try std.testing.expect(findWorktree(entries[0..1], "feature/pe-250-x") == null);
+}
+
+test "the --json payload keeps the shape a caller parses" {
+    const gpa = std.testing.allocator;
+
+    const issue: linear.Issue = .{
+        .id = "uuid-1",
+        .identifier = "PE-250",
+        .title = "Fix CLVisit capture",
+        .branch_name = "feature/pe-250-fix-clvisit-capture-dropped-visits",
+        .state_name = "In Progress",
+        .state_type = "started",
+        .priority = 2,
+        .url = "https://linear.app/x/issue/PE-250/fix",
+        .updated_at = "2026-07-27T00:00:00.000Z",
+        .assignee_name = "Someone",
+        .team_key = "PE",
+    };
+    const wt: Bootstrapped = .{
+        .branch = "feature/pe-250-fix-clvisit-handling-dedupe",
+        .path = "/wt/old",
+        .status = .existing,
+        .matched_by = .issue,
+        .created = null,
+        .base = null,
+        .is_main_checkout = false,
+        .linked = &.{".env"},
+        .skipped = &.{".claude/settings.local.json"},
+    };
+
+    const value = buildReport(issue, issue.branch_name, wt, .{
+        .current_branch = "feature/pe-250-fix-clvisit-handling-dedupe",
+        .branch_status = .{
+            .branch = "feature/pe-250-fix-clvisit-handling-dedupe",
+            .upstream = null,
+            .ahead = 3,
+            .behind = 1,
+            .gone = false,
+            .committed_at = 0,
+        },
+        .repo_root = "/r",
+        .default_branch = "main",
+        .is_cwd = true,
+        .start_task_command = "/start-task PE-250",
+    });
+
+    const body = try std.json.Stringify.valueAlloc(gpa, value, .{ .whitespace = .indent_2 });
+    defer gpa.free(body);
+
+    // The shape the caller relies on, spelled out independently of `Report`. Parsing
+    // rejects unknown fields, so renaming, dropping *or* adding one fails here rather
+    // than in whatever is reading the JSON.
+    const Schema = struct {
+        issue: struct {
+            id: []const u8,
+            identifier: []const u8,
+            title: []const u8,
+            url: []const u8,
+            state: []const u8,
+            state_type: []const u8,
+            team: ?[]const u8,
+            assignee: ?[]const u8,
+        },
+        branch: struct {
+            name: []const u8,
+            suggested: []const u8,
+            renamed: bool,
+            upstream: ?[]const u8,
+            pushed: bool,
+            ahead: u32,
+            behind: u32,
+            current: bool,
+        },
+        worktree: struct {
+            path: []const u8,
+            status: []const u8,
+            matched_by: ?[]const u8,
+            created: ?[]const u8,
+            base: ?[]const u8,
+            is_main_checkout: bool,
+            is_cwd: bool,
+        },
+        repo: struct { root: []const u8, default_branch: []const u8 },
+        links: struct { linked: [][]const u8, skipped: [][]const u8 },
+        start_task_command: ?[]const u8,
+    };
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(Schema, arena_state.allocator(), body, .{});
+
+    try std.testing.expectEqualStrings("PE-250", parsed.issue.identifier);
+    // The branch to use is the one with the commits; the rename is stated, not hidden.
+    try std.testing.expectEqualStrings("feature/pe-250-fix-clvisit-handling-dedupe", parsed.branch.name);
+    try std.testing.expectEqualStrings(issue.branch_name, parsed.branch.suggested);
+    try std.testing.expect(parsed.branch.renamed);
+    try std.testing.expect(!parsed.branch.pushed);
+    try std.testing.expect(parsed.branch.current);
+    try std.testing.expectEqual(@as(u32, 3), parsed.branch.ahead);
+    try std.testing.expectEqualStrings("existing", parsed.worktree.status);
+    try std.testing.expectEqualStrings("issue", parsed.worktree.matched_by.?);
+    try std.testing.expect(parsed.worktree.created == null);
+    try std.testing.expect(parsed.worktree.is_cwd);
+    try std.testing.expectEqualStrings(".env", parsed.links.linked[0]);
+    try std.testing.expectEqualStrings("/start-task PE-250", parsed.start_task_command.?);
+}
+
+test "a created worktree reports no match and its base" {
+    const gpa = std.testing.allocator;
+
+    const issue: linear.Issue = .{
+        .id = "uuid-2",
+        .identifier = "PE-9",
+        .title = "New work",
+        .branch_name = "feature/pe-9-new-work",
+        .state_name = "Todo",
+        .state_type = "unstarted",
+        .priority = 0,
+        .url = "https://linear.app/x/issue/PE-9/new-work",
+        .updated_at = "2026-07-27T00:00:00.000Z",
+        .assignee_name = null,
+        .team_key = "PE",
+    };
+    const wt: Bootstrapped = .{
+        .branch = "feature/pe-9-new-work",
+        .path = "/wt/pe-9",
+        .status = .created,
+        .matched_by = null,
+        .created = .new,
+        .base = "main",
+        .is_main_checkout = false,
+        .linked = &.{},
+        .skipped = &.{},
+    };
+
+    const value = buildReport(issue, issue.branch_name, wt, .{
+        .current_branch = "main",
+        // A branch that has just been cut has no `for-each-ref` row to find.
+        .branch_status = null,
+        .repo_root = "/r",
+        .default_branch = "main",
+        .is_cwd = false,
+        .start_task_command = null,
+    });
+
+    try std.testing.expect(!value.branch.renamed);
+    try std.testing.expect(!value.branch.pushed);
+    try std.testing.expect(value.branch.upstream == null);
+    try std.testing.expect(!value.branch.current);
+    try std.testing.expectEqualStrings("created", value.worktree.status);
+    try std.testing.expect(value.worktree.matched_by == null);
+    try std.testing.expectEqualStrings("new", value.worktree.created.?);
+    try std.testing.expectEqualStrings("main", value.worktree.base.?);
+    try std.testing.expect(value.start_task_command == null);
+
+    // Null optionals must be present as nulls, not dropped: a caller reading
+    // `worktree.created` should find the key whatever the outcome was.
+    const body = try std.json.Stringify.valueAlloc(gpa, value, .{});
+    defer gpa.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"matched_by\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"upstream\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"start_task_command\":null") != null);
 }
 
 fn expandCommand(

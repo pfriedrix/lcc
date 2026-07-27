@@ -170,6 +170,74 @@ fn unwrap(comptime T: type, gpa: std.mem.Allocator, raw: []const u8) Error!T {
     };
 }
 
+fn fromRaw(issue: RawIssue) Issue {
+    return .{
+        .id = issue.id,
+        .identifier = issue.identifier,
+        .title = issue.title,
+        .branch_name = issue.branchName,
+        .state_name = if (issue.state) |s| std.mem.trim(u8, s.name, " \t") else "Unknown",
+        .state_type = if (issue.state) |s| s.type else "unknown",
+        .priority = issue.priority,
+        .url = issue.url,
+        .updated_at = issue.updatedAt,
+        .assignee_name = if (issue.assignee) |a| a.name else null,
+        .team_key = if (issue.team) |t| t.key else null,
+    };
+}
+
+/// Everything `Issue` carries, for the one issue a caller named. Filtering on the
+/// number and the team key both narrows it to a unique row and lets Linear answer
+/// from the team's index — the cost note on `issue_statuses_query` applies here
+/// too, which is why `first` is 1 rather than a round number.
+const issue_query =
+    \\query LccIssue($number: Float!, $team: String!) {
+    \\  issues(
+    \\    filter: { number: { eq: $number }, team: { key: { eq: $team } } }
+    \\    first: 1
+    \\  ) {
+    \\    nodes {
+    \\      id
+    \\      identifier
+    \\      title
+    \\      branchName
+    \\      priority
+    \\      url
+    \\      updatedAt
+    \\      state { name type }
+    \\      assignee { name }
+    \\      team { key }
+    \\    }
+    \\  }
+    \\}
+;
+
+const OneIssueData = struct { issues: struct { nodes: []RawIssue } };
+
+/// The issue `PE-256` names. Neither the assignee nor the `activeStates` filter
+/// applies: naming an issue outright is a more specific answer than either, so a
+/// backlog issue or one assigned to somebody else still resolves. Null when the
+/// team has no such number.
+pub fn fetchIssue(
+    gpa: std.mem.Allocator,
+    io: Io,
+    token: oauth.Token,
+    ref: Ref,
+) Error!?Issue {
+    // Linear stores team keys uppercase; `pe-256` on a command line is the same issue.
+    const team = try std.ascii.allocUpperString(gpa, ref.team);
+
+    const body = std.json.Stringify.valueAlloc(gpa, .{
+        .query = issue_query,
+        .variables = .{ .number = ref.number, .team = team },
+    }, .{}) catch return Error.HttpFailed;
+
+    const raw = try post(gpa, io, token, body);
+    const data = try unwrap(OneIssueData, gpa, raw);
+    if (data.issues.nodes.len == 0) return null;
+    return fromRaw(data.issues.nodes[0]);
+}
+
 fn fetchAllRaw(gpa: std.mem.Allocator, io: Io, token: oauth.Token) Error![]RawIssue {
     var collected: std.ArrayList(RawIssue) = .empty;
     var after: ?[]const u8 = null;
@@ -243,19 +311,7 @@ pub fn fetchActiveIssues(
             continue;
         }
 
-        try matched.append(gpa, .{
-            .id = issue.id,
-            .identifier = issue.identifier,
-            .title = issue.title,
-            .branch_name = issue.branchName,
-            .state_name = state_name,
-            .state_type = if (issue.state) |s| s.type else "unknown",
-            .priority = issue.priority,
-            .url = issue.url,
-            .updated_at = issue.updatedAt,
-            .assignee_name = if (issue.assignee) |a| a.name else null,
-            .team_key = if (issue.team) |t| t.key else null,
-        });
+        try matched.append(gpa, fromRaw(issue));
     }
 
     const issues = try matched.toOwnedSlice(gpa);
@@ -418,6 +474,19 @@ pub fn fetchIssueStatuses(
     return out;
 }
 
+/// Whether two branch names belong to the same issue. Linear derives `branchName`
+/// from the title, so renaming an issue renames the branch it suggests — but the
+/// work stays on the branch that was cut from the old name. The `PE-224` part is
+/// the half that cannot drift.
+///
+/// A name with no issue ref in it never matches, not even another one like it:
+/// `master` and `release/2.4.1` are not the same issue, they are no issue at all.
+pub fn sameIssue(a: []const u8, b: []const u8) bool {
+    const left = refFromBranch(a) orelse return false;
+    const right = refFromBranch(b) orelse return false;
+    return left.number == right.number and fold.eql(left.team, right.team);
+}
+
 /// The issue whose identifier matches `PE-224` for this branch, case-insensitively.
 pub fn statusForBranch(statuses: []const IssueStatus, branch: []const u8) ?IssueStatus {
     const ref = refFromBranch(branch) orelse return null;
@@ -455,6 +524,24 @@ test "refFromBranch finds the issue key wherever it sits" {
     // And be short enough to be a team key, so ordinary words are not mistaken
     // for one: `typewriter-2` is a branch name, not issue 2 of team TYPEWRITER.
     try std.testing.expect(refFromBranch("typewriter-2") == null);
+}
+
+test "sameIssue survives a renamed issue and refuses branches with no issue" {
+    // The case from a real repo: PE-250's title changed, so Linear suggests a new
+    // branch name while the work sits on the one cut from the old title.
+    try std.testing.expect(sameIssue(
+        "feature/pe-250-fix-clvisit-handling-dedupe-arrivaldeparture-double-writes",
+        "feature/pe-250-fix-clvisit-capture-dropped-visits-lost-headless-writes-no",
+    ));
+    // Case differs between Linear's key and the branch name.
+    try std.testing.expect(sameIssue("feature/PE-250-a", "feature/pe-250-b"));
+
+    try std.testing.expect(!sameIssue("feature/pe-250-a", "feature/pe-251-a"));
+    // Same number, different team.
+    try std.testing.expect(!sameIssue("feature/pe-250-a", "feature/eng-250-a"));
+    // No ref at all is not an issue, so it matches nothing — including itself.
+    try std.testing.expect(!sameIssue("master", "master"));
+    try std.testing.expect(!sameIssue("release/2.4.1", "feature/pe-250-a"));
 }
 
 test "statusForBranch matches on team and number, not position" {

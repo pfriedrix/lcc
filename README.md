@@ -57,10 +57,12 @@ For headless machines, `lcc auth --token <pat>` stores a Linear personal API tok
 ```bash
 lcc                  # print the command list
 lcc start            # pick an issue, bootstrap worktree, launch Claude
+lcc start PE-256     # that issue, no picker
+lcc start PE-256 --json   # resolve it and print the result instead of launching Claude
 lcc start --all      # ignore the activeStates filter
 lcc setup            # configure startTaskCommand, worktreeTemplate, activeStates, linkPatterns
 lcc list             # dashboard of every worktree (--local to skip the network columns)
-lcc open             # pick a worktree and resume Claude in it (--no-resume for fresh)
+lcc open             # pick a worktree and resume Claude in it, if it has sessions (--no-resume for fresh)
 lcc open xcode       # pick a worktree and open it in Xcode instead
 lcc remove           # pick a worktree, remove it + its branch + Xcode build data
 lcc remove --merged  # bulk: every worktree and branch whose work already landed
@@ -101,6 +103,55 @@ Type to filter. Every whitespace-separated word has to appear somewhere in the r
 Results are ordered by *where* the match landed: the start of the identifier ranks above the start of a word, which ranks above something buried mid-word. Typing `log` therefore surfaces `logout()` and `logAllValues()` ahead of issues that merely sit in `Backlog`. Rows scoring the same keep their original order — your `activeStates` order first, most recently updated first within each state.
 
 `↑`/`↓` move, `enter` selects, `esc` or `Ctrl-C` cancels with exit code 130.
+
+### Naming the issue
+
+`lcc start PE-256` skips the picker. The issue is fetched by identifier rather than filtered out of your assigned list, so `activeStates` and the assignee do not apply — naming an issue is a more specific answer than either. `--base <ref>` cuts a new branch from `<ref>` instead of asking.
+
+Either way, a worktree the issue already has is reused rather than duplicated. It is found by exact branch name first, then by the `PE-N` in it — because Linear derives `branchName` from the title, so renaming an issue changes the branch it suggests while the commits stay on the branch cut from the old name. Matching on the ref is what keeps a renamed issue from getting a second, empty worktree beside the real one. The branch checked out there wins over the suggestion, and the reuse is reported (`matched_by`, `renamed`).
+
+Running `lcc start PE-256` twice therefore opens the same worktree twice, whatever the template or the title has done since.
+
+### `lcc start --json`
+
+Machine mode, for a caller that is already inside Claude Code — a `/start-task` slash command that owns the issue tracker can use it instead of probing git for the branch and the worktree itself. It requires an identifier, asks nothing (a new branch comes off `--base` or the default branch), and does not launch Claude Code, so it is safe to call from inside a session lcc itself started.
+
+```bash
+$ lcc start PE-256 --json
+{
+  "issue":     { "id": "…", "identifier": "PE-256", "title": "…", "url": "…",
+                 "state": "In Review", "state_type": "started", "team": "PE", "assignee": "…" },
+  "branch":    { "name": "feature/pe-256-…", "suggested": "feature/pe-256-…", "renamed": false,
+                 "upstream": "origin/feature/…", "pushed": true,
+                 "ahead": 0, "behind": 0, "current": true },
+  "worktree":  { "path": "/Users/me/…/App.worktrees/pe-256-…", "status": "existing",
+                 "matched_by": "branch", "created": null, "base": null,
+                 "is_main_checkout": false, "is_cwd": true },
+  "repo":      { "root": "/Users/me/…/App", "default_branch": "main" },
+  "links":     { "linked": [".env"], "skipped": [".claude/settings.local.json"] },
+  "start_task_command": "/start-task PE-256"
+}
+```
+
+Every key is always present; absent values are `null`, never dropped.
+
+| Field | Meaning |
+|---|---|
+| `branch.name` | the branch to use — the one with the commits |
+| `branch.suggested` / `renamed` | what Linear's `branchName` implies today, and whether it has drifted from `name` |
+| `branch.pushed` / `upstream` | false until the branch has an upstream; while it is, Linear's GitHub integration cannot see the branch and will not auto-transition the issue |
+| `worktree.status` | `created` or `existing` |
+| `worktree.matched_by` | how an existing worktree was recognised — `branch` (exact name) or `issue` (the `PE-N` matched, i.e. the issue was renamed). `null` for one this run created |
+| `worktree.is_cwd` | whether this very process is standing in it, which is what tells a caller there is nothing left to open |
+| `worktree.created` / `base` | the strategy (`new`, `reused_local`, `tracking_remote`) and what a new branch was cut from; `null` when the worktree already existed |
+
+Failures come back in the same shape, on stdout, with exit code 1:
+
+```json
+{ "error": { "code": "issue_not_found", "message": "No issue PE-999 in Linear." } }
+```
+
+Codes: `usage`, `not_authenticated`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`, `worktree_path_exists`, `git_failed`. Progress lines and the human-readable error go to stderr, so stdout holds nothing but the payload — including git's own output, which is captured rather than inherited in this mode.
 
 ### `lcc open xcode`
 
