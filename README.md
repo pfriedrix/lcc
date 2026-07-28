@@ -241,7 +241,7 @@ Session transcripts are what `claude --resume` replays — check before deleting
 | `worktreeTemplate` | `{repoRoot}/.lcc/worktrees/{branchLeaf}` | Where worktrees go. Placeholders: `{repoRoot}`, `{repoParent}`, `{repoName}`, `{branch}`, `{branchLeaf}` |
 | `activeStates` | `["Todo", "In Progress"]` | Which Linear states to offer, in this order |
 | `startTaskCommand` | `""` | Passed to `claude` as its first argument. Placeholders: `{identifier}`, `{branch}`, `{url}` |
-| `linkPatterns` | `[".env", ".env.*", ".claude/settings.local.json"]` | Which files to symlink into each worktree |
+| `linkPatterns` | `[".env", ".env.*", "CLAUDE.md", "CLAUDE.local.md", ".claude/settings.local.json"]` | Which files to symlink into each worktree |
 | `linkExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
 | `clientId` | built-in | Linear OAuth application. Override with `LCC_CLIENT_ID` or `lcc auth setup --client-id <id>` |
 
@@ -263,6 +263,8 @@ A pattern is a path relative to the repo root whose every segment may glob, so i
 `*` and `?` never cross a `/`, so a pattern only ever opens the directories it names — nothing walks the repository. Missing parent directories are created in the worktree, an existing entry of any kind is left alone (the worktree's own file wins), and a pattern that is absolute or contains `..` is skipped rather than clamped.
 
 `.claude/settings.local.json` is in the defaults because it holds the permission allowlist: without it, every new worktree re-asks for approvals already granted in the main checkout. Linking it means one allowlist shared by every worktree.
+
+`CLAUDE.md` and `CLAUDE.local.md` are there for the repos that keep theirs out of git — a worktree of one hands Claude Code no project instructions at all, which is the same session in a repo it knows nothing about. Claude Code walks up the parent directories looking for both, so a worktree **nested** inside the repo (the default template) finds them without any help; the link is what covers a template that puts worktrees *beside* the repo. A repo that commits its `CLAUDE.md` is unaffected either way: the file is already in the worktree, and linking never replaces one that is there — `lcc` reports it as skipped and moves on.
 
 `envPatterns` and `envExclude` are the pre-nested-path names for these two keys. An existing config keeps working; `linkPatterns`/`linkExclude` win when both are present, and `lcc setup` rewrites the old key to the new one.
 
