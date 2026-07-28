@@ -76,7 +76,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         app.ui.step("Measuring what the worktree left behind ({d})…", .{derived.len + sessions.len});
         app.ui.flush();
     }
-    var scanner: usage.Scanner = .init(app.gpa, app.io);
+    var scanner: usage.Scanner = .init(app.gpa, app.io, .open(app.gpa, app.io, app.environ));
     defer scanner.deinit();
     const session_dirs = try app.gpa.alloc([]const u8, sessions.len);
     for (sessions, 0..) |entry, i| session_dirs[i] = entry.path;
@@ -411,7 +411,7 @@ fn attach(
 
     // One scanner for the batch, so a message that appears in two worktrees'
     // transcripts is still only counted once.
-    var scanner: usage.Scanner = .init(app.gpa, app.io);
+    var scanner: usage.Scanner = .init(app.gpa, app.io, .open(app.gpa, app.io, app.environ));
     defer scanner.deinit();
 
     var at: usize = 0;

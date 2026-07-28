@@ -53,7 +53,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     const cp_root = try cp.root(app.gpa, app.environ);
     const projects = try cp.list(app.gpa, app.io, cp_root);
 
-    var scanner: usage.Scanner = .init(app.gpa, app.io);
+    var scanner: usage.Scanner = .init(app.gpa, app.io, .open(app.gpa, app.io, app.environ));
     defer scanner.deinit();
 
     const rows = try app.gpa.alloc(Row, entries.len);

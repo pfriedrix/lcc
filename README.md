@@ -259,7 +259,20 @@ Two things keep the counts honest. Messages are counted once by `message.id`, be
 
 The attribution is per worktree, which means per task only as long as the task has its own worktree. Work done in the main checkout lands in one bucket no matter which branch was checked out at the time, because Claude Code keys the directory on the cwd and not on git state.
 
-Reading every transcript is a full scan, not an index: about 70ms for 25MB of them. `lcc list --no-tokens` skips it.
+### Why it is not slow
+
+Counting means parsing every line of every transcript, and the pile only grows — Claude Code appends and never prunes. A repo worked in daily reaches hundreds of MB, and re-reading all of it to redraw a table costs about 0.6s.
+
+Almost none of it changed since the last run, so almost none of it is read again. Each transcript is reduced to the assistant messages that carried usage — two orders of magnitude smaller — and that is kept in `~/.cache/lcc/usage.json`, reused whenever the file's size and mtime both still match. Append-only means either one moving is enough to notice. In practice one session is live and everything else is frozen:
+
+```
+cold (cache deleted)   0.64s
+warm                   0.05s      1.7MB of cache for 1.3B tokens across 45 project directories
+```
+
+Nothing derived is stored. Cost is recomputed from the token counts on every read, so correcting `prices` takes effect at once instead of being frozen into a file nobody would think to delete. Deduplication is not stored either: a cache entry is deduplicated against its own transcript only, which keeps it a pure function of that file, and the cross-file pass stays with the scanner — the only thing that knows which transcripts a given question spans. A cached run and a cold run produce identical output, which is what the tests assert.
+
+The cache lives under `~/.cache`, not `~/.config/lcc` like the rest of lcc's state, because it is regenerable and large enough to matter — config directories end up in dotfile repos. `LCC_USAGE_CACHE` overrides the location; deleting the file costs one slow run. `lcc list --no-tokens` skips the whole thing.
 
 ## `lcc clean`
 
@@ -364,6 +377,7 @@ src/disk.zig             path containment and batched `du`
 src/derived_data.zig     DerivedData discovery and reclamation
 src/claude_projects.zig  ~/.claude/projects discovery and reclamation
 src/usage.zig            token usage out of the transcripts, per worktree and model
+src/usage_cache.zig      transcripts distilled, so a second run does not read them
 ```
 
 `src/keychain.zig` deliberately `@cImport`s five narrow CoreFoundation/Security headers rather than the umbrella ones: on the macOS 26.5 SDK, `CoreFoundation/CoreFoundation.h` drags in mach headers whose bitfield structs translate-c turns opaque (tripping their own `_Static_assert`s), and `Security/Security.h` drags in `xpc.h`, which puts nullability attributes on the non-pointer `uuid_t`.
