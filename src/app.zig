@@ -36,23 +36,38 @@ pub const Choice = struct {
     managed: bool,
 };
 
+/// The directory every worktree lcc creates for this repo sits under, per the
+/// configured template.
+pub fn managedPrefix(app: App, repo: git.Repo) ![]const u8 {
+    const cfg = try config.load(app.gpa, app.io, app.environ);
+    return git.worktreePathPrefix(app.gpa, cfg.worktreeTemplate, repo.root);
+}
+
+/// An empty prefix matches everything, which would tag every worktree.
+pub fn isManaged(prefix: []const u8, path: []const u8) bool {
+    return prefix.len > 0 and std.mem.startsWith(u8, path, prefix);
+}
+
 /// Worktrees other than the main one, tagged with whether lcc created them.
 pub fn worktreeChoices(app: App, repo: git.Repo) ![]Choice {
     const entries = try repo.listWorktrees();
-    const cfg = try config.load(app.gpa, app.io, app.environ);
-    const managed_prefix = try git.worktreePathPrefix(app.gpa, cfg.worktreeTemplate, repo.root);
+    const prefix = try managedPrefix(app, repo);
 
     var out: std.ArrayList(Choice) = .empty;
     for (entries) |entry| {
         if (entry.is_main) continue;
         try out.append(app.gpa, .{
             .entry = entry,
-            // An empty prefix matches everything, which would tag every worktree.
-            .managed = managed_prefix.len > 0 and
-                std.mem.startsWith(u8, entry.path, managed_prefix),
+            .managed = isManaged(prefix, entry.path),
         });
     }
     return out.toOwnedSlice(app.gpa);
+}
+
+/// Wall-clock seconds since the epoch, for the columns that render an age.
+pub fn nowSeconds(io: Io) i64 {
+    const ts = Io.Timestamp.now(io, .real);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
 }
 
 pub fn worktreeLabel(gpa: std.mem.Allocator, choice: Choice) ![]u8 {

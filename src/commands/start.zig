@@ -20,6 +20,7 @@ const oauth = @import("../oauth.zig");
 const prompt = @import("../prompt.zig");
 const repos = @import("../repos.zig");
 const ui = @import("../ui.zig");
+const usage = @import("../usage.zig");
 
 const priority_label = [_][]const u8{ "   ", "U  ", "H  ", "M  ", "L  " };
 
@@ -101,6 +102,12 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     app.ui.info("", .{});
     app.ui.info("{f} in {f}", .{ ui.bold("Launching Claude Code"), ui.dim(wt.path) });
     app.ui.hint("Linear: {s}", .{selected.url});
+    // Only says anything when this issue has been worked on before — picking up
+    // a task should show what it has already cost.
+    const spent = usage.forWorktree(app.gpa, app.io, app.environ, wt.path);
+    if (!spent.empty()) {
+        app.ui.hint("Spent here: {f}", .{usage.brief(spent, app_mod.nowSeconds(app.io))});
+    }
     if (carried) |c| {
         app.ui.hint("MCP: carrying {d} local server(s) from {s} — {s}", .{
             c.names.len,

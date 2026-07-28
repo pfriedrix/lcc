@@ -205,6 +205,32 @@ pub fn bytes(value: u64) Bytes {
     return .{ .value = value };
 }
 
+/// Human-readable count — `812`, `3.7k`, `62.2M`. Token counts reach nine
+/// digits, which no table column can carry and no reader wants to parse.
+pub const Count = struct {
+    value: u64,
+
+    pub fn format(self: Count, w: *Io.Writer) Io.Writer.Error!void {
+        if (self.value < 1000) return w.print("{d}", .{self.value});
+        const units = [_][]const u8{ "k", "M", "B" };
+        var v: f64 = @as(f64, @floatFromInt(self.value)) / 1000.0;
+        var unit: usize = 0;
+        while (v >= 1000 and unit < units.len - 1) {
+            v /= 1000;
+            unit += 1;
+        }
+        if (v < 10) {
+            try w.print("{d:.1}{s}", .{ v, units[unit] });
+        } else {
+            try w.print("{d:.0}{s}", .{ v, units[unit] });
+        }
+    }
+};
+
+pub fn count(value: u64) Count {
+    return .{ .value = value };
+}
+
 /// Coarse elapsed time in one or two characters plus a unit — `2h`, `6d`, `3w`.
 /// A dashboard column wants "roughly how stale", not a duration.
 pub const Age = struct {
@@ -254,6 +280,25 @@ test "age renders the coarsest unit that fits" {
     };
     for (cases) |case| {
         const got = try std.fmt.allocPrint(gpa, "{f}", .{age(case.seconds)});
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(case.want, got);
+    }
+}
+
+test "count switches unit at a thousand, not a kibibyte" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { value: u64, want: []const u8 }{
+        .{ .value = 0, .want = "0" },
+        .{ .value = 999, .want = "999" },
+        .{ .value = 1000, .want = "1.0k" },
+        .{ .value = 3675, .want = "3.7k" },
+        .{ .value = 417_196, .want = "417k" },
+        .{ .value = 62_246_287, .want = "62M" },
+        .{ .value = 1_526_969, .want = "1.5M" },
+        .{ .value = 2_400_000_000, .want = "2.4B" },
+    };
+    for (cases) |case| {
+        const got = try std.fmt.allocPrint(gpa, "{f}", .{count(case.value)});
         defer gpa.free(got);
         try std.testing.expectEqualStrings(case.want, got);
     }

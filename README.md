@@ -62,6 +62,7 @@ lcc start PE-256 --json   # resolve it and print the result instead of launching
 lcc start --all      # ignore the activeStates filter
 lcc setup            # configure startTaskCommand, worktreeTemplate, activeStates, linkPatterns
 lcc list             # dashboard of every worktree (--local to skip the network columns)
+lcc stats            # what each worktree has spent on Claude Code (--models for the breakdown)
 lcc open             # pick a worktree and resume Claude in it, if it has sessions (--no-resume for fresh)
 lcc open xcode       # pick a worktree and open it in Xcode instead
 lcc remove           # pick a worktree, remove it + its branch + Xcode build data
@@ -80,10 +81,10 @@ lcc auth --logout    # clear the token from the Keychain
 
 ```
 $ lcc list
-BRANCH                   STATUS   SYNC   AGE  PR          LINEAR       PATH
-feature/pe-256-app-hangs 3 dirty  ↑2 ↓0  2h   #412 open   In Progress  ~/…/pe-256-app-hangs
-feature/pe-247-exc-bad   clean    ↑0 ↓14 6d   #398 merged In Build     ~/…/pe-247-exc-bad
-feature/pe-224-history   clean    gone   11d  —           In Review    ~/…/pe-224-history
+BRANCH                   STATUS   SYNC   AGE  TOKENS  PR          LINEAR       PATH
+feature/pe-256-app-hangs 3 dirty  ↑2 ↓0  2h   53M     #412 open   In Progress  ~/…/pe-256-app-hangs
+feature/pe-247-exc-bad   clean    ↑0 ↓14 6d   8.0M    #398 merged In Build     ~/…/pe-247-exc-bad
+feature/pe-224-history   clean    gone   11d  —       —           In Review    ~/…/pe-224-history
 ```
 
 | Column | Where it comes from |
@@ -91,10 +92,11 @@ feature/pe-224-history   clean    gone   11d  —           In Review    ~/…/p
 | `STATUS` | `git status --porcelain` in the worktree — entry count, or `missing` when the directory is gone |
 | `SYNC` | `%(upstream:track)` — `↑ahead ↓behind`, `unpushed` with no upstream, `gone` once the remote branch is deleted |
 | `AGE` | how long ago the branch tip was committed |
+| `TOKENS` | context tokens the worktree's Claude Code sessions have read — see [token usage](#token-usage) |
 | `PR` | `gh pr list` for the repo, matched on head branch; open beats merged beats closed |
 | `LINEAR` | the state of the issue the branch names, e.g. `PE-256` out of `feature/pe-256-…` |
 
-Everything local is two `git` calls plus one `git status` per worktree — about 0.2s on a large iOS repo with five worktrees. `PR` and `LINEAR` are one batched request each and are the whole rest of the cost: roughly 1.9s in total, more on the first call of the day while Linear warms up. `--local` drops both columns, as does a missing `gh` or an expired Linear token — those print a hint and leave the rest of the table intact.
+Everything local is two `git` calls plus one `git status` per worktree — about 0.2s on a large iOS repo with five worktrees. `PR` and `LINEAR` are one batched request each and are the whole rest of the cost: roughly 1.9s in total, more on the first call of the day while Linear warms up. `--local` drops both columns, as does a missing `gh` or an expired Linear token — those print a hint and leave the rest of the table intact. `--no-tokens` drops the transcript read behind `TOKENS`.
 
 ### Picking
 
@@ -191,8 +193,8 @@ Anything else is kept, and `lcc` reports how many unmerged commits it found and 
 ```
 $ lcc remove --merged
 ? Select what to remove (space toggles, enter confirms):
-❯ ◉ feature/pe-101-shipped  merged       2.4 GB   ~/…/.lcc/worktrees/pe-101-shipped
-  ◉ feature/pe-103-squashed remote gone  —        branch only — no worktree left
+❯ ◉ feature/pe-101-shipped  merged       2.4 GB   53M      ~/…/.lcc/worktrees/pe-101-shipped
+  ◉ feature/pe-103-squashed remote gone  —        —        branch only — no worktree left
   3/3 selected · space toggles · enter confirms · esc cancel
 ```
 
@@ -215,6 +217,45 @@ Claude Code names each directory after a flattened cwd, and that flattening is l
 Transcripts are treated as more valuable than build data, because they are: a DerivedData folder comes back on the next build and a transcript is what `claude --resume` replays. So `lcc remove` **lists** the matching folders in its confirmation and keeps them; `--sessions` is what actually deletes them.
 
 Set `LCC_CLAUDE_PROJECTS` to override the location.
+
+## Token usage
+
+Those transcripts record what every assistant message cost — the `usage` block the API returned, plus the model that produced it. Since a project directory is keyed on the cwd Claude Code ran in, and lcc already maps directories to worktrees by the `cwd` a transcript records, the same data answers "what has this task spent".
+
+It shows up wherever you touch a worktree, not only when you ask:
+
+```
+$ lcc open
+› Launching Claude Code in ~/…/pe-47-backfill-receipts feature/pe-47-backfill-receipts
+  Spent here: 3.6M context · 18k output · 2 sessions · 36m ago · ~$2.54
+```
+
+`lcc list` carries it as a column, `lcc start` prints it when the worktree already exists, and both removal paths show it — the single confirmation as a line, `--merged` as a column next to the reclaimable bytes. A transcript's size on disk says nothing about the work it holds, and `--sessions` deletes it for good.
+
+`lcc stats` is the detailed view, with `--models` for the breakdown that explains the money:
+
+```
+$ lcc stats --models
+WORKTREE                         SESS  MSGS  CONTEXT  OUTPUT  ~USD   LAST
+feature/pe-47-backfill-receipts  2     6     3.6M     18k     2.54   36m
+  opus-5                               5     3.6M     17k     2.54
+  haiku-4-5                            1     50       900     0.00
+main                             17    1198  257M     1.0M    180.14 now   main
+feature/pe-51-liquid-glass       —     —     —        —       —      —
+TOTAL                            19    1204  261M     1.0M    182.68
+```
+
+`--json` prints the same numbers with the cache split intact, for anything that wants to keep its own history.
+
+**`CONTEXT` is the number that matters.** It counts fresh input plus cache writes and cache reads, and on a long session the cache reads dominate everything else by two orders of magnitude — the 3.6M above is 3.6M of re-read conversation against 103 tokens of genuinely new input. Output is shown separately because it is priced five times higher per token.
+
+Two things keep the counts honest. Messages are counted once by `message.id`, because a resumed session copies history forward and compaction rewrites it, so the same API response appears in several lines and often several transcripts. And each line is parsed as JSON rather than scanned for `"output_tokens"` — a message whose own text quotes a usage block would otherwise inflate its own session, which is exactly what a transcript of a session about token counts does.
+
+`~USD` is Anthropic **list price**, applied per model, with cache writes at 1.25× input (2× for the hour-long TTL) and cache reads at 0.1×. It is not what a Claude subscription bills — it is what the same tokens would have cost through the API. The table lives in one place, `prices` in `src/usage.zig`; a model that is not in it still has its tokens counted, and the total it is missing from is marked with a trailing `+`.
+
+The attribution is per worktree, which means per task only as long as the task has its own worktree. Work done in the main checkout lands in one bucket no matter which branch was checked out at the time, because Claude Code keys the directory on the cwd and not on git state.
+
+Reading every transcript is a full scan, not an index: about 70ms for 25MB of them. `lcc list --no-tokens` skips it.
 
 ## `lcc clean`
 
@@ -318,6 +359,7 @@ src/link.zig             pattern matching and symlinking into a worktree
 src/disk.zig             path containment and batched `du`
 src/derived_data.zig     DerivedData discovery and reclamation
 src/claude_projects.zig  ~/.claude/projects discovery and reclamation
+src/usage.zig            token usage out of the transcripts, per worktree and model
 ```
 
 `src/keychain.zig` deliberately `@cImport`s five narrow CoreFoundation/Security headers rather than the umbrella ones: on the macOS 26.5 SDK, `CoreFoundation/CoreFoundation.h` drags in mach headers whose bitfield structs translate-c turns opaque (tripping their own `_Static_assert`s), and `Security/Security.h` drags in `xpc.h`, which puts nullability attributes on the non-pointer `uuid_t`.

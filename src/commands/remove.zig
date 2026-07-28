@@ -9,6 +9,7 @@ const disk = @import("../disk.zig");
 const git = @import("../git.zig");
 const prompt = @import("../prompt.zig");
 const ui = @import("../ui.zig");
+const usage = @import("../usage.zig");
 
 pub const Opts = struct {
     force: bool = false,
@@ -26,6 +27,10 @@ pub const Opts = struct {
 const Attached = struct {
     derived: []dd.Sized = &.{},
     sessions: []cp.Sized = &.{},
+    /// What those sessions spent. A transcript's disk size says nothing about
+    /// the work it holds — this is the number that makes deleting one a
+    /// decision rather than a shrug.
+    spent: usage.Totals = .{},
 
     fn reclaimable(self: Attached, sessions_go: bool) u64 {
         var total: u64 = 0;
@@ -71,9 +76,15 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         app.ui.step("Measuring what the worktree left behind ({d})…", .{derived.len + sessions.len});
         app.ui.flush();
     }
+    var scanner: usage.Scanner = .init(app.gpa, app.io);
+    defer scanner.deinit();
+    const session_dirs = try app.gpa.alloc([]const u8, sessions.len);
+    for (sessions, 0..) |entry, i| session_dirs[i] = entry.path;
+
     const attached: Attached = .{
         .derived = try dd.withSizes(app.gpa, app.io, derived),
         .sessions = try cp.withSizes(app.gpa, app.io, sessions),
+        .spent = try scanner.projectDirs(session_dirs),
     };
 
     const disposition: ?git.BranchDisposition = if (picked.entry.branch != null and !opts.keep_branch)
@@ -155,6 +166,11 @@ fn confirmMessage(
             plural(item.entry.sessions),
             ui.bytes(item.size),
             if (opts.sessions) "" else "  — kept, use --sessions",
+        }));
+    }
+    if (!attached.spent.empty()) {
+        try out.appendSlice(w, try std.fmt.allocPrint(w, "    spent      {f}\n", .{
+            usage.brief(attached.spent, app_mod.nowSeconds(app.io)),
         }));
     }
     if (disposition) |d| {
@@ -393,6 +409,11 @@ fn attach(
     }
     const sizes = try disk.usage(app.gpa, app.io, paths.items);
 
+    // One scanner for the batch, so a message that appears in two worktrees'
+    // transcripts is still only counted once.
+    var scanner: usage.Scanner = .init(app.gpa, app.io);
+    defer scanner.deinit();
+
     var at: usize = 0;
     for (rows, 0..) |*row, i| {
         const dd_sized = try app.gpa.alloc(dd.Sized, derived[i].len);
@@ -401,12 +422,55 @@ fn attach(
             at += 1;
         }
         const cp_sized = try app.gpa.alloc(cp.Sized, sessions[i].len);
+        const session_dirs = try app.gpa.alloc([]const u8, sessions[i].len);
         for (sessions[i], 0..) |e, j| {
             cp_sized[j] = .{ .entry = e, .size = sizes[at] };
+            session_dirs[j] = e.path;
             at += 1;
         }
-        row.attached = .{ .derived = dd_sized, .sessions = cp_sized };
+        row.attached = .{
+            .derived = dd_sized,
+            .sessions = cp_sized,
+            .spent = try scanner.projectDirs(session_dirs),
+        };
     }
+}
+
+/// One line of the `--merged` checkbox list: what it is, why it is safe, what
+/// removing it frees, and what it spent getting here.
+fn rowLabel(
+    gpa: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    row: Row,
+    branch_width: usize,
+    reason_width: usize,
+    opts: Opts,
+) ![]const u8 {
+    const size = row.attached.reclaimable(opts.sessions);
+    const reclaim = if (size == 0)
+        try gpa.dupe(u8, "—")
+    else
+        try std.fmt.allocPrint(gpa, "{f}", .{ui.bytes(size)});
+
+    // What the worktree spent, so a row is not judged on disk size alone — the
+    // transcripts go with it when `--sessions` is on.
+    const spent = if (row.attached.spent.empty())
+        try gpa.dupe(u8, "—")
+    else
+        try std.fmt.allocPrint(gpa, "{f}", .{
+            ui.count(row.attached.spent.counts.contextTokens()),
+        });
+
+    return std.fmt.allocPrint(gpa, "{f}  {f}  {f}  {f}  {s}", .{
+        ui.pad(row.branch, branch_width),
+        ui.pad(row.reason(), reason_width),
+        ui.pad(reclaim, 8),
+        ui.pad(spent, 7),
+        if (row.worktree) |entry|
+            disk.abbreviate(gpa, environ, entry.path)
+        else
+            "branch only — no worktree left",
+    });
 }
 
 fn selectRows(app: app_mod.App, rows: []const Row, opts: Opts) ![]const Row {
@@ -419,22 +483,8 @@ fn selectRows(app: app_mod.App, rows: []const Row, opts: Opts) ![]const Row {
 
     const items = try app.gpa.alloc(prompt.Item, rows.len);
     for (rows, 0..) |row, i| {
-        const size = row.attached.reclaimable(opts.sessions);
-        const reclaim = if (size == 0)
-            try app.gpa.dupe(u8, "—")
-        else
-            try std.fmt.allocPrint(app.gpa, "{f}", .{ui.bytes(size)});
-
         items[i] = .{
-            .label = try std.fmt.allocPrint(app.gpa, "{f}  {f}  {f}  {s}", .{
-                ui.pad(row.branch, branch_width),
-                ui.pad(row.reason(), reason_width),
-                ui.pad(reclaim, 8),
-                if (row.worktree) |entry|
-                    disk.abbreviate(app.gpa, app.environ, entry.path)
-                else
-                    "branch only — no worktree left",
-            }),
+            .label = try rowLabel(app.gpa, app.environ, row, branch_width, reason_width, opts),
         };
     }
 
@@ -454,4 +504,51 @@ fn selectRows(app: app_mod.App, rows: []const Row, opts: Opts) ![]const Row {
 
 fn plural(n: anytype) []const u8 {
     return if (n == 1) "" else "s";
+}
+
+test "a bulk row shows what it frees and what it spent" {
+    const gpa = std.testing.allocator;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("HOME", "/Users/me");
+
+    const worktree: git.WorktreeEntry = .{
+        .path = "/Users/me/Projects/App/.lcc/worktrees/pe-101",
+        .branch = "feature/pe-101-shipped",
+        .head = "abc",
+        .locked = false,
+        .prunable = false,
+        .is_main = false,
+    };
+    const row: Row = .{
+        .worktree = worktree,
+        .branch = "feature/pe-101-shipped",
+        .disposition = .{ .branch = "feature/pe-101-shipped", .safe = true, .reason = .merged, .unmerged = 0 },
+        .attached = .{
+            .derived = &.{},
+            .sessions = &.{},
+            .spent = .{
+                .counts = .{ .messages = 190, .cache_read = 52_600_000 },
+                .sessions = 1,
+            },
+        },
+    };
+
+    const label = try rowLabel(arena, &environ, row, 22, 11, .{});
+    try std.testing.expect(std.mem.indexOf(u8, label, "53M") != null);
+    // No build data and sessions kept, so there is nothing to reclaim yet.
+    try std.testing.expect(std.mem.indexOf(u8, label, "—") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "~/Projects/App/.lcc/worktrees/pe-101") != null);
+
+    // A branch whose worktree is already gone has no usage to report.
+    var orphan = row;
+    orphan.worktree = null;
+    orphan.attached = .{};
+    const orphan_label = try rowLabel(arena, &environ, orphan, 22, 11, .{});
+    try std.testing.expect(std.mem.indexOf(u8, orphan_label, "53M") == null);
+    try std.testing.expect(std.mem.indexOf(u8, orphan_label, "branch only") != null);
 }

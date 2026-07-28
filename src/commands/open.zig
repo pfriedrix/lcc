@@ -7,6 +7,7 @@ const claude_projects = @import("../claude_projects.zig");
 const git = @import("../git.zig");
 const mcp = @import("../mcp.zig");
 const ui = @import("../ui.zig");
+const usage = @import("../usage.zig");
 const xcode = @import("../xcode.zig");
 
 pub const Target = enum { claude, xcode };
@@ -61,6 +62,12 @@ fn openInClaude(
         ui.cyan(label),
     });
     if (!resumable and !no_resume) app.ui.hint("No sessions here yet — starting fresh.", .{});
+
+    // What this task has cost so far, before adding to it.
+    const spent = usage.forWorktree(app.gpa, app.io, app.environ, picked.entry.path);
+    if (!spent.empty()) {
+        app.ui.hint("Spent here: {f}", .{usage.brief(spent, app_mod.nowSeconds(app.io))});
+    }
     if (carried) |c| {
         app.ui.hint("MCP: carrying {d} local server(s) from {s} — {s}", .{
             c.names.len,
