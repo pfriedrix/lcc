@@ -18,7 +18,21 @@ const default_worktree_template = "{repoRoot}/.lcc/worktrees/{branchLeaf}";
 /// Gitignored files worth sharing with every worktree. `.claude/settings.local.json`
 /// is the permission allowlist: without it, each new worktree re-asks for approvals
 /// that were already granted in the main checkout.
-const default_link_patterns = [_][]const u8{ ".env", ".env.*", ".claude/settings.local.json" };
+///
+/// `CLAUDE.md` and `CLAUDE.local.md` are here for the repos that keep theirs out of
+/// git — a worktree of one hands Claude Code no project instructions at all, which is
+/// the same session in a repo it knows nothing about. Claude Code walks up the parent
+/// directories looking for both, so a worktree *nested* inside the repo finds them
+/// without any help; the link is what covers a template that puts worktrees beside the
+/// repo instead. Linking never replaces a file that is already there, so a repo that
+/// commits its `CLAUDE.md` keeps the copy its branch carries.
+const default_link_patterns = [_][]const u8{
+    ".env",
+    ".env.*",
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    ".claude/settings.local.json",
+};
 const default_link_exclude = [_][]const u8{ ".env.example", ".env.sample", ".env.template" };
 const default_active_states = [_][]const u8{ "Todo", "In Progress" };
 
@@ -150,15 +164,28 @@ fn resolveLinkPatterns(stored: Stored) []const []const u8 {
     return stored.linkPatterns orelse stored.envPatterns orelse &default_link_patterns;
 }
 
+fn hasPattern(patterns: []const []const u8, needle: []const u8) bool {
+    for (patterns) |pattern| {
+        if (std.mem.eql(u8, pattern, needle)) return true;
+    }
+    return false;
+}
+
 test "linkPatterns wins over the older envPatterns, which still works alone" {
     const old: Stored = .{ .envPatterns = &.{".env"} };
     try std.testing.expectEqualStrings(".env", resolveLinkPatterns(old)[0]);
 
     const both: Stored = .{ .linkPatterns = &.{"x"}, .envPatterns = &.{".env"} };
     try std.testing.expectEqualStrings("x", resolveLinkPatterns(both)[0]);
+}
 
-    const neither: Stored = .{};
-    const defaults = resolveLinkPatterns(neither);
-    try std.testing.expectEqual(@as(usize, 3), defaults.len);
-    try std.testing.expectEqualStrings(".claude/settings.local.json", defaults[2]);
+test "the defaults carry Claude Code's own files, not just secrets" {
+    const defaults = resolveLinkPatterns(.{});
+    try std.testing.expectEqual(@as(usize, 5), defaults.len);
+
+    // Secrets are the obvious half; these three are what a worktree needs to be the
+    // same working environment as the checkout it was cut from.
+    try std.testing.expect(hasPattern(defaults, ".claude/settings.local.json"));
+    try std.testing.expect(hasPattern(defaults, "CLAUDE.md"));
+    try std.testing.expect(hasPattern(defaults, "CLAUDE.local.md"));
 }
