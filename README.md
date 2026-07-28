@@ -236,14 +236,16 @@ $ lcc open
 
 ```
 $ lcc stats --models
-WORKTREE                         SESS  MSGS  CONTEXT  OUTPUT  ~USD   LAST
-feature/pe-47-backfill-receipts  2     6     3.6M     18k     2.54   36m
+WORKTREE                         SESS  MSGS  CONTEXT  OUTPUT  ~USD    LAST  ORIGIN
+feature/pe-47-backfill-receipts  2     6     3.6M     18k     2.54    36m
   opus-5                               5     3.6M     17k     2.54
   haiku-4-5                            1     50       900     0.00
-main                             17    1198  257M     1.0M    180.14 now   main
-feature/pe-51-liquid-glass       —     —     —        —       —      —
+main                             17    1198  257M     1.0M    180.14  now   main
+feature/pe-51-liquid-glass       —     —     —        —       —       —     lcc
 TOTAL                            19    1204  261M     1.0M    182.68
 ```
+
+`ORIGIN` says where a worktree came from — `main` for the checkout itself, `lcc` for one lcc created under the configured prefix, blank for one made by hand somewhere else. The column is only drawn when there is something to put in it.
 
 `--json` prints the same numbers with the cache split intact, for anything that wants to keep its own history.
 

@@ -25,11 +25,22 @@ pub const Opts = struct {
 const Row = struct {
     /// Branch name, or the short head when detached.
     label: []const u8,
-    /// `main`, `lcc`, or nothing — where this worktree came from.
+    /// `main`, `lcc`, or nothing — where this worktree came from. Rendered under
+    /// the ORIGIN column, which is only drawn when some row has one to show.
     tag: []const u8,
     path: []const u8,
     totals: usage.Totals,
 };
+
+/// Whether the ORIGIN column is worth a header and its padding. A repo whose
+/// worktrees were all made by hand outside the managed prefix has nothing to put
+/// there, and an empty column would only cost every row a trailing space.
+fn anyTagged(rows: []const Row) bool {
+    for (rows) |row| {
+        if (row.tag.len > 0) return true;
+    }
+    return false;
+}
 
 pub fn run(app: app_mod.App, opts: Opts) !void {
     const repo = try app.repo();
@@ -219,15 +230,18 @@ fn renderTable(app: app_mod.App, rows: []const Row, opts: Opts) !void {
 
     // The rightmost cell of a line is never padded — padding it would leave
     // trailing spaces on every row, which show up the moment output is piped or
-    // pasted somewhere.
-    app.ui.hint("{f}  {f}  {f}  {f}  {f}  {f}  {s}", .{
+    // pasted somewhere. Which cell that is depends on whether ORIGIN is drawn,
+    // both in the header and in every row below it.
+    const origin = anyTagged(rows);
+    app.ui.hint("{f}  {f}  {f}  {f}  {f}  {f}  {f}{s}", .{
         ui.pad("WORKTREE", w.label),
         ui.pad("SESS", w.sessions),
         ui.pad("MSGS", w.messages),
         ui.pad("CONTEXT", w.input),
         ui.pad("OUTPUT", w.output),
         ui.pad("~USD", w.cost),
-        "LAST",
+        ui.pad("LAST", if (origin) w.last else 0),
+        if (origin) "  ORIGIN" else "",
     });
 
     for (rows, cells) |row, cell| {
@@ -330,6 +344,53 @@ fn pad(gpa: std.mem.Allocator, text: []const u8, width: usize) ![]const u8 {
 
 fn testRow(label: []const u8, totals: usage.Totals) Row {
     return .{ .label = label, .tag = "", .path = "/x", .totals = totals };
+}
+
+/// A table rendered into memory, with colour off so the assertions are about
+/// the layout rather than the escape codes.
+fn renderToString(arena: std.mem.Allocator, rows: []const Row) ![]const u8 {
+    const was_colour = ui.colorEnabled();
+    ui.setColor(false);
+    defer ui.setColor(was_colour);
+
+    var out: Io.Writer.Allocating = .init(arena);
+    var err: Io.Writer.Allocating = .init(arena);
+    var environ: std.process.Environ.Map = .init(arena);
+
+    try renderTable(.{
+        .gpa = arena,
+        .io = std.testing.io,
+        .environ = &environ,
+        .ui = .{ .io = std.testing.io, .out = &out.writer, .err = &err.writer },
+    }, rows, .{});
+    return out.writer.buffered();
+}
+
+test "the origin column is headed, and absent when no worktree has one" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const spent: usage.Totals = .{ .counts = .{ .messages = 4, .output = 900 }, .sessions = 1 };
+
+    // With a tag to show, LAST is padded so ORIGIN lines up under its header.
+    const tagged = try renderToString(arena, &.{
+        .{ .label = "main", .tag = "main", .path = "/x", .totals = spent },
+        .{ .label = "feature/pe-1", .tag = "lcc", .path = "/y", .totals = spent },
+    });
+    var lines = std.mem.splitScalar(u8, tagged, '\n');
+    try std.testing.expect(std.mem.endsWith(u8, lines.next().?, "LAST  ORIGIN"));
+    try std.testing.expect(std.mem.endsWith(u8, lines.next().?, "  main"));
+    try std.testing.expect(std.mem.endsWith(u8, lines.next().?, "  lcc"));
+
+    // With nothing to show, the column is gone entirely — header included, and
+    // no row picks up a trailing space where it used to be.
+    const untagged = try renderToString(arena, &.{testRow("feature/pe-1", spent)});
+    var plain = std.mem.splitScalar(u8, untagged, '\n');
+    try std.testing.expect(std.mem.endsWith(u8, plain.next().?, "LAST"));
+    const row = plain.next().?;
+    try std.testing.expect(std.mem.indexOf(u8, row, "ORIGIN") == null);
+    try std.testing.expect(!std.mem.endsWith(u8, row, " "));
 }
 
 test "measure sizes every column to its widest cell, header included" {
