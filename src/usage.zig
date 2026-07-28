@@ -28,6 +28,10 @@ const ui = @import("ui.zig");
 /// silently undercounted.
 const transcript_limit = 256 * 1024 * 1024;
 
+/// How far below a project directory transcripts are looked for. Claude Code
+/// puts subagents at `<session-id>/subagents/`, which is two.
+const max_depth = 4;
+
 /// What a set of messages spent. The unit of both the per-model buckets and the
 /// rollup over them.
 pub const Counts = struct {
@@ -158,18 +162,45 @@ pub const Scanner = struct {
     /// and a missing transcript should not fail the command that wanted it.
     pub fn project(self: *Scanner, dir_path: []const u8) !Totals {
         var totals: Totals = .{};
+        try self.scan(&totals, dir_path, 0);
+        return totals;
+    }
 
-        var dir = Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch
-            return totals;
+    /// Subagents do not write into the conversation that spawned them. Each gets
+    /// its own transcript under `<session-id>/subagents/`, so the top level of a
+    /// project directory holds only part of what the work cost — for a worktree
+    /// driven through a pipeline, usually well under half of it. The whole tree
+    /// is walked for `.jsonl`; everything else Claude Code keeps down there
+    /// (`tool-results/`, the per-subagent `.json` sidecars, `.md` notes) is not
+    /// a transcript and carries no usage.
+    ///
+    /// Only the top level counts towards `sessions`. A subagent is part of a
+    /// conversation, not one of its own, and counting it would inflate a column
+    /// that answers "how many times did I sit down with this worktree".
+    fn scan(self: *Scanner, totals: *Totals, dir_path: []const u8, depth: u8) !void {
+        // Claude Code nests two deep. The cap is for a tree that is not its own.
+        if (depth > max_depth) return;
+
+        var dir = Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch return;
         defer dir.close(self.io);
 
         var it = dir.iterate();
         while (it.next(self.io) catch null) |dirent| {
-            if (dirent.kind != .file or !std.mem.endsWith(u8, dirent.name, ".jsonl")) continue;
-            const path = try std.fs.path.join(self.gpa, &.{ dir_path, dirent.name });
-            try self.transcript(&totals, path);
+            switch (dirent.kind) {
+                .file => {
+                    if (!std.mem.endsWith(u8, dirent.name, ".jsonl")) continue;
+                    const path = try std.fs.path.join(self.gpa, &.{ dir_path, dirent.name });
+                    try self.transcript(totals, path, depth == 0);
+                },
+                // Symlinks report as `.sym_link` and are left alone, so the walk
+                // cannot be sent round a loop.
+                .directory => {
+                    const path = try std.fs.path.join(self.gpa, &.{ dir_path, dirent.name });
+                    try self.scan(totals, path, depth + 1);
+                },
+                else => {},
+            }
         }
-        return totals;
     }
 
     /// Usage across several project directories.
@@ -196,7 +227,7 @@ pub const Scanner = struct {
         return self.projectDirs(dirs);
     }
 
-    fn transcript(self: *Scanner, totals: *Totals, path: []const u8) !void {
+    fn transcript(self: *Scanner, totals: *Totals, path: []const u8, session: bool) !void {
         _ = self.scratch.reset(.retain_capacity);
         const scratch = self.scratch.allocator();
 
@@ -213,7 +244,7 @@ pub const Scanner = struct {
             else => return,
         };
 
-        totals.sessions += 1;
+        if (session) totals.sessions += 1;
 
         var lines = std.mem.splitScalar(u8, bytes, '\n');
         while (lines.next()) |line| {
@@ -614,6 +645,65 @@ test "usage from a sidechain subagent belongs to the worktree that spawned it" {
 
     try std.testing.expectEqual(@as(u64, 2), totals.counts.messages);
     try std.testing.expectEqual(@as(u64, 50), totals.counts.output);
+}
+
+test "a subagent's own transcript counts, but not as another session" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cwd = Io.Dir.cwd();
+
+    // The layout Claude Code writes: the conversation at the top, each subagent
+    // in its own transcript below it, and non-transcript company alongside. A
+    // pipeline puts most of the work through subagents, so a scan that stops at
+    // the top level can miss more than it finds.
+    const dir_path = try std.fs.path.join(arena, &.{ base, "project" });
+    const subagents = try std.fs.path.join(arena, &.{ dir_path, "sess-1", "subagents" });
+    const tool_results = try std.fs.path.join(arena, &.{ dir_path, "sess-1", "tool-results" });
+    try cwd.createDirPath(io, subagents);
+    try cwd.createDirPath(io, tool_results);
+
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ dir_path, "sess-1.jsonl" }),
+        .data =
+        \\{"type":"assistant","timestamp":"2026-07-28T10:00:00.000Z","message":{"id":"msg_a","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":100}}}
+        \\
+        ,
+    });
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ subagents, "agent-1.jsonl" }),
+        .data =
+        \\{"type":"assistant","timestamp":"2026-07-28T11:00:00.000Z","message":{"id":"msg_b","model":"claude-opus-5","usage":{"input_tokens":5,"output_tokens":900}}}
+        \\
+        ,
+    });
+    // Neither of these is a transcript, and both sit where the walk goes.
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ subagents, "agent-1.json" }),
+        .data = "{\"usage\":{\"output_tokens\":999999}}\n",
+    });
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ tool_results, "out.txt" }),
+        .data = "output_tokens 999999\n",
+    });
+
+    var scanner: Scanner = .init(arena, io);
+    defer scanner.deinit();
+    const totals = try scanner.project(dir_path);
+
+    try std.testing.expectEqual(@as(u64, 2), totals.counts.messages);
+    try std.testing.expectEqual(@as(u64, 1000), totals.counts.output);
+    // One conversation, whatever it delegated. The subagent is part of it.
+    try std.testing.expectEqual(@as(u64, 1), totals.sessions);
+    // The subagent's message is the newest, so it sets `last`.
+    try std.testing.expectEqualStrings("2026-07-28T11:00:00.000Z", totals.last);
 }
 
 test "add merges per-model buckets across project directories" {
