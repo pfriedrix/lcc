@@ -12,6 +12,7 @@ const open_cmd = @import("commands/open.zig");
 const remove_cmd = @import("commands/remove.zig");
 const setup_cmd = @import("commands/setup.zig");
 const start_cmd = @import("commands/start.zig");
+const stats_cmd = @import("commands/stats.zig");
 const ui = @import("ui.zig");
 
 const version = "0.1.0";
@@ -38,6 +39,10 @@ const usage =
     \\  setup                    Interactively configure lcc
     \\  list | ls                Dashboard of the worktrees in the current repo
     \\    --local                skip the PR and Linear columns (no network)
+    \\    --no-tokens            skip the TOKENS column (skips reading transcripts)
+    \\  stats                    What each worktree has spent on Claude Code
+    \\    --models               break every worktree down by model
+    \\    --json                 print the numbers instead of a table
     \\  open | o [claude|xcode]  Open a worktree — Claude Code (default) or Xcode
     \\                           resumes when the worktree has transcripts, else starts fresh
     \\    --no-resume            never pass --resume, even when it has them
@@ -113,6 +118,7 @@ fn dispatch(app: app_mod.App, args: []const []const u8) !void {
     if (eq(first, "remove") or eq(first, "rm")) return removeCommand(app, args[1..]);
     if (eq(first, "clean")) return cleanCommand(app, args[1..]);
     if (eq(first, "start")) return startCommand(app, args[1..]);
+    if (eq(first, "stats")) return statsCommand(app, args[1..]);
     if (std.mem.startsWith(u8, first, "-")) return error.UnknownOption;
     return error.UnknownCommand;
 }
@@ -201,9 +207,29 @@ fn openCommand(app: app_mod.App, args: []const []const u8) !void {
 fn listCommand(app: app_mod.App, args: []const []const u8) !void {
     var opts: list_cmd.Opts = .{};
     for (args) |arg| {
-        if (eq(arg, "--local")) opts.local = true else return error.UnknownOption;
+        if (eq(arg, "--local")) {
+            opts.local = true;
+        } else if (eq(arg, "--no-tokens")) {
+            opts.tokens = false;
+        } else return error.UnknownOption;
     }
     return list_cmd.run(app, opts);
+}
+
+fn statsCommand(app: app_mod.App, args: []const []const u8) !void {
+    var opts: stats_cmd.Opts = .{};
+    for (args) |arg| {
+        if (eq(arg, "--models")) {
+            opts.models = true;
+        } else if (eq(arg, "--json")) {
+            opts.json = true;
+        } else return error.UnknownOption;
+    }
+
+    // stdout belongs to the payload in machine mode, same as `start --json`.
+    var machine = app;
+    machine.ui.divert = opts.json;
+    return stats_cmd.run(machine, opts);
 }
 
 fn removeCommand(app: app_mod.App, args: []const []const u8) !void {
@@ -265,9 +291,12 @@ test {
     _ = @import("prompt.zig");
     _ = @import("repos.zig");
     _ = @import("ui.zig");
+    _ = @import("usage.zig");
     _ = @import("xcode.zig");
     _ = @import("commands/list.zig");
+    _ = @import("commands/remove.zig");
     _ = @import("commands/start.zig");
+    _ = @import("commands/stats.zig");
 }
 
 fn describe(err: anyerror) []const u8 {

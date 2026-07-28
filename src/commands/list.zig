@@ -10,16 +10,22 @@ const std = @import("std");
 const Io = std.Io;
 const app_mod = @import("../app.zig");
 const config = @import("../config.zig");
+const cp = @import("../claude_projects.zig");
 const disk = @import("../disk.zig");
 const git = @import("../git.zig");
 const github = @import("../github.zig");
 const linear = @import("../linear.zig");
 const oauth = @import("../oauth.zig");
 const ui = @import("../ui.zig");
+const usage = @import("../usage.zig");
 
 pub const Opts = struct {
     /// Skip the two network columns.
     local: bool = false,
+    /// Show what each worktree has spent on Claude Code. On by default: the
+    /// question "how much has this task cost" comes up every time the dashboard
+    /// does. Off is for when reading the transcripts is not worth the wait.
+    tokens: bool = true,
 };
 
 const Tree = enum { clean, dirty, missing };
@@ -33,6 +39,9 @@ const Row = struct {
     /// True once the remote branch the worktree tracked has been deleted.
     remote_gone: bool,
     age: []const u8,
+    /// Context tokens this worktree's Claude Code sessions have read, or a dash
+    /// when it has none and when the column is off.
+    tokens: []const u8,
     pr: []const u8,
     pr_state: ?github.State,
     issue: []const u8,
@@ -49,16 +58,19 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
 
     // One call for every branch's upstream, drift and tip date.
     const statuses: []const git.BranchStatus = repo.branchStatuses() catch &.{};
-    const now = nowSeconds(app.io);
+    const now = app_mod.nowSeconds(app.io);
 
     const remote: Remote = if (opts.local)
         .{}
     else
         try fetchRemote(app, repo, choices);
 
+    const spend = try tokenColumn(app, choices, opts);
+
     const rows = try app.gpa.alloc(Row, choices.len);
     for (choices, 0..) |choice, i| {
         rows[i] = try buildRow(app, repo, choice, statuses, remote, now);
+        rows[i].tokens = spend[i];
     }
 
     try render(app, rows, opts);
@@ -67,6 +79,30 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         if (remote.pr_note) |note| app.ui.hint("{s}", .{note});
         if (remote.issue_note) |note| app.ui.hint("{s}", .{note});
     }
+}
+
+/// The TOKENS cell for each worktree, in the order given. Reading transcripts is
+/// the one part of this dashboard that scales with how much Claude Code has been
+/// used rather than with the size of the repo, so `--no-tokens` turns it off.
+fn tokenColumn(app: app_mod.App, choices: []const app_mod.Choice, opts: Opts) ![]const []const u8 {
+    const cells = try app.gpa.alloc([]const u8, choices.len);
+    @memset(cells, "—");
+    if (!opts.tokens) return cells;
+
+    const cp_root = try cp.root(app.gpa, app.environ);
+    const projects = try cp.list(app.gpa, app.io, cp_root);
+
+    var scanner: usage.Scanner = .init(app.gpa, app.io);
+    defer scanner.deinit();
+
+    for (choices, 0..) |choice, i| {
+        const totals = try scanner.worktree(projects, choice.entry.path);
+        if (totals.empty()) continue;
+        cells[i] = try std.fmt.allocPrint(app.gpa, "{f}", .{
+            ui.count(totals.counts.contextTokens()),
+        });
+    }
+    return cells;
 }
 
 /// What the two network lookups produced, plus why a column is missing.
@@ -178,6 +214,8 @@ fn buildRow(
         .sync = sync,
         .remote_gone = remote_gone,
         .age = age,
+        // Filled in by the caller — the token scan is one pass for every row.
+        .tokens = "—",
         .pr = pr,
         .pr_state = pr_state,
         .issue = issue,
@@ -196,6 +234,7 @@ const Widths = struct {
     status: usize,
     sync: usize,
     age: usize,
+    tokens: usize,
     pr: usize,
     issue: usize,
 };
@@ -206,6 +245,7 @@ fn measure(rows: []const Row, opts: Opts) Widths {
         .status = "STATUS".len,
         .sync = "SYNC".len,
         .age = "AGE".len,
+        .tokens = if (opts.tokens) "TOKENS".len else 0,
         .pr = if (opts.local) 0 else "PR".len,
         .issue = if (opts.local) 0 else "LINEAR".len,
     };
@@ -214,6 +254,7 @@ fn measure(rows: []const Row, opts: Opts) Widths {
         w.status = @max(w.status, ui.displayWidth(row.status));
         w.sync = @max(w.sync, ui.displayWidth(row.sync));
         w.age = @max(w.age, ui.displayWidth(row.age));
+        if (opts.tokens) w.tokens = @max(w.tokens, ui.displayWidth(row.tokens));
         if (!opts.local) {
             w.pr = @max(w.pr, ui.displayWidth(row.pr));
             w.issue = @max(w.issue, ui.displayWidth(row.issue));
@@ -232,6 +273,11 @@ fn render(app: app_mod.App, rows: []const Row, opts: Opts) !void {
         ui.pad("SYNC", w.sync),
         ui.pad("AGE", w.age),
     }));
+    if (opts.tokens) {
+        try header.appendSlice(app.gpa, try std.fmt.allocPrint(app.gpa, "  {f}", .{
+            ui.pad("TOKENS", w.tokens),
+        }));
+    }
     if (!opts.local) {
         try header.appendSlice(app.gpa, try std.fmt.allocPrint(app.gpa, "  {f}  {f}", .{
             ui.pad("PR", w.pr),
@@ -249,6 +295,11 @@ fn render(app: app_mod.App, rows: []const Row, opts: Opts) !void {
             paintSync(row, try pad(app.gpa, row.sync, w.sync)),
             ui.dim(try pad(app.gpa, row.age, w.age)),
         }));
+        if (opts.tokens) {
+            try line.appendSlice(app.gpa, try std.fmt.allocPrint(app.gpa, "  {f}", .{
+                ui.pad(row.tokens, w.tokens),
+            }));
+        }
         if (!opts.local) {
             try line.appendSlice(app.gpa, try std.fmt.allocPrint(app.gpa, "  {f}  {f}", .{
                 paintPr(row, try pad(app.gpa, row.pr, w.pr)),
@@ -294,11 +345,6 @@ fn pad(gpa: std.mem.Allocator, text: []const u8, width: usize) ![]const u8 {
     return std.fmt.allocPrint(gpa, "{f}", .{ui.pad(text, width)});
 }
 
-fn nowSeconds(io: Io) i64 {
-    const ts = Io.Timestamp.now(io, .real);
-    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
-}
-
 test "measure sizes every column to its widest cell, header included" {
     const rows = [_]Row{
         .{
@@ -316,6 +362,7 @@ test "measure sizes every column to its widest cell, header included" {
             .sync = "↑2 ↓0",
             .remote_gone = false,
             .age = "2h",
+            .tokens = "62.2M",
             .pr = "#412 open",
             .pr_state = .open,
             .issue = "In Progress",
@@ -330,9 +377,15 @@ test "measure sizes every column to its widest cell, header included" {
     try std.testing.expectEqual(@as(usize, "AGE".len), full.age);
     try std.testing.expectEqual(@as(usize, "#412 open".len), full.pr);
     try std.testing.expectEqual(@as(usize, "In Progress".len), full.issue);
+    try std.testing.expectEqual(@as(usize, "TOKENS".len), full.tokens);
 
     // --local drops the two network columns entirely.
     const local = measure(&rows, .{ .local = true });
     try std.testing.expectEqual(@as(usize, 0), local.pr);
     try std.testing.expectEqual(@as(usize, 0), local.issue);
+
+    // --no-tokens drops its column, and nothing else moves.
+    const quiet = measure(&rows, .{ .tokens = false });
+    try std.testing.expectEqual(@as(usize, 0), quiet.tokens);
+    try std.testing.expectEqual(full.branch, quiet.branch);
 }
