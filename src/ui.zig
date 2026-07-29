@@ -262,6 +262,63 @@ pub fn age(seconds: i64) Age {
     return .{ .seconds = seconds };
 }
 
+/// A worked length of time, in two units at most — `0m`, `12m`, `9h40m`, `2d3h`.
+///
+/// Deliberately not `Age`, which rounds to one unit because "roughly how stale"
+/// is all a staleness column can honestly claim. This is a duration someone is
+/// meant to weigh against a working day, and there `9h` and `9h40m` are
+/// different answers.
+pub const Duration = struct {
+    seconds: i64,
+
+    pub fn format(self: Duration, w: *Io.Writer) Io.Writer.Error!void {
+        if (self.seconds <= 0) return w.writeAll("0m");
+        const s: u64 = @intCast(self.seconds);
+        const minute = 60;
+        const hour = 60 * minute;
+        const day = 24 * hour;
+
+        if (s < hour) return w.print("{d}m", .{s / minute});
+        if (s < day) {
+            const hours = s / hour;
+            const minutes = (s % hour) / minute;
+            if (minutes == 0) return w.print("{d}h", .{hours});
+            return w.print("{d}h{d}m", .{ hours, minutes });
+        }
+        const days = s / day;
+        const hours = (s % day) / hour;
+        if (hours == 0) return w.print("{d}d", .{days});
+        return w.print("{d}d{d}h", .{ days, hours });
+    }
+};
+
+pub fn duration(seconds: i64) Duration {
+    return .{ .seconds = seconds };
+}
+
+test "duration keeps the second unit that age rounds away" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { seconds: i64, want: []const u8 }{
+        .{ .seconds = -1, .want = "0m" },
+        .{ .seconds = 0, .want = "0m" },
+        // Under a minute is real time worked, but there is no unit below `m`
+        // worth a column — it rounds down rather than inventing one.
+        .{ .seconds = 59, .want = "0m" },
+        .{ .seconds = 12 * 60, .want = "12m" },
+        .{ .seconds = 3600, .want = "1h" },
+        .{ .seconds = 9 * 3600 + 40 * 60, .want = "9h40m" },
+        // Seconds never surface: the trailing 30 is dropped, not rounded up.
+        .{ .seconds = 9 * 3600 + 40 * 60 + 30, .want = "9h40m" },
+        .{ .seconds = 24 * 3600, .want = "1d" },
+        .{ .seconds = 2 * 24 * 3600 + 3 * 3600, .want = "2d3h" },
+    };
+    for (cases) |case| {
+        const got = try std.fmt.allocPrint(gpa, "{f}", .{duration(case.seconds)});
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(case.want, got);
+    }
+}
+
 test "age renders the coarsest unit that fits" {
     const gpa = std.testing.allocator;
     const cases = [_]struct { seconds: i64, want: []const u8 }{
