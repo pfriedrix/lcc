@@ -21,12 +21,17 @@
 const std = @import("std");
 const Io = std.Io;
 const cp = @import("claude_projects.zig");
+const uc = @import("usage_cache.zig");
 const ui = @import("ui.zig");
 
 /// Transcripts are read whole so a line spanning a read boundary cannot be
 /// half-parsed. Anything past this is reported through `skipped` rather than
 /// silently undercounted.
 const transcript_limit = 256 * 1024 * 1024;
+
+/// How far below a project directory transcripts are looked for. Claude Code
+/// puts subagents at `<session-id>/subagents/`, which is two.
+const max_depth = 4;
 
 /// What a set of messages spent. The unit of both the per-model buckets and the
 /// rollup over them.
@@ -143,12 +148,18 @@ pub const Scanner = struct {
     /// Transcripts that could not be read whole. Non-zero means the totals are
     /// low and the caller should say so.
     skipped: usize = 0,
+    /// What earlier runs already read. `uc.Cache.none` opts out.
+    cache: uc.Cache,
 
-    pub fn init(gpa: std.mem.Allocator, io: Io) Scanner {
-        return .{ .gpa = gpa, .io = io, .scratch = .init(gpa) };
+    pub fn init(gpa: std.mem.Allocator, io: Io, cache: uc.Cache) Scanner {
+        return .{ .gpa = gpa, .io = io, .scratch = .init(gpa), .cache = cache };
     }
 
+    /// Teardown writes the cache back, because every caller already defers this
+    /// and a cache that needs a second call remembered is a cache that quietly
+    /// stops working the first time someone adds a `return` above it.
     pub fn deinit(self: *Scanner) void {
+        self.cache.save();
         self.scratch.deinit();
         self.seen.deinit(self.gpa);
     }
@@ -158,18 +169,45 @@ pub const Scanner = struct {
     /// and a missing transcript should not fail the command that wanted it.
     pub fn project(self: *Scanner, dir_path: []const u8) !Totals {
         var totals: Totals = .{};
+        try self.scan(&totals, dir_path, 0);
+        return totals;
+    }
 
-        var dir = Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch
-            return totals;
+    /// Subagents do not write into the conversation that spawned them. Each gets
+    /// its own transcript under `<session-id>/subagents/`, so the top level of a
+    /// project directory holds only part of what the work cost — for a worktree
+    /// driven through a pipeline, usually well under half of it. The whole tree
+    /// is walked for `.jsonl`; everything else Claude Code keeps down there
+    /// (`tool-results/`, the per-subagent `.json` sidecars, `.md` notes) is not
+    /// a transcript and carries no usage.
+    ///
+    /// Only the top level counts towards `sessions`. A subagent is part of a
+    /// conversation, not one of its own, and counting it would inflate a column
+    /// that answers "how many times did I sit down with this worktree".
+    fn scan(self: *Scanner, totals: *Totals, dir_path: []const u8, depth: u8) !void {
+        // Claude Code nests two deep. The cap is for a tree that is not its own.
+        if (depth > max_depth) return;
+
+        var dir = Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch return;
         defer dir.close(self.io);
 
         var it = dir.iterate();
         while (it.next(self.io) catch null) |dirent| {
-            if (dirent.kind != .file or !std.mem.endsWith(u8, dirent.name, ".jsonl")) continue;
-            const path = try std.fs.path.join(self.gpa, &.{ dir_path, dirent.name });
-            try self.transcript(&totals, path);
+            switch (dirent.kind) {
+                .file => {
+                    if (!std.mem.endsWith(u8, dirent.name, ".jsonl")) continue;
+                    const path = try std.fs.path.join(self.gpa, &.{ dir_path, dirent.name });
+                    try self.transcript(totals, path, depth == 0);
+                },
+                // Symlinks report as `.sym_link` and are left alone, so the walk
+                // cannot be sent round a loop.
+                .directory => {
+                    const path = try std.fs.path.join(self.gpa, &.{ dir_path, dirent.name });
+                    try self.scan(totals, path, depth + 1);
+                },
+                else => {},
+            }
         }
-        return totals;
     }
 
     /// Usage across several project directories.
@@ -196,7 +234,44 @@ pub const Scanner = struct {
         return self.projectDirs(dirs);
     }
 
-    fn transcript(self: *Scanner, totals: *Totals, path: []const u8) !void {
+    /// One transcript, from the cache when the file on disk is still the one it
+    /// was built from, and from the transcript itself otherwise. Both routes end
+    /// at `apply`, so a cached run and a cold run cannot drift apart.
+    fn transcript(self: *Scanner, totals: *Totals, path: []const u8, session: bool) !void {
+        const info = Io.Dir.cwd().statFile(self.io, path, .{}) catch return;
+        const size = info.size;
+        // Nanoseconds are `i96` at the source; a value that does not fit is not
+        // a time this decade, and 0 simply means the entry never matches.
+        const mtime = std.math.cast(i64, info.mtime.nanoseconds) orelse 0;
+
+        const entry = self.cache.lookup(path, size, mtime) orelse blk: {
+            const parsed = self.parse(path) orelse return;
+            self.cache.put(path, .{
+                .size = size,
+                .mtime = mtime,
+                .skipped = parsed.skipped,
+                .messages = parsed.messages,
+            });
+            break :blk parsed;
+        };
+
+        if (entry.skipped) {
+            self.skipped += 1;
+            return;
+        }
+        if (session) totals.sessions += 1;
+        try self.apply(totals, entry.messages);
+    }
+
+    /// Reads a transcript down to the messages that carried usage. Null when the
+    /// file could not be read at all — which is not cached, because there is
+    /// nothing to say about it and the next run may find it readable.
+    ///
+    /// Messages are deduplicated against this transcript only. Doing it here
+    /// rather than against `seen` is what keeps the result a pure function of
+    /// the file: a cache entry must not depend on which transcripts happened to
+    /// be read before it, or reusing it would depend on repeating that order.
+    fn parse(self: *Scanner, path: []const u8) ?uc.Entry {
         _ = self.scratch.reset(.retain_capacity);
         const scratch = self.scratch.allocator();
 
@@ -206,77 +281,107 @@ pub const Scanner = struct {
             scratch,
             .limited(transcript_limit),
         ) catch |err| switch (err) {
-            error.StreamTooLong => {
-                self.skipped += 1;
-                return;
-            },
-            else => return,
+            error.StreamTooLong => return .{ .skipped = true },
+            else => return null,
         };
 
-        totals.sessions += 1;
+        var local: std.StringHashMapUnmanaged(void) = .empty;
+        var out: std.ArrayList(uc.Message) = .empty;
 
         var lines = std.mem.splitScalar(u8, bytes, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
             // A line that is not the shape we expect is a line we do not count.
             // Transcripts hold several record types and gain more over time.
-            const parsed = std.json.parseFromSliceLeaky(
+            const record = std.json.parseFromSliceLeaky(
                 Line,
                 scratch,
                 line,
                 .{ .ignore_unknown_fields = true },
             ) catch continue;
-            try self.count(totals, parsed);
+
+            const found = self.extract(record, &local, scratch) orelse continue;
+            // The messages outlive `scratch`, which is reset for the next file.
+            out.append(self.gpa, found) catch return null;
         }
+        return .{ .messages = out.toOwnedSlice(self.gpa) catch return null };
     }
 
-    fn count(self: *Scanner, totals: *Totals, line: Line) !void {
-        const kind = line.type orelse return;
-        if (!std.mem.eql(u8, kind, "assistant")) return;
-        const message = line.message orelse return;
-        const usage = message.usage orelse return;
+    /// The usage a transcript line reports, or null when it reports none or
+    /// repeats a message already taken from this transcript.
+    fn extract(
+        self: *Scanner,
+        line: Line,
+        local: *std.StringHashMapUnmanaged(void),
+        scratch: std.mem.Allocator,
+    ) ?uc.Message {
+        const kind = line.type orelse return null;
+        if (!std.mem.eql(u8, kind, "assistant")) return null;
+        const msg = line.message orelse return null;
+        const usage = msg.usage orelse return null;
 
-        if (message.id) |id| {
-            const slot = try self.seen.getOrPut(self.gpa, id);
-            if (slot.found_existing) return;
-            // The key has to outlive the scratch arena the line was parsed in.
-            slot.key_ptr.* = try self.gpa.dupe(u8, id);
+        if (msg.id) |id| {
+            const slot = local.getOrPut(scratch, id) catch return null;
+            if (slot.found_existing) return null;
         }
 
-        var counts: Counts = .{ .messages = 1 };
-        counts.input = usage.input_tokens orelse 0;
-        counts.output = usage.output_tokens orelse 0;
-        counts.cache_read = usage.cache_read_input_tokens orelse 0;
+        var out: uc.Message = .{
+            .id = self.gpa.dupe(u8, msg.id orelse "") catch return null,
+            .model = self.gpa.dupe(u8, msg.model orelse "") catch return null,
+            .input = usage.input_tokens orelse 0,
+            .output = usage.output_tokens orelse 0,
+            .cache_read = usage.cache_read_input_tokens orelse 0,
+            .timestamp = self.gpa.dupe(u8, line.timestamp orelse "") catch return null,
+        };
 
         // The 5m/1h split arrived after the flat total did. Without it, credit
         // the whole write to the 5-minute bucket — that was the only TTL when
         // transcripts recorded the total alone.
         if (usage.cache_creation) |split| {
-            counts.cache_write_5m = split.ephemeral_5m_input_tokens orelse 0;
-            counts.cache_write_1h = split.ephemeral_1h_input_tokens orelse 0;
+            out.cache_write_5m = split.ephemeral_5m_input_tokens orelse 0;
+            out.cache_write_1h = split.ephemeral_1h_input_tokens orelse 0;
         } else {
-            counts.cache_write_5m = usage.cache_creation_input_tokens orelse 0;
+            out.cache_write_5m = usage.cache_creation_input_tokens orelse 0;
         }
+        return out;
+    }
 
-        const model = message.model orelse "";
-        if (priceFor(model)) |price| {
-            counts.cost_usd = price.cost(counts);
-        } else if (counts.tokens() > 0) {
-            totals.unpriced = true;
-        }
+    /// Adds one transcript's messages to a running total, dropping the ones
+    /// already counted from somewhere else. This is where cost is worked out, so
+    /// the price table is read fresh on every run rather than cached into a
+    /// number nobody would think to invalidate.
+    fn apply(self: *Scanner, totals: *Totals, messages: []const uc.Message) !void {
+        for (messages) |msg| {
+            if (msg.id.len > 0) {
+                const slot = try self.seen.getOrPut(self.gpa, msg.id);
+                if (slot.found_existing) continue;
+                slot.key_ptr.* = msg.id;
+            }
 
-        totals.counts.add(counts);
+            var counts: Counts = .{
+                .messages = 1,
+                .input = msg.input,
+                .output = msg.output,
+                .cache_write_5m = msg.cache_write_5m,
+                .cache_write_1h = msg.cache_write_1h,
+                .cache_read = msg.cache_read,
+            };
+            if (priceFor(msg.model)) |price| {
+                counts.cost_usd = price.cost(counts);
+            } else if (counts.tokens() > 0) {
+                totals.unpriced = true;
+            }
 
-        // A model with nothing to its name would only clutter the breakdown;
-        // `<synthetic>` messages are the usual source.
-        if (counts.tokens() > 0) {
-            const bucket = try totals.bucket(self.gpa, try self.gpa.dupe(u8, model));
-            bucket.add(counts);
-        }
+            totals.counts.add(counts);
 
-        if (line.timestamp) |ts| {
-            if (std.mem.lessThan(u8, totals.last, ts)) {
-                totals.last = try self.gpa.dupe(u8, ts);
+            // A model with nothing to its name would only clutter the breakdown;
+            // `<synthetic>` messages are the usual source.
+            if (counts.tokens() > 0) {
+                (try totals.bucket(self.gpa, msg.model)).add(counts);
+            }
+
+            if (std.mem.lessThan(u8, totals.last, msg.timestamp)) {
+                totals.last = msg.timestamp;
             }
         }
     }
@@ -298,7 +403,7 @@ pub fn forWorktree(
     const root = cp.root(gpa, environ) catch return .{};
     const projects = cp.list(gpa, io, root) catch return .{};
 
-    var scanner: Scanner = .init(gpa, io);
+    var scanner: Scanner = .init(gpa, io, .open(gpa, io, environ));
     defer scanner.deinit();
     return scanner.worktree(projects, worktree_path) catch .{};
 }
@@ -505,7 +610,7 @@ test "counts assistant usage once per message id" {
         .data = second,
     });
 
-    var scanner: Scanner = .init(arena, io);
+    var scanner: Scanner = .init(arena, io, .none(arena, io));
     defer scanner.deinit();
     const totals = try scanner.project(dir_path);
 
@@ -548,7 +653,7 @@ test "a message quoting a usage block does not inflate the totals" {
         \\
     );
 
-    var scanner: Scanner = .init(arena, io);
+    var scanner: Scanner = .init(arena, io, .none(arena, io));
     defer scanner.deinit();
     const totals = try scanner.project(dir_path);
 
@@ -577,7 +682,7 @@ test "unpriced models keep their tokens and flag the cost" {
         \\
     );
 
-    var scanner: Scanner = .init(arena, io);
+    var scanner: Scanner = .init(arena, io, .none(arena, io));
     defer scanner.deinit();
     const totals = try scanner.project(dir_path);
 
@@ -608,12 +713,149 @@ test "usage from a sidechain subagent belongs to the worktree that spawned it" {
         \\
     );
 
-    var scanner: Scanner = .init(arena, io);
+    var scanner: Scanner = .init(arena, io, .none(arena, io));
     defer scanner.deinit();
     const totals = try scanner.project(dir_path);
 
     try std.testing.expectEqual(@as(u64, 2), totals.counts.messages);
     try std.testing.expectEqual(@as(u64, 50), totals.counts.output);
+}
+
+test "a subagent's own transcript counts, but not as another session" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cwd = Io.Dir.cwd();
+
+    // The layout Claude Code writes: the conversation at the top, each subagent
+    // in its own transcript below it, and non-transcript company alongside. A
+    // pipeline puts most of the work through subagents, so a scan that stops at
+    // the top level can miss more than it finds.
+    const dir_path = try std.fs.path.join(arena, &.{ base, "project" });
+    const subagents = try std.fs.path.join(arena, &.{ dir_path, "sess-1", "subagents" });
+    const tool_results = try std.fs.path.join(arena, &.{ dir_path, "sess-1", "tool-results" });
+    try cwd.createDirPath(io, subagents);
+    try cwd.createDirPath(io, tool_results);
+
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ dir_path, "sess-1.jsonl" }),
+        .data =
+        \\{"type":"assistant","timestamp":"2026-07-28T10:00:00.000Z","message":{"id":"msg_a","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":100}}}
+        \\
+        ,
+    });
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ subagents, "agent-1.jsonl" }),
+        .data =
+        \\{"type":"assistant","timestamp":"2026-07-28T11:00:00.000Z","message":{"id":"msg_b","model":"claude-opus-5","usage":{"input_tokens":5,"output_tokens":900}}}
+        \\
+        ,
+    });
+    // Neither of these is a transcript, and both sit where the walk goes.
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ subagents, "agent-1.json" }),
+        .data = "{\"usage\":{\"output_tokens\":999999}}\n",
+    });
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ tool_results, "out.txt" }),
+        .data = "output_tokens 999999\n",
+    });
+
+    var scanner: Scanner = .init(arena, io, .none(arena, io));
+    defer scanner.deinit();
+    const totals = try scanner.project(dir_path);
+
+    try std.testing.expectEqual(@as(u64, 2), totals.counts.messages);
+    try std.testing.expectEqual(@as(u64, 1000), totals.counts.output);
+    // One conversation, whatever it delegated. The subagent is part of it.
+    try std.testing.expectEqual(@as(u64, 1), totals.sessions);
+    // The subagent's message is the newest, so it sets `last`.
+    try std.testing.expectEqualStrings("2026-07-28T11:00:00.000Z", totals.last);
+}
+
+test "a cached run agrees with a cold one, and notices an appended transcript" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cwd = Io.Dir.cwd();
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("LCC_USAGE_CACHE", try std.fs.path.join(arena, &.{ base, "usage.json" }));
+
+    // Two transcripts sharing a message, so the cross-file deduplication has
+    // something to do: it is the part a per-file cache could most easily lose.
+    const dir_path = try std.fs.path.join(arena, &.{ base, "project" });
+    try cwd.createDirPath(io, dir_path);
+    const first = try std.fs.path.join(arena, &.{ dir_path, "a.jsonl" });
+    try cwd.writeFile(io, .{
+        .sub_path = first,
+        .data =
+        \\{"type":"assistant","timestamp":"2026-07-28T10:00:00.000Z","message":{"id":"msg_a","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":100,"cache_read_input_tokens":900}}}
+        \\
+        ,
+    });
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ dir_path, "b.jsonl" }),
+        .data =
+        \\{"type":"assistant","timestamp":"2026-07-28T10:00:00.000Z","message":{"id":"msg_a","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":100,"cache_read_input_tokens":900}}}
+        \\{"type":"assistant","timestamp":"2026-07-28T11:00:00.000Z","message":{"id":"msg_b","model":"claude-haiku-4-5","usage":{"input_tokens":5,"output_tokens":20}}}
+        \\
+        ,
+    });
+
+    var cold: Scanner = .init(arena, io, .open(arena, io, &environ));
+    const from_disk = try cold.project(dir_path);
+    try std.testing.expect(cold.cache.dirty);
+    cold.deinit();
+
+    var warm: Scanner = .init(arena, io, .open(arena, io, &environ));
+    const from_cache = try warm.project(dir_path);
+    // Nothing was learned, which is only true if every transcript was a hit.
+    try std.testing.expect(!warm.cache.dirty);
+    warm.deinit();
+
+    try std.testing.expectEqual(from_disk.counts.messages, from_cache.counts.messages);
+    try std.testing.expectEqual(from_disk.counts.tokens(), from_cache.counts.tokens());
+    try std.testing.expectEqual(from_disk.counts.cost_usd, from_cache.counts.cost_usd);
+    try std.testing.expectEqual(from_disk.sessions, from_cache.sessions);
+    try std.testing.expectEqualStrings(from_disk.last, from_cache.last);
+    try std.testing.expectEqual(from_disk.models.items.len, from_cache.models.items.len);
+    // The shared message was counted once by both routes, not once per file.
+    try std.testing.expectEqual(@as(u64, 2), from_cache.counts.messages);
+    try std.testing.expectEqual(@as(u64, 120), from_cache.counts.output);
+
+    // What a live session does between two runs.
+    try cwd.writeFile(io, .{
+        .sub_path = first,
+        .data =
+        \\{"type":"assistant","timestamp":"2026-07-28T10:00:00.000Z","message":{"id":"msg_a","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":100,"cache_read_input_tokens":900}}}
+        \\{"type":"assistant","timestamp":"2026-07-28T12:00:00.000Z","message":{"id":"msg_c","model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":7}}}
+        \\
+        ,
+    });
+
+    var again: Scanner = .init(arena, io, .open(arena, io, &environ));
+    const grown = try again.project(dir_path);
+    try std.testing.expect(again.cache.dirty);
+    again.deinit();
+
+    try std.testing.expectEqual(@as(u64, 3), grown.counts.messages);
+    try std.testing.expectEqual(@as(u64, 127), grown.counts.output);
+    try std.testing.expectEqualStrings("2026-07-28T12:00:00.000Z", grown.last);
 }
 
 test "add merges per-model buckets across project directories" {

@@ -292,6 +292,7 @@ test {
     _ = @import("repos.zig");
     _ = @import("ui.zig");
     _ = @import("usage.zig");
+    _ = @import("usage_cache.zig");
     _ = @import("xcode.zig");
     _ = @import("commands/list.zig");
     _ = @import("commands/remove.zig");

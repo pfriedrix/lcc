@@ -158,14 +158,27 @@ fn scanSessions(gpa: std.mem.Allocator, io: Io, dir_path: []const u8) !Scan {
         if (found != null) continue;
 
         const file_path = try std.fs.path.join(gpa, &.{ dir_path, dirent.name });
-        const prefix = Io.Dir.cwd().readFileAlloc(io, file_path, gpa, .limited(prefix_limit)) catch |err| switch (err) {
-            // A transcript longer than the limit still gives us its prefix.
-            error.StreamTooLong => continue,
-            else => continue,
-        };
+        const prefix = readPrefix(gpa, io, file_path) orelse continue;
         found = try extractCwd(gpa, prefix);
     }
     return .{ .cwd = found, .count = count };
+}
+
+/// The first `prefix_limit` bytes of a file, or fewer if that is all there is.
+/// Null when the file cannot be opened or read at all.
+///
+/// `readFileAlloc` cannot do this: its limit is a ceiling on the whole file, so
+/// a transcript past it comes back as `error.StreamTooLong` with no bytes —
+/// which is exactly the case this needs to serve, since a worked-in worktree
+/// has nothing but multi-megabyte transcripts.
+fn readPrefix(gpa: std.mem.Allocator, io: Io, file_path: []const u8) ?[]const u8 {
+    var file = Io.Dir.cwd().openFile(io, file_path, .{}) catch return null;
+    defer file.close(io);
+
+    const buf = gpa.alloc(u8, prefix_limit) catch return null;
+    var reader = file.reader(io, &.{});
+    const n = reader.interface.readSliceShort(buf) catch return null;
+    return buf[0..n];
 }
 
 /// Pulls the first `"cwd":"…"` value out of a transcript prefix, undoing JSON
@@ -324,6 +337,115 @@ test "extractCwd undoes escaping and refuses a truncated value" {
     try std.testing.expect((try extractCwd(gpa, "{\"cwd\":\"/Users/me/Proj")) == null);
     try std.testing.expect((try extractCwd(gpa, "{\"type\":\"mode\"}")) == null);
     try std.testing.expect((try extractCwd(gpa, "{\"cwd\":\"\"}")) == null);
+}
+
+/// A transcript that names `cwd` on its first line and then runs well past
+/// `prefix_limit` — the shape every worked-in worktree leaves behind, and the
+/// one a whole-file read under a ceiling cannot see at all.
+fn oversizedTranscript(arena: std.mem.Allocator, cwd_path: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, try std.fmt.allocPrint(
+        arena,
+        "{{\"type\":\"user\",\"cwd\":\"{s}\"}}\n",
+        .{cwd_path},
+    ));
+    while (out.items.len <= prefix_limit * 2) {
+        try out.appendSlice(arena, "{\"type\":\"assistant\",\"pad\":\"" ++ ("x" ** 512) ++ "\"}\n");
+    }
+    return out.items;
+}
+
+test "a transcript larger than the prefix limit still yields its cwd" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const projects = try std.fs.path.join(arena, &.{ base, "projects" });
+    const cwd = Io.Dir.cwd();
+
+    const worktree = try std.fs.path.join(arena, &.{ base, "App.worktrees", "pe-1" });
+    try cwd.createDirPath(io, worktree);
+
+    // What a worked-in worktree actually holds: one transcript, megabytes long,
+    // naming its cwd on the first line. Reading it whole under a small ceiling
+    // yields nothing at all, so the directory would vanish from the listing and
+    // the worktree would report no usage.
+    const project_dir = try std.fs.path.join(arena, &.{ projects, try dirName(arena, worktree) });
+    try cwd.createDirPath(io, project_dir);
+
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ project_dir, "a.jsonl" }),
+        .data = try oversizedTranscript(arena, worktree),
+    });
+
+    const entries = try list(arena, io, projects);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings(worktree, entries[0].cwd);
+
+    const mine = try forWorktree(arena, io, entries, worktree);
+    try std.testing.expectEqual(@as(usize, 1), mine.len);
+}
+
+test "clean reclaims an orphan whose transcripts are all oversized" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const projects = try std.fs.path.join(arena, &.{ base, "projects" });
+    const cwd = Io.Dir.cwd();
+
+    // `lcc clean` walks list → orphans → remove, and every step is downstream of
+    // reading the cwd. A worktree deleted after real work on it leaves exactly
+    // the transcripts that read is worst at: big ones, and no small one beside
+    // them. Miss it and the megabytes stay on disk forever, unreclaimable —
+    // which is the failure mode that hurts, since the whole point of the command
+    // is the space.
+    const gone = try std.fs.path.join(arena, &.{ base, "App.worktrees", "pe-removed" });
+    const project_dir = try std.fs.path.join(arena, &.{ projects, try dirName(arena, gone) });
+    try cwd.createDirPath(io, project_dir);
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ project_dir, "a.jsonl" }),
+        .data = try oversizedTranscript(arena, gone),
+    });
+
+    // A live worktree alongside it, to pin that `orphans` still tells them apart.
+    const alive = try std.fs.path.join(arena, &.{ base, "App.worktrees", "pe-1" });
+    try cwd.createDirPath(io, alive);
+    const alive_dir = try std.fs.path.join(arena, &.{ projects, try dirName(arena, alive) });
+    try cwd.createDirPath(io, alive_dir);
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ alive_dir, "b.jsonl" }),
+        .data = try oversizedTranscript(arena, alive),
+    });
+
+    const entries = try list(arena, io, projects);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+
+    const dead = try orphans(arena, io, entries);
+    try std.testing.expectEqual(@as(usize, 1), dead.len);
+    try std.testing.expectEqualStrings(gone, dead[0].cwd);
+
+    try remove(arena, io, dead[0], projects);
+    try std.testing.expectError(
+        error.FileNotFound,
+        cwd.access(io, project_dir, .{}),
+    );
+    // The live worktree's transcripts were never in danger.
+    try cwd.access(io, alive_dir, .{});
 }
 
 test "hasSessionsFor answers for the launch directory only" {

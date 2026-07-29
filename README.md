@@ -236,18 +236,22 @@ $ lcc open
 
 ```
 $ lcc stats --models
-WORKTREE                         SESS  MSGS  CONTEXT  OUTPUT  ~USD   LAST
-feature/pe-47-backfill-receipts  2     6     3.6M     18k     2.54   36m
+WORKTREE                         SESS  MSGS  CONTEXT  OUTPUT  ~USD    LAST  ORIGIN
+feature/pe-47-backfill-receipts  2     6     3.6M     18k     2.54    36m
   opus-5                               5     3.6M     17k     2.54
   haiku-4-5                            1     50       900     0.00
-main                             17    1198  257M     1.0M    180.14 now   main
-feature/pe-51-liquid-glass       —     —     —        —       —      —
+main                             17    1198  257M     1.0M    180.14  now   main
+feature/pe-51-liquid-glass       —     —     —        —       —       —     lcc
 TOTAL                            19    1204  261M     1.0M    182.68
 ```
+
+`ORIGIN` says where a worktree came from — `main` for the checkout itself, `lcc` for one lcc created under the configured prefix, blank for one made by hand somewhere else. The column is only drawn when there is something to put in it.
 
 `--json` prints the same numbers with the cache split intact, for anything that wants to keep its own history.
 
 **`CONTEXT` is the number that matters.** It counts fresh input plus cache writes and cache reads, and on a long session the cache reads dominate everything else by two orders of magnitude — the 3.6M above is 3.6M of re-read conversation against 103 tokens of genuinely new input. Output is shown separately because it is priced five times higher per token.
+
+**Subagents are counted.** They do not write into the conversation that spawned them — each gets its own transcript under `<session-id>/subagents/` — so the top level of a project directory holds only part of what a task cost. On a worktree driven through a pipeline that is usually the smaller part: 51M context in the parent against 95M across its subagents is a normal split. The whole directory tree is walked for `.jsonl`, and everything else Claude Code keeps down there (`tool-results/`, the per-subagent `.json` sidecars) carries no usage and is skipped. `SESS` still counts conversations, not subagents — a subagent is part of the sitting, not another one.
 
 Two things keep the counts honest. Messages are counted once by `message.id`, because a resumed session copies history forward and compaction rewrites it, so the same API response appears in several lines and often several transcripts. And each line is parsed as JSON rather than scanned for `"output_tokens"` — a message whose own text quotes a usage block would otherwise inflate its own session, which is exactly what a transcript of a session about token counts does.
 
@@ -255,7 +259,20 @@ Two things keep the counts honest. Messages are counted once by `message.id`, be
 
 The attribution is per worktree, which means per task only as long as the task has its own worktree. Work done in the main checkout lands in one bucket no matter which branch was checked out at the time, because Claude Code keys the directory on the cwd and not on git state.
 
-Reading every transcript is a full scan, not an index: about 70ms for 25MB of them. `lcc list --no-tokens` skips it.
+### Why it is not slow
+
+Counting means parsing every line of every transcript, and the pile only grows — Claude Code appends and never prunes. A repo worked in daily reaches hundreds of MB, and re-reading all of it to redraw a table costs about 0.6s.
+
+Almost none of it changed since the last run, so almost none of it is read again. Each transcript is reduced to the assistant messages that carried usage — two orders of magnitude smaller — and that is kept in `~/.cache/lcc/usage.json`, reused whenever the file's size and mtime both still match. Append-only means either one moving is enough to notice. In practice one session is live and everything else is frozen:
+
+```
+cold (cache deleted)   0.64s
+warm                   0.05s      1.7MB of cache for 1.3B tokens across 45 project directories
+```
+
+Nothing derived is stored. Cost is recomputed from the token counts on every read, so correcting `prices` takes effect at once instead of being frozen into a file nobody would think to delete. Deduplication is not stored either: a cache entry is deduplicated against its own transcript only, which keeps it a pure function of that file, and the cross-file pass stays with the scanner — the only thing that knows which transcripts a given question spans. A cached run and a cold run produce identical output, which is what the tests assert.
+
+The cache lives under `~/.cache`, not `~/.config/lcc` like the rest of lcc's state, because it is regenerable and large enough to matter — config directories end up in dotfile repos. `LCC_USAGE_CACHE` overrides the location; deleting the file costs one slow run. `lcc list --no-tokens` skips the whole thing.
 
 ## `lcc clean`
 
@@ -360,6 +377,7 @@ src/disk.zig             path containment and batched `du`
 src/derived_data.zig     DerivedData discovery and reclamation
 src/claude_projects.zig  ~/.claude/projects discovery and reclamation
 src/usage.zig            token usage out of the transcripts, per worktree and model
+src/usage_cache.zig      transcripts distilled, so a second run does not read them
 ```
 
 `src/keychain.zig` deliberately `@cImport`s five narrow CoreFoundation/Security headers rather than the umbrella ones: on the macOS 26.5 SDK, `CoreFoundation/CoreFoundation.h` drags in mach headers whose bitfield structs translate-c turns opaque (tripping their own `_Static_assert`s), and `Security/Security.h` drags in `xpc.h`, which puts nullability attributes on the non-pointer `uuid_t`.

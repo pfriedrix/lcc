@@ -92,7 +92,7 @@ fn tokenColumn(app: app_mod.App, choices: []const app_mod.Choice, opts: Opts) ![
     const cp_root = try cp.root(app.gpa, app.environ);
     const projects = try cp.list(app.gpa, app.io, cp_root);
 
-    var scanner: usage.Scanner = .init(app.gpa, app.io);
+    var scanner: usage.Scanner = .init(app.gpa, app.io, .open(app.gpa, app.io, app.environ));
     defer scanner.deinit();
 
     for (choices, 0..) |choice, i| {
