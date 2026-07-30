@@ -73,9 +73,10 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
 
     const now = app_mod.nowSeconds(app.io);
 
-    // Only branches that name an issue are worth asking Linear about, and the
-    // identifiers they resolve to are also what says whether a cached answer
-    // covered this set of worktrees.
+    // Both remote columns are asked per branch, so both need the list of them —
+    // and that list is also what says whether a cached answer covered this set of
+    // worktrees. Only the branches that name an issue go to Linear.
+    const branches = try branchNames(app, choices);
     const refs = try issueRefs(app, choices);
     const asked = try identifiers(app, refs);
 
@@ -90,7 +91,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     var prs: PrColumn = .{};
     var issues: IssueColumn = .{};
     if (!opts.local and !opts.refresh) {
-        if (cache.prs(repo.root, now)) |hit| {
+        if (cache.prs(repo.root, branches, now)) |hit| {
             prs = .{ .list = hit.list, .cached_age = hit.age_seconds };
         }
         if (asked.len > 0) {
@@ -117,7 +118,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         }
         if (opts.tokens) group.async(app.io, tokenTask, .{ app, choices, spend });
         if (!opts.local) {
-            if (prs.cached_age == null) group.async(app.io, prTask, .{ app, repo, &prs });
+            if (prs.cached_age == null) group.async(app.io, prTask, .{ app, repo, branches, &prs });
             if (issues.cached_age == null and refs.len > 0) {
                 group.async(app.io, issueTask, .{ app, refs, &issues });
             }
@@ -125,7 +126,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         try group.await(app.io);
     }
 
-    if (prs.fetched) cache.putPrs(repo.root, now, prs.list);
+    if (prs.fetched) cache.putPrs(repo.root, branches, now, prs.list);
     if (issues.fetched) cache.putIssues(repo.root, asked, now, issues.list);
     cache.save(now);
 
@@ -142,6 +143,19 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         if (issues.note) |note| app.ui.hint("{s}", .{note});
         if (try cacheNote(app.gpa, prs, issues)) |note| app.ui.hint("{s}", .{note});
     }
+}
+
+/// The branch of every worktree on screen. A detached one contributes nothing:
+/// there is no head ref to match a pull request against.
+fn branchNames(app: app_mod.App, choices: []const app_mod.Choice) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (choices) |choice| {
+        const branch = choice.entry.branch orelse continue;
+        for (out.items) |seen| {
+            if (std.mem.eql(u8, seen, branch)) break;
+        } else try out.append(app.gpa, branch);
+    }
+    return out.toOwnedSlice(app.gpa);
 }
 
 /// The issues the worktrees on screen belong to, in the order the branches give
@@ -225,8 +239,8 @@ fn tokenTask(app: app_mod.App, choices: []const app_mod.Choice, cells: [][]const
     }
 }
 
-fn prTask(app: app_mod.App, repo: git.Repo, out: *PrColumn) void {
-    if (github.list(app.gpa, app.io, repo.root)) |list| {
+fn prTask(app: app_mod.App, repo: git.Repo, branches: []const []const u8, out: *PrColumn) void {
+    if (github.forBranches(app.gpa, app.io, repo.root, branches)) |list| {
         out.list = list;
         out.fetched = true;
     } else {

@@ -28,7 +28,7 @@ const linear = @import("linear.zig");
 
 /// Bumped when the stored shape changes. An older file is dropped rather than
 /// migrated: rebuilding costs one slow run.
-const version: u32 = 1;
+const version: u32 = 2;
 
 /// A ceiling, so a corrupt or hostile file cannot be read into memory unbounded.
 const file_limit = 8 * 1024 * 1024;
@@ -58,6 +58,11 @@ const Stored = struct {
     /// Main worktree path — what makes two repos two entries.
     root: []const u8 = "",
     prs_at: i64 = 0,
+    /// The branches the stored pull requests were *asked* about. The lookup is
+    /// per-branch, so — exactly as with `issues_asked` — a branch with no row
+    /// means GitHub was asked and had nothing, and a worktree the stored answer
+    /// never covered has to miss rather than read a dash out of it.
+    prs_asked: []const []const u8 = &.{},
     prs: []const StoredPr = &.{},
     issues_at: i64 = 0,
     /// The issue identifiers the stored statuses were *asked* about, which is not
@@ -142,12 +147,16 @@ pub const Cache = struct {
         return &self.repos.items[self.repos.items.len - 1];
     }
 
-    /// The pull requests from an answer still inside the TTL.
-    pub fn prs(self: *Cache, root: []const u8, now: i64) ?PrHit {
+    /// The pull requests from an answer still inside the TTL, provided that
+    /// answer covered every branch being asked about now.
+    pub fn prs(self: *Cache, root: []const u8, asked: []const []const u8, now: i64) ?PrHit {
         if (self.path == null) return null;
         const found = self.find(root) orelse return null;
         if (!fresh(found.prs_at, now)) return null;
         const age = now - found.prs_at;
+        for (asked) |want| {
+            if (!contains(found.prs_asked, want)) return null;
+        }
 
         const list = self.gpa.alloc(github.PullRequest, found.prs.len) catch return null;
         for (found.prs, 0..) |stored, i| {
@@ -161,9 +170,20 @@ pub const Cache = struct {
         return .{ .list = list, .age_seconds = age };
     }
 
-    pub fn putPrs(self: *Cache, root: []const u8, now: i64, list: []const github.PullRequest) void {
+    pub fn putPrs(
+        self: *Cache,
+        root: []const u8,
+        asked: []const []const u8,
+        now: i64,
+        list: []const github.PullRequest,
+    ) void {
         if (self.path == null) return;
         const target = self.entry(root) orelse return;
+
+        const kept_asked = self.gpa.alloc([]const u8, asked.len) catch return;
+        for (asked, 0..) |branch, i| {
+            kept_asked[i] = self.gpa.dupe(u8, branch) catch return;
+        }
 
         const stored = self.gpa.alloc(StoredPr, list.len) catch return;
         for (list, 0..) |pr, i| {
@@ -174,6 +194,7 @@ pub const Cache = struct {
                 .draft = pr.draft,
             };
         }
+        target.prs_asked = kept_asked;
         target.prs = stored;
         target.prs_at = now;
         self.dirty = true;
@@ -331,17 +352,19 @@ test "a PR list round-trips through the file and expires with the TTL" {
     // to be a directory that exists.
     const root = base;
 
+    const asked = [_][]const u8{ "feature/x", "feature/y" };
+
     {
         var cache = testCache(arena, &environ);
-        try std.testing.expect(cache.prs(root, 1_000) == null);
-        cache.putPrs(root, 1_000, &.{
+        try std.testing.expect(cache.prs(root, &asked, 1_000) == null);
+        cache.putPrs(root, &asked, 1_000, &.{
             .{ .number = 412, .branch = "feature/x", .state = .merged, .draft = false },
         });
         cache.save(1_000);
     }
 
     var reopened = testCache(arena, &environ);
-    const hit = reopened.prs(root, 1_060).?;
+    const hit = reopened.prs(root, &asked, 1_060).?;
     try std.testing.expectEqual(@as(usize, 1), hit.list.len);
     try std.testing.expectEqual(@as(u32, 412), hit.list[0].number);
     // The state survives as a state, not as whatever integer the enum happened to use.
@@ -349,11 +372,20 @@ test "a PR list round-trips through the file and expires with the TTL" {
     try std.testing.expectEqualStrings("feature/x", hit.list[0].branch);
     try std.testing.expectEqual(@as(i64, 60), hit.age_seconds);
 
+    // feature/y was asked about and had no pull request. That is an answer, so a
+    // run that only wants feature/y still hits rather than paying a round trip to
+    // be told the same nothing.
+    try std.testing.expect(reopened.prs(root, &.{"feature/y"}, 1_060) != null);
+    try std.testing.expectEqual(@as(usize, 1), reopened.prs(root, &.{"feature/y"}, 1_060).?.list.len);
+
+    // A worktree cut since the answer was stored was never covered by it.
+    try std.testing.expect(reopened.prs(root, &.{ "feature/x", "feature/new" }, 1_060) == null);
+
     // Past the TTL, and for a repo nobody stored.
-    try std.testing.expect(reopened.prs(root, 1_000 + ttl_seconds + 1) == null);
-    try std.testing.expect(reopened.prs("/other", 1_060) == null);
+    try std.testing.expect(reopened.prs(root, &asked, 1_000 + ttl_seconds + 1) == null);
+    try std.testing.expect(reopened.prs("/other", &asked, 1_060) == null);
     // A clock that jumped backwards must not read as an infinitely fresh entry.
-    try std.testing.expect(reopened.prs(root, 900) == null);
+    try std.testing.expect(reopened.prs(root, &asked, 900) == null);
 }
 
 test "saving drops entries that can never hit again, and keeps the live one" {
@@ -376,11 +408,11 @@ test "saving drops entries that can never hit again, and keeps the live one" {
 
     {
         var cache = testCache(arena, &environ);
-        cache.putPrs(live, 1_000, &.{});
+        cache.putPrs(live, &.{"b"}, 1_000, &.{});
         // Expired: nothing left inside the TTL by the time the file is written.
-        cache.putPrs(base, 1_000 - ttl_seconds - 1, &.{});
+        cache.putPrs(base, &.{"b"}, 1_000 - ttl_seconds - 1, &.{});
         // Fresh, but its repo is gone from disk.
-        cache.putPrs(deleted, 1_000, &.{});
+        cache.putPrs(deleted, &.{"b"}, 1_000, &.{});
         cache.save(1_000);
     }
 
@@ -406,7 +438,7 @@ test "issue statuses are reused only for an answer that covered what is being as
     var cache = testCache(arena, &environ);
     // PE-9 was asked about and came back with nothing — a real answer, and one
     // that must not be mistaken for never having been asked.
-    cache.putPrs("/repo", 500, &.{});
+    cache.putPrs("/repo", &.{"b"}, 500, &.{});
     cache.putIssues("/repo", &.{ "PE-7", "PE-9" }, 500, &.{
         .{ .identifier = "PE-7", .state_name = "In Progress", .state_type = "started" },
     });
@@ -424,7 +456,7 @@ test "issue statuses are reused only for an answer that covered what is being as
     try std.testing.expect(cache.issues("/repo", &.{ "PE-7", "PE-11" }, 500) == null);
 
     // The two halves expire independently: PRs are repo-wide, issues are not.
-    try std.testing.expect(cache.prs("/repo", 500) != null);
+    try std.testing.expect(cache.prs("/repo", &.{"b"}, 500) != null);
     try std.testing.expect(cache.issues("/repo", &.{"PE-7"}, 500 + ttl_seconds + 1) == null);
 }
 
@@ -436,12 +468,12 @@ test "a cache with nowhere to live keeps working and remembers nothing" {
     const arena = arena_state.allocator();
 
     var cache: Cache = .none(arena, std.testing.io);
-    cache.putPrs("/repo", 100, &.{
+    cache.putPrs("/repo", &.{"b"}, 100, &.{
         .{ .number = 1, .branch = "b", .state = .open, .draft = false },
     });
     cache.putIssues("/repo", &.{"PE-1"}, 100, &.{});
 
-    try std.testing.expect(cache.prs("/repo", 100) == null);
+    try std.testing.expect(cache.prs("/repo", &.{"b"}, 100) == null);
     try std.testing.expect(cache.issues("/repo", &.{"PE-1"}, 100) == null);
     try std.testing.expect(!cache.dirty);
     cache.save(100); // Writes nothing, and must not fail doing it.
@@ -465,12 +497,12 @@ test "an unreadable or wrong-version file reads as an empty cache" {
     const cwd = Io.Dir.cwd();
     try cwd.writeFile(std.testing.io, .{ .sub_path = file_path, .data = "not json at all" });
     var corrupt = testCache(arena, &environ);
-    try std.testing.expect(corrupt.prs("/repo", 0) == null);
+    try std.testing.expect(corrupt.prs("/repo", &.{}, 0) == null);
 
     try cwd.writeFile(std.testing.io, .{
         .sub_path = file_path,
         .data = "{\"version\":99,\"repos\":[{\"root\":\"/repo\",\"prs_at\":10,\"prs\":[]}]}",
     });
     var future = testCache(arena, &environ);
-    try std.testing.expect(future.prs("/repo", 10) == null);
+    try std.testing.expect(future.prs("/repo", &.{}, 10) == null);
 }
