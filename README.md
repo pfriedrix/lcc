@@ -206,7 +206,7 @@ $ lcc remove --merged
 
 The reason column says which of the three vouched for the row, so a branch deleted on GitHub's word names the pull request that gave it.
 
-A branch checked out anywhere — including the main worktree — is never offered, and a worktree with uncommitted changes is reported and skipped rather than forced. A merged pull request whose branch has since been reopened is not a merge: an open PR shadows the old one, and the branch is left alone. `-y` takes everything without asking; `--force`, `--keep-branch` and `--keep-derived-data` mean the same as they do for a single removal.
+A branch checked out anywhere — including the main worktree — is never offered, and a worktree with uncommitted changes is reported and skipped rather than forced. A merged pull request whose branch has since been reopened is not a merge: an open PR shadows the old one, and the branch is left alone. A row Xcode still has open is marked `— open in Xcode`, and one with unsaved work in it `— unsaved in Xcode`; ticking that one holds it back rather than removing it. `-y` takes everything without asking; `--force`, `--keep-branch`, `--keep-derived-data` and `--keep-xcode` mean the same as they do for a single removal.
 
 ## Xcode build data
 
@@ -215,6 +215,26 @@ A worktree that gets built in Xcode leaves a DerivedData folder behind, and remo
 Folders without an `info.plist` — Xcode's own shared caches — are never touched, and deletion refuses any path that is not a direct child of the DerivedData root.
 
 Set `LCC_DERIVED_DATA` to override the location; otherwise `lcc` honours Xcode's own `IDECustomDerivedDataLocation` when it is absolute.
+
+## The Xcode window standing on the worktree
+
+A worktree open in Xcode does not stop `git worktree remove`, so the directory goes and the window stays — sitting on a path that no longer exists. `lcc remove` asks Xcode to close it first, and says so before it does:
+
+```
+Remove worktree feature/pe-101-shipped?
+    worktree   /Users/me/Projects/App/.lcc/worktrees/pe-101-shipped
+    xcode      App.xcworkspace  (open — will be closed)
+    build data App-fmqzbihqxvpk…  (2.4 GB)
+    branch     feature/pe-101-shipped  (merged — will be deleted)
+```
+
+*Which* Xcode gets asked matters more than it sounds. A beta installed beside the release build carries the same bundle id, so `application id "com.apple.dt.Xcode"` picks one of the two and the choice is not yours to make — on a machine running both, the wrong pick is the one holding the worktree. `lcc` finds the running Xcodes through `ps`, addresses each by its bundle path, and asks them one at a time.
+
+Matching goes by Xcode's own answer rather than a path `lcc` assembled: Xcode says `/tmp/…` where git says `/private/tmp/…`, so both sides are resolved before the containment test, while the string handed to `close` is the one Xcode gave. A Swift package opened by its folder is reported as that folder, which *is* the worktree root rather than something inside it — that counts too.
+
+**Unsaved changes stop the removal.** Xcode's scripting interface has no `save` — its documents answer `close` and nothing else — so `lcc` cannot put editor work on disk, and deleting the worktree would take it along. It lists what is unsaved and removes nothing; save it in Xcode, or pass `--force` and lose it knowingly. That is also why the close is `saving no`: a CLI must not be able to raise a save dialog nobody is looking at.
+
+Everything here is best-effort in one direction only. Nothing running, automation not permitted (System Settings → Privacy & Security → Automation), an Xcode too busy to answer inside the timeout — none of those stops a removal, and the last two say so rather than passing for "nothing was open". `--keep-xcode` skips the lot: Xcode is never even asked.
 
 ## Claude Code session transcripts
 
