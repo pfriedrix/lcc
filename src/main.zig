@@ -40,6 +40,7 @@ const usage =
     \\  list | ls                Dashboard of the worktrees in the current repo
     \\    --local                skip the PR and Linear columns (no network)
     \\    --no-tokens            skip the TOKENS column (skips reading transcripts)
+    \\    --refresh              re-ask GitHub and Linear instead of reusing a recent answer
     \\  stats                    What each worktree has spent on Claude Code
     \\    --models               break every worktree down by model
     \\    --json                 print the numbers instead of a table
@@ -211,6 +212,8 @@ fn listCommand(app: app_mod.App, args: []const []const u8) !void {
             opts.local = true;
         } else if (eq(arg, "--no-tokens")) {
             opts.tokens = false;
+        } else if (eq(arg, "--refresh")) {
+            opts.refresh = true;
         } else return error.UnknownOption;
     }
     return list_cmd.run(app, opts);
@@ -289,6 +292,7 @@ test {
     _ = @import("mcp.zig");
     _ = @import("oauth.zig");
     _ = @import("prompt.zig");
+    _ = @import("remote_cache.zig");
     _ = @import("repos.zig");
     _ = @import("ui.zig");
     _ = @import("usage.zig");

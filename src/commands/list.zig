@@ -5,6 +5,16 @@
 //! The PR and Linear columns are one batched request each, and both degrade to a
 //! dash when they cannot be answered — an unauthenticated shell still gets the
 //! rest of the table.
+//!
+//! None of that work depends on any of the rest of it, so none of it waits: the
+//! two hosts, the `git status` calls and the transcript scan all go out at once
+//! and the table is assembled from whatever comes back. Done in sequence the
+//! network alone was most of the command's runtime, and the slower of the two
+//! round trips is now the whole of it.
+//!
+//! What that still cannot fix is that a round trip is half a second no matter
+//! how little is being asked. So the two answers are cached for a few minutes —
+//! see `remote_cache` — and `--refresh` is how you say you want them asked again.
 
 const std = @import("std");
 const Io = std.Io;
@@ -16,6 +26,7 @@ const git = @import("../git.zig");
 const github = @import("../github.zig");
 const linear = @import("../linear.zig");
 const oauth = @import("../oauth.zig");
+const rc = @import("../remote_cache.zig");
 const ui = @import("../ui.zig");
 const usage = @import("../usage.zig");
 
@@ -26,6 +37,10 @@ pub const Opts = struct {
     /// question "how much has this task cost" comes up every time the dashboard
     /// does. Off is for when reading the transcripts is not worth the wait.
     tokens: bool = true,
+    /// Ask GitHub and Linear again instead of reusing a recent answer. For the
+    /// moment right after merging a PR, when the cached state is the one thing
+    /// you know to be wrong.
+    refresh: bool = false,
 };
 
 const Tree = enum { clean, dirty, missing };
@@ -56,105 +71,239 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         return;
     }
 
-    // One call for every branch's upstream, drift and tip date.
-    const statuses: []const git.BranchStatus = repo.branchStatuses() catch &.{};
     const now = app_mod.nowSeconds(app.io);
 
-    const remote: Remote = if (opts.local)
-        .{}
-    else
-        try fetchRemote(app, repo, choices);
+    // Both remote columns are asked per branch, so both need the list of them —
+    // and that list is also what says whether a cached answer covered this set of
+    // worktrees. Only the branches that name an issue go to Linear.
+    const branches = try branchNames(app, choices);
+    const refs = try issueRefs(app, choices);
+    const asked = try identifiers(app, refs);
 
-    const spend = try tokenColumn(app, choices, opts);
+    // The cache is read here, before anything is spawned, and written after
+    // everything has been joined. A task never touches it, so there is nothing
+    // for two of them to race over.
+    var cache: rc.Cache = if (opts.local)
+        .none(app.gpa, app.io)
+    else
+        .open(app.gpa, app.io, app.environ);
+
+    var prs: PrColumn = .{};
+    var issues: IssueColumn = .{};
+    if (!opts.local and !opts.refresh) {
+        if (cache.prs(repo.root, branches, now)) |hit| {
+            prs = .{ .list = hit.list, .cached_age = hit.age_seconds };
+        }
+        if (asked.len > 0) {
+            if (cache.issues(repo.root, asked, now)) |hit| {
+                issues = .{ .list = hit.list, .cached_age = hit.age_seconds };
+            }
+        }
+    }
+
+    var statuses: []const git.BranchStatus = &.{};
+    const dirty = try app.gpa.alloc(?u32, choices.len);
+    @memset(dirty, null);
+    const spend = try app.gpa.alloc([]const u8, choices.len);
+    @memset(spend, "—");
+
+    // Everything slow, at once. `git status` walks each worktree, the two columns
+    // wait on two different hosts, and the token scan reads `~/.claude` — four
+    // kinds of waiting with nothing to say to each other.
+    {
+        var group: Io.Group = .init;
+        group.async(app.io, branchStatusTask, .{ repo, &statuses });
+        for (choices, 0..) |choice, i| {
+            group.async(app.io, dirtyTask, .{ repo, choice.entry.path, &dirty[i] });
+        }
+        if (opts.tokens) group.async(app.io, tokenTask, .{ app, choices, spend });
+        if (!opts.local) {
+            if (prs.cached_age == null) group.async(app.io, prTask, .{ app, repo, branches, &prs });
+            if (issues.cached_age == null and refs.len > 0) {
+                group.async(app.io, issueTask, .{ app, refs, &issues });
+            }
+        }
+        try group.await(app.io);
+    }
+
+    if (prs.fetched) cache.putPrs(repo.root, branches, now, prs.list);
+    if (issues.fetched) cache.putIssues(repo.root, asked, now, issues.list);
+    cache.save(now);
 
     const rows = try app.gpa.alloc(Row, choices.len);
     for (choices, 0..) |choice, i| {
-        rows[i] = try buildRow(app, repo, choice, statuses, remote, now);
+        rows[i] = try buildRow(app, choice, statuses, dirty[i], prs.list, issues.list, now);
         rows[i].tokens = spend[i];
     }
 
     try render(app, rows, opts);
 
     if (!opts.local) {
-        if (remote.pr_note) |note| app.ui.hint("{s}", .{note});
-        if (remote.issue_note) |note| app.ui.hint("{s}", .{note});
+        if (prs.note) |note| app.ui.hint("{s}", .{note});
+        if (issues.note) |note| app.ui.hint("{s}", .{note});
+        if (try cacheNote(app.gpa, prs, issues)) |note| app.ui.hint("{s}", .{note});
     }
 }
 
-/// The TOKENS cell for each worktree, in the order given. Reading transcripts is
-/// the one part of this dashboard that scales with how much Claude Code has been
-/// used rather than with the size of the repo, so `--no-tokens` turns it off.
-fn tokenColumn(app: app_mod.App, choices: []const app_mod.Choice, opts: Opts) ![]const []const u8 {
-    const cells = try app.gpa.alloc([]const u8, choices.len);
-    @memset(cells, "—");
-    if (!opts.tokens) return cells;
-
-    const cp_root = try cp.root(app.gpa, app.environ);
-    const projects = try cp.list(app.gpa, app.io, cp_root);
-
-    var scanner: usage.Scanner = .init(app.gpa, app.io, .open(app.gpa, app.io, app.environ));
-    defer scanner.deinit();
-
-    for (choices, 0..) |choice, i| {
-        const totals = try scanner.worktree(projects, choice.entry.path);
-        if (totals.empty()) continue;
-        cells[i] = try std.fmt.allocPrint(app.gpa, "{f}", .{
-            ui.count(totals.counts.contextTokens()),
-        });
+/// The branch of every worktree on screen. A detached one contributes nothing:
+/// there is no head ref to match a pull request against.
+fn branchNames(app: app_mod.App, choices: []const app_mod.Choice) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (choices) |choice| {
+        const branch = choice.entry.branch orelse continue;
+        for (out.items) |seen| {
+            if (std.mem.eql(u8, seen, branch)) break;
+        } else try out.append(app.gpa, branch);
     }
-    return cells;
+    return out.toOwnedSlice(app.gpa);
 }
 
-/// What the two network lookups produced, plus why a column is missing.
-const Remote = struct {
-    prs: []const github.PullRequest = &.{},
-    issues: []const linear.IssueStatus = &.{},
-    pr_note: ?[]const u8 = null,
-    issue_note: ?[]const u8 = null,
-};
-
-fn fetchRemote(app: app_mod.App, repo: git.Repo, choices: []const app_mod.Choice) !Remote {
-    var remote: Remote = .{};
-
-    if (github.list(app.gpa, app.io, repo.root)) |prs| {
-        remote.prs = prs;
-    } else {
-        remote.pr_note = "PR column skipped — `gh` could not answer. Is it installed and authenticated?";
-    }
-
-    // Only ask Linear about branches that actually name an issue.
+/// The issues the worktrees on screen belong to, in the order the branches give
+/// them. Duplicates are left in: `fetchIssueStatuses` folds them itself, and
+/// `identifiers` is what the cache is keyed on.
+fn issueRefs(app: app_mod.App, choices: []const app_mod.Choice) ![]const linear.Ref {
     var refs: std.ArrayList(linear.Ref) = .empty;
     for (choices) |choice| {
         const branch = choice.entry.branch orelse continue;
         const ref = linear.refFromBranch(branch) orelse continue;
         try refs.append(app.gpa, ref);
     }
-    if (refs.items.len == 0) return remote;
+    return refs.toOwnedSlice(app.gpa);
+}
 
-    const cfg = try config.load(app.gpa, app.io, app.environ);
+/// `PE-224` for each distinct ref, uppercased the way Linear stores keys and
+/// sorted, so the same set of worktrees always produces the same list.
+fn identifiers(app: app_mod.App, refs: []const linear.Ref) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (refs) |ref| {
+        const key = try std.ascii.allocUpperString(app.gpa, ref.team);
+        const identifier = try std.fmt.allocPrint(app.gpa, "{s}-{d}", .{ key, ref.number });
+        for (out.items) |seen| {
+            if (std.mem.eql(u8, seen, identifier)) break;
+        } else try out.append(app.gpa, identifier);
+    }
+    const names = try out.toOwnedSlice(app.gpa);
+    std.mem.sort([]const u8, names, {}, lessThan);
+    return names;
+}
+
+fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// One column's worth of pull requests, and why it is missing when it is.
+const PrColumn = struct {
+    list: []const github.PullRequest = &.{},
+    note: ?[]const u8 = null,
+    /// How old the cached answer is, when that is where these came from.
+    cached_age: ?i64 = null,
+    /// Came off the network this run, so it is worth storing.
+    fetched: bool = false,
+};
+
+const IssueColumn = struct {
+    list: []const linear.IssueStatus = &.{},
+    note: ?[]const u8 = null,
+    cached_age: ?i64 = null,
+    fetched: bool = false,
+};
+
+/// The tasks below run on the thread pool, which is why none of them return an
+/// error and none of them touch `app.ui`: a column that cannot be answered
+/// reports that in its own result, and the caller decides what to print.
+fn branchStatusTask(repo: git.Repo, out: *[]const git.BranchStatus) void {
+    // One call for every branch's upstream, drift and tip date.
+    out.* = repo.branchStatuses() catch &.{};
+}
+
+fn dirtyTask(repo: git.Repo, worktree_path: []const u8, out: *?u32) void {
+    out.* = repo.dirtyCount(worktree_path);
+}
+
+/// The TOKENS cell for each worktree, in the order given. Reading transcripts is
+/// the one part of this dashboard that scales with how much Claude Code has been
+/// used rather than with the size of the repo, so `--no-tokens` turns it off.
+fn tokenTask(app: app_mod.App, choices: []const app_mod.Choice, cells: [][]const u8) void {
+    const cp_root = cp.root(app.gpa, app.environ) catch return;
+    const projects = cp.list(app.gpa, app.io, cp_root) catch return;
+
+    var scanner: usage.Scanner = .init(app.gpa, app.io, .open(app.gpa, app.io, app.environ));
+    defer scanner.deinit();
+
+    for (choices, 0..) |choice, i| {
+        const totals = scanner.worktree(projects, choice.entry.path) catch continue;
+        if (totals.empty()) continue;
+        cells[i] = std.fmt.allocPrint(app.gpa, "{f}", .{
+            ui.count(totals.counts.contextTokens()),
+        }) catch continue;
+    }
+}
+
+fn prTask(app: app_mod.App, repo: git.Repo, branches: []const []const u8, out: *PrColumn) void {
+    if (github.forBranches(app.gpa, app.io, repo.root, branches)) |list| {
+        out.list = list;
+        out.fetched = true;
+    } else {
+        out.note = "PR column skipped — `gh` could not answer. Is it installed and authenticated?";
+    }
+}
+
+fn issueTask(app: app_mod.App, refs: []const linear.Ref, out: *IssueColumn) void {
+    const cfg = config.load(app.gpa, app.io, app.environ) catch {
+        out.note = "Linear column skipped — could not read the config.";
+        return;
+    };
     if (oauth.getToken(app.gpa) == null) {
-        remote.issue_note = "Linear column needs `lcc auth`.";
-        return remote;
+        out.note = "Linear column needs `lcc auth`.";
+        return;
     }
     const token = oauth.ensureFreshToken(app.gpa, app.io, cfg.clientId) catch {
-        remote.issue_note = "Could not refresh the Linear token — run `lcc auth`.";
-        return remote;
+        out.note = "Could not refresh the Linear token — run `lcc auth`.";
+        return;
     };
-    remote.issues = linear.fetchIssueStatuses(app.gpa, app.io, token, refs.items) catch {
-        remote.issue_note = try std.fmt.allocPrint(app.gpa, "Linear lookup failed: {s}", .{
+    out.list = linear.fetchIssueStatuses(app.gpa, app.io, token, refs) catch {
+        out.note = std.fmt.allocPrint(app.gpa, "Linear lookup failed: {s}", .{
             linear.last_message,
-        });
-        return remote;
+        }) catch "Linear lookup failed.";
+        return;
     };
-    return remote;
+    out.fetched = true;
+}
+
+/// Says which columns were answered from the cache and how stale they are. A
+/// cache nobody can see is a cache that gets blamed for showing the wrong thing.
+fn cacheNote(gpa: std.mem.Allocator, prs: PrColumn, issues: IssueColumn) !?[]const u8 {
+    const which: []const u8 = if (prs.cached_age != null and issues.cached_age != null)
+        "PR and LINEAR"
+    else if (prs.cached_age != null)
+        "PR"
+    else if (issues.cached_age != null)
+        "LINEAR"
+    else
+        return null;
+
+    // The older of the two is the honest number to show for both.
+    const age = @max(prs.cached_age orelse 0, issues.cached_age orelse 0);
+    // `ui.age` renders anything under a minute as "now", which does not take an
+    // "ago" — and inside a five-minute TTL that is the common case.
+    const when: []const u8 = if (age < 60)
+        "just now"
+    else
+        try std.fmt.allocPrint(gpa, "{f} ago", .{ui.age(age)});
+
+    return try std.fmt.allocPrint(gpa, "{s} from cache, asked {s} — `lcc list --refresh` to re-check.", .{
+        which,
+        when,
+    });
 }
 
 fn buildRow(
     app: app_mod.App,
-    repo: git.Repo,
     choice: app_mod.Choice,
     statuses: []const git.BranchStatus,
-    remote: Remote,
+    count: ?u32,
+    prs: []const github.PullRequest,
+    issues: []const linear.IssueStatus,
     now: i64,
 ) !Row {
     const branch = if (choice.entry.branch) |b|
@@ -162,7 +311,6 @@ fn buildRow(
     else
         try std.fmt.allocPrint(app.gpa, "{s} (detached)", .{app_mod.shortHead(choice.entry.head)});
 
-    const count = repo.dirtyCount(choice.entry.path);
     const tree: Tree = if (count) |n|
         if (n == 0) .clean else .dirty
     else
@@ -195,7 +343,7 @@ fn buildRow(
     var pr: []const u8 = "—";
     var pr_state: ?github.State = null;
     if (choice.entry.branch) |b| {
-        if (github.forBranch(remote.prs, b)) |found_pr| {
+        if (github.forBranch(prs, b)) |found_pr| {
             pr = found_pr.describe(app.gpa);
             pr_state = found_pr.state;
         }
@@ -203,7 +351,7 @@ fn buildRow(
 
     var issue: []const u8 = "—";
     if (choice.entry.branch) |b| {
-        if (linear.statusForBranch(remote.issues, b)) |found_issue| issue = found_issue.state_name;
+        if (linear.statusForBranch(issues, b)) |found_issue| issue = found_issue.state_name;
     }
 
     return .{
@@ -343,6 +491,64 @@ fn paintPr(row: Row, text: []const u8) ui.Painted {
 /// go around text of a known length.
 fn pad(gpa: std.mem.Allocator, text: []const u8, width: usize) ![]const u8 {
     return std.fmt.allocPrint(gpa, "{f}", .{ui.pad(text, width)});
+}
+
+test "cacheNote names only the columns that came from the cache" {
+    const gpa = std.testing.allocator;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Nothing cached — nothing to say.
+    try std.testing.expect(try cacheNote(arena, .{}, .{}) == null);
+
+    const both = (try cacheNote(arena, .{ .cached_age = 120 }, .{ .cached_age = 200 })).?;
+    try std.testing.expect(std.mem.startsWith(u8, both, "PR and LINEAR from cache"));
+    // The older of the two is what gets shown, not whichever was checked first.
+    try std.testing.expect(std.mem.indexOf(u8, both, "3m ago") != null);
+
+    const pr_only = (try cacheNote(arena, .{ .cached_age = 90 }, .{})).?;
+    try std.testing.expect(std.mem.startsWith(u8, pr_only, "PR from cache"));
+    try std.testing.expect(std.mem.indexOf(u8, pr_only, "LINEAR") == null);
+
+    const issue_only = (try cacheNote(arena, .{}, .{ .cached_age = 90 })).?;
+    try std.testing.expect(std.mem.startsWith(u8, issue_only, "LINEAR from cache"));
+
+    // Under a minute reads as "just now": `ui.age` says "now", which cannot take
+    // an "ago" after it.
+    const fresh = (try cacheNote(arena, .{ .cached_age = 3 }, .{ .cached_age = 3 })).?;
+    try std.testing.expect(std.mem.indexOf(u8, fresh, "asked just now") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fresh, "now ago") == null);
+}
+
+test "identifiers dedupes, uppercases and sorts what Linear will be asked" {
+    const gpa = std.testing.allocator;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const app: app_mod.App = .{
+        .gpa = arena,
+        .io = std.testing.io,
+        .environ = undefined,
+        .ui = undefined,
+    };
+
+    // Two worktrees on the same issue ask about it once, and a branch carrying
+    // the key lowercased must land on the same identifier as one that does not.
+    const refs = [_]linear.Ref{
+        .{ .team = "pe", .number = 270 },
+        .{ .team = "PE", .number = 7 },
+        .{ .team = "pe", .number = 270 },
+    };
+    const out = try identifiers(app, &refs);
+    try std.testing.expectEqual(@as(usize, 2), out.len);
+    try std.testing.expectEqualStrings("PE-270", out[0]);
+    try std.testing.expectEqualStrings("PE-7", out[1]);
+
+    try std.testing.expectEqual(@as(usize, 0), (try identifiers(app, &.{})).len);
 }
 
 test "measure sizes every column to its widest cell, header included" {
