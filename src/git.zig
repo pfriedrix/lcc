@@ -304,12 +304,35 @@ pub const Repo = struct {
         return slice;
     }
 
+    /// Brings the remote-tracking refs up to date and drops the ones whose remote
+    /// branch is gone.
+    ///
+    /// Every signal a removal decision rests on is read out of those refs, and
+    /// none of them move on their own: `origin/master` only grows once something
+    /// fetches it, and `%(upstream:track)` cannot say `[gone]` until the pruning
+    /// happens. Without this, `lcc` is deciding what to delete from whatever the
+    /// last `git pull` happened to leave behind.
+    pub fn fetchPrune(self: Repo) Error!void {
+        // Captured rather than inherited: this runs under a progress line, and
+        // fetch's own output would break it apart for no gain.
+        const out = exec.run(self.gpa, self.io, &.{ "git", "fetch", "--prune" }, self.root) catch
+            return Error.GitFailed;
+        if (!out.ok()) {
+            last_error = exec.message(out);
+            return Error.GitFailed;
+        }
+    }
+
     /// Decide whether a branch can be deleted along with its worktree.
     ///
     /// Being an ancestor of the default branch is the plain case. A *gone* upstream is
     /// the other one: the branch was pushed and the remote branch has since been
     /// deleted, which is what a squash-merged PR looks like locally — the commits are
     /// in the default branch under different SHAs, so ancestry can never prove it.
+    ///
+    /// Both are read from local refs, so both are only as current as the last fetch,
+    /// and neither can speak for a squash-merged branch whose remote branch is still
+    /// there. `BranchDisposition.withMergedPr` covers that case from GitHub.
     pub fn branchDisposition(self: Repo, branch: []const u8) Error!BranchDisposition {
         const base = try self.defaultBranch();
         if (std.mem.eql(u8, branch, base)) {
@@ -438,7 +461,7 @@ pub fn parseTrack(track: []const u8) Drift {
     return drift;
 }
 
-pub const DispositionReason = enum { merged, upstream_gone, unmerged, default_branch };
+pub const DispositionReason = enum { merged, merged_pr, upstream_gone, unmerged, default_branch };
 
 pub const BranchDisposition = struct {
     branch: []const u8,
@@ -447,6 +470,38 @@ pub const BranchDisposition = struct {
     /// Commits on the branch that the default branch does not have.
     unmerged: u32,
     reason: DispositionReason,
+    /// The pull request that vouched for the branch, when that is what did.
+    pr: u32 = 0,
+
+    /// The same verdict, with GitHub's answer folded in: it says the branch's pull
+    /// request is merged.
+    ///
+    /// That vouches for commits local ancestry never can. A squash merge rewrites
+    /// them, so `merge-base --is-ancestor` will keep failing however long you wait,
+    /// and the `[gone]` upstream that stands in for it only appears once the remote
+    /// branch has been deleted *and* pruned. A merged pull request is the state
+    /// both of those are trying to infer.
+    ///
+    /// Never overrides a verdict that already stands: the default branch stays
+    /// undeletable whatever a pull request says, and a plain merge is a better
+    /// reason than this one.
+    pub fn withMergedPr(self: BranchDisposition, number: u32) BranchDisposition {
+        if (self.safe or self.reason == .default_branch) return self;
+        return .{
+            .branch = self.branch,
+            .safe = true,
+            .unmerged = self.unmerged,
+            .reason = .merged_pr,
+            .pr = number,
+        };
+    }
+
+    /// `git branch -d` refuses a branch whose commits are not in the ancestry of
+    /// the branch it is run from — which is every safe reason here except a plain
+    /// merge, both of the others being ways of surviving a rewrite.
+    pub fn needsForce(self: BranchDisposition) bool {
+        return self.reason != .merged;
+    }
 };
 
 /// `PE-42/some-title` from Linear becomes `feature/some-title`.
@@ -632,6 +687,77 @@ test "repoRoot answers the main worktree from inside a linked worktree" {
     const branch = (try repo.currentBranch()).?;
     defer gpa.free(branch);
     try std.testing.expectEqualStrings("feature/x", branch);
+}
+
+test "a squash-merged branch reads as unmerged until a pull request vouches for it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const origin = try std.fs.path.join(arena, &.{ base, "origin.git" });
+    const proj = try std.fs.path.join(arena, &.{ base, "proj" });
+
+    try runGit(gpa, io, base, &.{ "init", "-q", "--bare", "origin.git" });
+    try runGit(gpa, io, base, &.{ "init", "-q", "-b", "master", "proj" });
+    try runGit(gpa, io, proj, &.{ "commit", "-q", "--allow-empty", "-m", "init" });
+    try runGit(gpa, io, proj, &.{ "remote", "add", "origin", origin });
+    try runGit(gpa, io, proj, &.{ "push", "-q", "-u", "origin", "master" });
+
+    try runGit(gpa, io, proj, &.{ "checkout", "-q", "-b", "feature/x" });
+    try runGit(gpa, io, proj, &.{ "commit", "-q", "--allow-empty", "-m", "the work" });
+    try runGit(gpa, io, proj, &.{ "push", "-q", "-u", "origin", "feature/x" });
+
+    // The squash: master gains the same work under a different SHA, and the remote
+    // branch stays — the repo setting that deletes it on merge is off.
+    try runGit(gpa, io, proj, &.{ "checkout", "-q", "master" });
+    try runGit(gpa, io, proj, &.{ "commit", "-q", "--allow-empty", "-m", "squashed feature/x" });
+    try runGit(gpa, io, proj, &.{ "push", "-q", "origin", "master" });
+
+    const repo: Repo = .{ .gpa = arena, .io = io, .root = proj };
+    try repo.fetchPrune();
+
+    // The bug this pins: the work is safely in master, and neither local signal can
+    // say so. Ancestry fails because the SHA changed, and the upstream is not gone
+    // because the remote branch is still there — so `lcc remove --merged` offered
+    // nothing right after the merge, which is exactly when it gets run.
+    const local = try repo.branchDisposition("feature/x");
+    try std.testing.expect(!local.safe);
+    try std.testing.expectEqual(DispositionReason.unmerged, local.reason);
+    try std.testing.expectEqual(@as(u32, 1), local.unmerged);
+
+    const vouched = local.withMergedPr(412);
+    try std.testing.expect(vouched.safe);
+    try std.testing.expectEqual(DispositionReason.merged_pr, vouched.reason);
+    try std.testing.expectEqual(@as(u32, 412), vouched.pr);
+    // `-d` would still refuse: the commits are not in master's ancestry and never
+    // will be.
+    try std.testing.expect(vouched.needsForce());
+    // The count survives the upgrade — it is what the confirmation shows.
+    try std.testing.expectEqual(@as(u32, 1), vouched.unmerged);
+}
+
+test "withMergedPr never overrides a verdict that already stands" {
+    const merged: BranchDisposition = .{ .branch = "b", .safe = true, .unmerged = 0, .reason = .merged };
+    // A plain merge is the better reason, and it is the one `-d` accepts.
+    try std.testing.expectEqual(DispositionReason.merged, merged.withMergedPr(1).reason);
+    try std.testing.expect(!merged.needsForce());
+
+    // The default branch is not deletable, whatever pull request came off it.
+    const base: BranchDisposition = .{ .branch = "master", .safe = false, .unmerged = 0, .reason = .default_branch };
+    const still_base = base.withMergedPr(2);
+    try std.testing.expectEqual(DispositionReason.default_branch, still_base.reason);
+    try std.testing.expect(!still_base.safe);
+
+    const gone: BranchDisposition = .{ .branch = "b", .safe = true, .unmerged = 3, .reason = .upstream_gone };
+    try std.testing.expectEqual(DispositionReason.upstream_gone, gone.withMergedPr(3).reason);
+    try std.testing.expect(gone.needsForce());
 }
 
 fn runGit(gpa: std.mem.Allocator, io: Io, cwd: []const u8, args: []const []const u8) !void {

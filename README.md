@@ -181,10 +181,15 @@ Uses the same worktree picker, then launches Xcode instead of Claude. It looks f
 
 ## Branch cleanup
 
-`lcc remove` deletes the branch along with the worktree — but only when the commits survive somewhere else. Two things count as safe:
+`lcc remove` deletes the branch along with the worktree — but only when the commits survive somewhere else. Three things count as safe:
 
 - The branch is an ancestor of the default branch (an ordinary merge).
 - The branch was pushed and its upstream is now `[gone]` — what a squash-merged PR looks like locally, where ancestry can never prove the commits survived.
+- GitHub says the branch's pull request is merged.
+
+That third one is there because the first two are read out of local refs, and local refs cannot describe the situation you are actually in most often: you squash-merged the PR a minute ago and the remote branch is still there. Ancestry fails — the SHAs changed and always will have. `[gone]` has nothing to say either, since nothing deleted the remote branch. Both signals are trying to infer a state GitHub will simply tell you, so `lcc` asks it, and only about the branches nothing local could vouch for.
+
+`lcc` fetches and prunes first, for the same reason: `origin/master` does not grow and an upstream cannot go `[gone]` until something goes and looks. A removal decided from whatever the last `git pull` left behind is a decision made on stale refs. `--local` skips both the fetch and the question — every branch is then judged exactly as it was before, which costs accuracy rather than safety: a stale ref only makes a branch look *less* safe than it is, and `lcc` keeps what it cannot vouch for. A failed fetch or an unreachable `gh` says so and carries on the same way.
 
 Anything else is kept, and `lcc` reports how many unmerged commits it found and prints the `git branch -D` you would need. `--keep-branch` skips the check entirely.
 
@@ -194,11 +199,14 @@ Anything else is kept, and `lcc` reports how many unmerged commits it found and 
 $ lcc remove --merged
 ? Select what to remove (space toggles, enter confirms):
 ❯ ◉ feature/pe-101-shipped  merged       2.4 GB   53M      ~/…/.lcc/worktrees/pe-101-shipped
+  ◉ feature/pe-102-squashed merged #412  1.1 GB   18M      ~/…/.lcc/worktrees/pe-102-squashed
   ◉ feature/pe-103-squashed remote gone  —        —        branch only — no worktree left
   3/3 selected · space toggles · enter confirms · esc cancel
 ```
 
-A branch checked out anywhere — including the main worktree — is never offered, and a worktree with uncommitted changes is reported and skipped rather than forced. `-y` takes everything without asking; `--force`, `--keep-branch` and `--keep-derived-data` mean the same as they do for a single removal.
+The reason column says which of the three vouched for the row, so a branch deleted on GitHub's word names the pull request that gave it.
+
+A branch checked out anywhere — including the main worktree — is never offered, and a worktree with uncommitted changes is reported and skipped rather than forced. A merged pull request whose branch has since been reopened is not a merge: an open PR shadows the old one, and the branch is left alone. `-y` takes everything without asking; `--force`, `--keep-branch` and `--keep-derived-data` mean the same as they do for a single removal.
 
 ## Xcode build data
 

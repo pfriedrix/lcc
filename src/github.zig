@@ -174,6 +174,16 @@ pub fn forBranch(prs: []const PullRequest, branch: []const u8) ?PullRequest {
     return best;
 }
 
+/// The number of the merged pull request that vouches for `branch`, if one does.
+///
+/// Deliberately built on `forBranch`, so an open pull request shadows a merged
+/// one rather than being ignored: a branch that was merged and then reopened has
+/// work in flight again, and nothing about the old merge makes deleting it safe.
+pub fn mergedFor(prs: []const PullRequest, branch: []const u8) ?u32 {
+    const pr = forBranch(prs, branch) orelse return null;
+    return if (pr.state == .merged) pr.number else null;
+}
+
 test "buildQuery aliases one connection per branch and quotes them as JSON" {
     const gpa = std.testing.allocator;
 
@@ -229,6 +239,23 @@ test "forBranch prefers open, then merged, then the newest attempt" {
         .{ .number = 4, .branch = "b", .state = .closed, .draft = false },
     };
     try std.testing.expectEqual(@as(u32, 4), forBranch(&closed_only, "b").?.number);
+}
+
+test "mergedFor answers only for a branch whose newest word is a merge" {
+    const prs = [_]PullRequest{
+        .{ .number = 398, .branch = "feature/shipped", .state = .merged, .draft = false },
+        .{ .number = 400, .branch = "feature/abandoned", .state = .closed, .draft = false },
+        // Merged once, then someone pushed to the branch and opened a new PR. The
+        // old merge says nothing about work that is in flight again.
+        .{ .number = 401, .branch = "feature/again", .state = .merged, .draft = false },
+        .{ .number = 402, .branch = "feature/again", .state = .open, .draft = false },
+    };
+
+    try std.testing.expectEqual(@as(?u32, 398), mergedFor(&prs, "feature/shipped"));
+    try std.testing.expectEqual(@as(?u32, null), mergedFor(&prs, "feature/abandoned"));
+    try std.testing.expectEqual(@as(?u32, null), mergedFor(&prs, "feature/again"));
+    // No pull request at all is not a merge either.
+    try std.testing.expectEqual(@as(?u32, null), mergedFor(&prs, "feature/unknown"));
 }
 
 test "describe labels a draft distinctly from an open PR" {

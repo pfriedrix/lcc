@@ -7,7 +7,9 @@ const cp = @import("../claude_projects.zig");
 const dd = @import("../derived_data.zig");
 const disk = @import("../disk.zig");
 const git = @import("../git.zig");
+const github = @import("../github.zig");
 const prompt = @import("../prompt.zig");
+const rc = @import("../remote_cache.zig");
 const ui = @import("../ui.zig");
 const usage = @import("../usage.zig");
 
@@ -16,6 +18,10 @@ pub const Opts = struct {
     yes: bool = false,
     keep_derived_data: bool = false,
     keep_branch: bool = false,
+    /// Decide from local refs alone — no fetch, and no asking GitHub what became
+    /// of a branch's pull request. Everything still works; a squash-merged branch
+    /// whose remote branch is still there just goes back to reading as unmerged.
+    local: bool = false,
     /// Delete the Claude Code session transcripts too. Off by default: build
     /// data regenerates on the next build, a transcript never comes back.
     sessions: bool = false,
@@ -45,6 +51,8 @@ const Attached = struct {
 pub fn run(app: app_mod.App, opts: Opts) !void {
     const repo = try app.repo();
     if (opts.merged) return runMerged(app, repo, opts);
+
+    if (!opts.local and !opts.keep_branch) refresh(app, repo);
 
     const choices = try app_mod.worktreeChoices(app, repo);
     if (choices.len == 0) {
@@ -87,10 +95,19 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         .spent = try scanner.projectDirs(session_dirs),
     };
 
-    const disposition: ?git.BranchDisposition = if (picked.entry.branch != null and !opts.keep_branch)
+    var disposition: ?git.BranchDisposition = if (picked.entry.branch != null and !opts.keep_branch)
         try repo.branchDisposition(picked.entry.branch.?)
     else
         null;
+    // Only a branch local refs cannot vouch for is worth a round trip — and that
+    // is exactly the branch whose pull request was squash-merged.
+    if (disposition) |d| {
+        if (d.reason == .unmerged and !opts.local) {
+            if (pullRequests(app, repo, &.{d.branch})) |prs| {
+                if (github.mergedFor(prs, d.branch)) |number| disposition = d.withMergedPr(number);
+            }
+        }
+    }
 
     if (!opts.yes) {
         const message = try confirmMessage(app, picked, attached, disposition, opts);
@@ -141,6 +158,47 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     try disposeBranch(app, repo, picked.entry.branch, disposition);
 }
 
+/// Brings the remote-tracking refs up to date before anything is judged by them.
+///
+/// Never fatal. A repo with no remote, a machine that is offline, a host that
+/// asks for credentials nobody is there to type — each of those means the refs
+/// stay as they were, which is where every decision was being made from before.
+/// It costs accuracy, not correctness: a stale ref only ever makes a branch look
+/// *less* safe than it is, and lcc keeps what it cannot vouch for.
+fn refresh(app: app_mod.App, repo: git.Repo) void {
+    app.ui.step("Fetching…", .{});
+    app.ui.flush();
+    repo.fetchPrune() catch {
+        app.ui.warn("Could not fetch — deciding from the refs already here.", .{});
+    };
+}
+
+/// What GitHub says about `branches`, or null when it could not be asked.
+///
+/// Reads `lcc list`'s cache before the network, which is free and cannot mislead
+/// here: an answer this reuses is at most `rc.ttl_seconds` old, `merged` is a
+/// terminal state so a stored one cannot have become false, and a stale `open`
+/// only leaves a branch reading as unmerged — the verdict it already had.
+fn pullRequests(
+    app: app_mod.App,
+    repo: git.Repo,
+    branches: []const []const u8,
+) ?[]const github.PullRequest {
+    const now = app_mod.nowSeconds(app.io);
+    var cache: rc.Cache = .open(app.gpa, app.io, app.environ);
+    if (cache.prs(repo.root, branches, now)) |hit| return hit.list;
+
+    app.ui.step("Asking GitHub about {d} branch{s}…", .{ branches.len, plural(branches.len) });
+    app.ui.flush();
+    const list = github.forBranches(app.gpa, app.io, repo.root, branches) orelse {
+        app.ui.warn("Could not reach GitHub — judging by local refs alone.", .{});
+        return null;
+    };
+    cache.putPrs(repo.root, branches, now, list);
+    cache.save(now);
+    return list;
+}
+
 fn confirmMessage(
     app: app_mod.App,
     picked: app_mod.Choice,
@@ -184,6 +242,7 @@ fn confirmMessage(
 fn describeDisposition(gpa: std.mem.Allocator, d: git.BranchDisposition) ![]const u8 {
     return switch (d.reason) {
         .merged => "(merged — will be deleted)",
+        .merged_pr => try std.fmt.allocPrint(gpa, "(PR #{d} merged — will be deleted)", .{d.pr}),
         .upstream_gone => "(pushed, remote branch gone — will be deleted)",
         .default_branch => "(default branch — kept)",
         .unmerged => try std.fmt.allocPrint(gpa, "({d} unmerged commit{s} — kept)", .{
@@ -218,8 +277,7 @@ fn disposeBranch(
         return;
     }
 
-    // A gone upstream means `-d` refuses even though the work is safely merged.
-    repo.deleteBranch(branch, d.reason == .upstream_gone) catch {
+    repo.deleteBranch(branch, d.needsForce()) catch {
         app.ui.warn("Could not delete branch {s}", .{branch});
         app.ui.hint("  Delete manually with: git branch -D {s}", .{branch});
         return;
@@ -268,9 +326,10 @@ const Row = struct {
     disposition: git.BranchDisposition,
     attached: Attached = .{},
 
-    fn reason(self: Row) []const u8 {
+    fn reason(self: Row, gpa: std.mem.Allocator) []const u8 {
         return switch (self.disposition.reason) {
             .merged => "merged",
+            .merged_pr => std.fmt.allocPrint(gpa, "merged #{d}", .{self.disposition.pr}) catch "merged",
             .upstream_gone => "remote gone",
             else => "safe",
         };
@@ -278,6 +337,8 @@ const Row = struct {
 };
 
 fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
+    if (!opts.local) refresh(app, repo);
+
     app.ui.step("Checking which branches are already merged…", .{});
     app.ui.flush();
 
@@ -290,29 +351,35 @@ fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
         if (entry.branch) |branch| try checked_out.put(app.gpa, branch, {});
     }
 
-    var rows: std.ArrayList(Row) = .empty;
+    // Every branch worth a verdict, judged by local refs first. Unsafe ones are
+    // kept in the list rather than dropped here: GitHub may still vouch for them,
+    // and the set of those is what decides how much it gets asked about.
+    var candidates: std.ArrayList(Row) = .empty;
     for (worktrees) |entry| {
         if (entry.is_main) continue;
         // Detached: no branch, so nothing tells us the commits survived.
         const branch = entry.branch orelse continue;
-        const disposition = try repo.branchDisposition(branch);
-        if (!disposition.safe) continue;
-        try rows.append(app.gpa, .{
+        try candidates.append(app.gpa, .{
             .worktree = entry,
             .branch = branch,
-            .disposition = disposition,
+            .disposition = try repo.branchDisposition(branch),
         });
     }
 
     for (try repo.branchStatuses()) |status| {
         if (checked_out.contains(status.branch)) continue;
-        const disposition = try repo.branchDisposition(status.branch);
-        if (!disposition.safe) continue;
-        try rows.append(app.gpa, .{
+        try candidates.append(app.gpa, .{
             .worktree = null,
             .branch = status.branch,
-            .disposition = disposition,
+            .disposition = try repo.branchDisposition(status.branch),
         });
+    }
+
+    if (!opts.local) try consultGitHub(app, repo, candidates.items);
+
+    var rows: std.ArrayList(Row) = .empty;
+    for (candidates.items) |row| {
+        if (row.disposition.safe) try rows.append(app.gpa, row);
     }
 
     if (rows.items.len == 0) {
@@ -350,7 +417,7 @@ fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
         }
 
         if (opts.keep_branch) continue;
-        repo.deleteBranch(row.branch, row.disposition.reason == .upstream_gone) catch {
+        repo.deleteBranch(row.branch, row.disposition.needsForce()) catch {
             app.ui.warn("Could not delete branch {s}", .{row.branch});
             app.ui.hint("  Delete manually with: git branch -D {s}", .{row.branch});
             continue;
@@ -369,6 +436,31 @@ fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
     });
     if (!opts.sessions) {
         app.ui.hint("Session transcripts were kept. Add --sessions to delete them too.", .{});
+    }
+}
+
+/// Upgrades the rows local refs could not vouch for, where GitHub says the pull
+/// request was merged.
+///
+/// Only those rows go into the question. A branch already safe needs no help, the
+/// default branch is not deletable whatever it says, and asking about either would
+/// grow the query with rows whose answer changes nothing — on a repo with fifty
+/// stale branches that is the difference between a handful of connections and all
+/// fifty.
+fn consultGitHub(app: app_mod.App, repo: git.Repo, rows: []Row) !void {
+    var asked: std.ArrayList([]const u8) = .empty;
+    for (rows) |row| {
+        if (row.disposition.reason != .unmerged) continue;
+        for (asked.items) |seen| {
+            if (std.mem.eql(u8, seen, row.branch)) break;
+        } else try asked.append(app.gpa, row.branch);
+    }
+    if (asked.items.len == 0) return;
+
+    const prs = pullRequests(app, repo, asked.items) orelse return;
+    for (rows) |*row| {
+        const number = github.mergedFor(prs, row.branch) orelse continue;
+        row.disposition = row.disposition.withMergedPr(number);
     }
 }
 
@@ -463,7 +555,7 @@ fn rowLabel(
 
     return std.fmt.allocPrint(gpa, "{f}  {f}  {f}  {f}  {s}", .{
         ui.pad(row.branch, branch_width),
-        ui.pad(row.reason(), reason_width),
+        ui.pad(row.reason(gpa), reason_width),
         ui.pad(reclaim, 8),
         ui.pad(spent, 7),
         if (row.worktree) |entry|
@@ -478,7 +570,7 @@ fn selectRows(app: app_mod.App, rows: []const Row, opts: Opts) ![]const Row {
     var reason_width: usize = 0;
     for (rows) |row| {
         branch_width = @max(branch_width, ui.displayWidth(row.branch));
-        reason_width = @max(reason_width, row.reason().len);
+        reason_width = @max(reason_width, ui.displayWidth(row.reason(app.gpa)));
     }
 
     const items = try app.gpa.alloc(prompt.Item, rows.len);
@@ -551,4 +643,16 @@ test "a bulk row shows what it frees and what it spent" {
     const orphan_label = try rowLabel(arena, &environ, orphan, 22, 11, .{});
     try std.testing.expect(std.mem.indexOf(u8, orphan_label, "53M") == null);
     try std.testing.expect(std.mem.indexOf(u8, orphan_label, "branch only") != null);
+
+    // A row GitHub vouched for names the pull request that did it, so the reason
+    // column says where the answer came from rather than just "safe".
+    var by_pr = row;
+    by_pr.disposition = (git.BranchDisposition{
+        .branch = "feature/pe-101-shipped",
+        .safe = false,
+        .reason = .unmerged,
+        .unmerged = 3,
+    }).withMergedPr(412);
+    const pr_label = try rowLabel(arena, &environ, by_pr, 22, 11, .{});
+    try std.testing.expect(std.mem.indexOf(u8, pr_label, "merged #412") != null);
 }

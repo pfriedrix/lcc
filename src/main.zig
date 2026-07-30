@@ -49,6 +49,8 @@ const usage =
     \\    --no-resume            never pass --resume, even when it has them
     \\  remove | rm              Remove a worktree, its branch, and its Xcode build data
     \\    --merged               bulk: every worktree and branch already merged
+    \\    --local                decide from local refs only — no fetch, no asking
+    \\                           GitHub whether the branch's PR was merged
     \\    -f, --force            force remove even with uncommitted changes
     \\    -y, --yes              skip the confirmation prompt
     \\    --keep-derived-data    leave the Xcode DerivedData folder in place
@@ -250,6 +252,8 @@ fn removeCommand(app: app_mod.App, args: []const []const u8) !void {
             opts.sessions = true;
         } else if (eq(arg, "--merged")) {
             opts.merged = true;
+        } else if (eq(arg, "--local")) {
+            opts.local = true;
         } else return error.UnknownOption;
     }
     return remove_cmd.run(app, opts);
