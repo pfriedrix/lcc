@@ -236,14 +236,20 @@ $ lcc open
 
 ```
 $ lcc stats --models
-WORKTREE                         SESS  MSGS  CONTEXT  OUTPUT  ~USD    LAST  ORIGIN
-feature/pe-47-backfill-receipts  2     6     3.6M     18k     2.54    36m
+WORKTREE                         SESS  MSGS  CONTEXT  OUTPUT  ~USD    ACTIVE  LAST  ORIGIN
+feature/pe-47-backfill-receipts  2     6     3.6M     18k     2.54    12m     36m
   opus-5                               5     3.6M     17k     2.54
   haiku-4-5                            1     50       900     0.00
-main                             17    1198  257M     1.0M    180.14  now   main
-feature/pe-51-liquid-glass       —     —     —        —       —       —     lcc
-TOTAL                            19    1204  261M     1.0M    182.68
+main                             17    1198  257M     1.0M    180.14  9h35m   now   main
+feature/pe-51-liquid-glass       —     —     —        —       —       —       —     lcc
+TOTAL                            19    1204  261M     1.0M    182.68  9h47m
 ```
+
+`ACTIVE` is how long the work actually took, which is not how long the task has been open. Messages less than 15 minutes apart are one stretch of work and the gap between them counts — that gap is thinking, tool calls, and reading the answer. A longer gap is a break and contributes nothing. The two answers are not close: measured on this repo's own branch, 13.8 days elapsed and 9h35m of it was worked.
+
+It undercounts, deliberately. The first message of a stretch is credited with nothing, because whatever went into asking for it happened before the transcript recorded anything, and a session of one message reads as `0m`. A number meant to be weighed against a working day is more useful as a floor than as a flattering estimate. The threshold is `idle_gap_seconds` in `src/usage.zig`, and `--json` reports it alongside the counts so the numbers stay interpretable.
+
+The gaps are measured across the worktree's whole message stream rather than per transcript, because a subagent runs *alongside* the conversation that spawned it. Summing each transcript's own stretches would bill the same wall clock once per agent, so a pipeline running five of them in parallel could report several times the time it actually took. Merged and sorted first, the stretches cannot add up to more than the span they happened in.
 
 `ORIGIN` says where a worktree came from — `main` for the checkout itself, `lcc` for one lcc created under the configured prefix, blank for one made by hand somewhere else. The column is only drawn when there is something to put in it.
 

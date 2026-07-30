@@ -33,6 +33,16 @@ const transcript_limit = 256 * 1024 * 1024;
 /// puts subagents at `<session-id>/subagents/`, which is two.
 const max_depth = 4;
 
+/// The gap between two messages beyond which the work is taken to have stopped.
+/// Fifteen minutes clears anything one turn can spend — a long agent run, a
+/// build, a wall of output being read — and falls well short of stepping away.
+///
+/// The number decides what `ACTIVE` means, so it is worth being wrong in a known
+/// direction: too low splits one sitting into several and undercounts, too high
+/// bills lunch. This errs low, because a duration meant to be compared against a
+/// working day is more useful as a floor than as a flattering estimate.
+pub const idle_gap_seconds: i64 = 15 * 60;
+
 /// What a set of messages spent. The unit of both the per-model buckets and the
 /// rollup over them.
 pub const Counts = struct {
@@ -95,6 +105,12 @@ pub const Totals = struct {
     /// A model carried tokens but had no entry in the price table, so
     /// `counts.cost_usd` is an underestimate.
     unpriced: bool = false,
+    /// When each counted message landed, in Unix seconds and no particular
+    /// order. Kept as the raw set rather than a running duration because active
+    /// time is not additive: a subagent runs *alongside* the conversation that
+    /// spawned it, so two transcripts that each worked ten minutes may between
+    /// them have used ten minutes of anyone's day. `activeSeconds` unions them.
+    stamps: std.ArrayList(i64) = .empty,
 
     pub fn empty(self: Totals) bool {
         return self.counts.messages == 0;
@@ -108,6 +124,31 @@ pub const Totals = struct {
         for (other.models.items) |model| {
             (try self.bucket(gpa, model.name)).add(model.counts);
         }
+        try self.stamps.appendSlice(gpa, other.stamps.items);
+    }
+
+    /// Time spent, as against time elapsed. Messages closer together than
+    /// `idle_gap_seconds` are one stretch of work and the gap between them
+    /// counts — it is thinking, tool calls, and reading the answer. A longer gap
+    /// is a break and contributes nothing, which is what separates this from the
+    /// span between the first message and the last.
+    ///
+    /// Undercounts by design at both ends: the first message of a stretch is
+    /// credited with no time (whatever went into asking for it happened before
+    /// the transcript recorded anything), and a lone message counts as zero.
+    pub fn activeSeconds(self: Totals, gpa: std.mem.Allocator) !i64 {
+        if (self.stamps.items.len < 2) return 0;
+
+        const sorted = try gpa.dupe(i64, self.stamps.items);
+        defer gpa.free(sorted);
+        std.mem.sort(i64, sorted, {}, std.sort.asc(i64));
+
+        var total: i64 = 0;
+        for (sorted[1..], 0..) |at, i| {
+            const gap = at - sorted[i];
+            if (gap > 0 and gap <= idle_gap_seconds) total += gap;
+        }
+        return total;
     }
 
     /// The bucket for `name`, created if this is its first message.
@@ -382,6 +423,12 @@ pub const Scanner = struct {
 
             if (std.mem.lessThan(u8, totals.last, msg.timestamp)) {
                 totals.last = msg.timestamp;
+            }
+            // Collected here rather than per transcript so that `activeSeconds`
+            // sees one worktree's messages as the single interleaved sequence
+            // they were, whichever conversation or subagent wrote each of them.
+            if (epochSeconds(msg.timestamp)) |at| {
+                try totals.stamps.append(self.gpa, at);
             }
         }
     }
@@ -780,6 +827,101 @@ test "a subagent's own transcript counts, but not as another session" {
     try std.testing.expectEqualStrings("2026-07-28T11:00:00.000Z", totals.last);
 }
 
+test "active time counts the gaps inside a stretch, not the breaks between them" {
+    const gpa = std.testing.allocator;
+    const t0: i64 = 1_800_000_000;
+
+    var totals: Totals = .{};
+    defer totals.stamps.deinit(gpa);
+
+    // Two messages five minutes apart: one stretch, five minutes of it.
+    for ([_]i64{ t0, t0 + 5 * 60 }) |at| try totals.stamps.append(gpa, at);
+    try std.testing.expectEqual(@as(i64, 5 * 60), try totals.activeSeconds(gpa));
+
+    // An hour later the work resumes. The hour is a break and is not billed;
+    // the ten minutes on the far side of it are.
+    for ([_]i64{ t0 + 65 * 60, t0 + 75 * 60 }) |at| try totals.stamps.append(gpa, at);
+    try std.testing.expectEqual(@as(i64, 15 * 60), try totals.activeSeconds(gpa));
+
+    // Order is the sequence the messages happened in, not the one they were
+    // read in — two transcripts arrive interleaved and neither is sorted.
+    var shuffled: Totals = .{};
+    defer shuffled.stamps.deinit(gpa);
+    for ([_]i64{ t0 + 75 * 60, t0, t0 + 65 * 60, t0 + 5 * 60 }) |at| {
+        try shuffled.stamps.append(gpa, at);
+    }
+    try std.testing.expectEqual(@as(i64, 15 * 60), try shuffled.activeSeconds(gpa));
+
+    // A gap exactly at the threshold is still one sitting: the break is the
+    // first gap *longer* than it.
+    var edge: Totals = .{};
+    defer edge.stamps.deinit(gpa);
+    for ([_]i64{ t0, t0 + idle_gap_seconds, t0 + 2 * idle_gap_seconds + 1 }) |at| {
+        try edge.stamps.append(gpa, at);
+    }
+    try std.testing.expectEqual(idle_gap_seconds, try edge.activeSeconds(gpa));
+
+    // One message has no gap to measure. Zero, rather than a guess at how long
+    // producing it took.
+    var single: Totals = .{};
+    defer single.stamps.deinit(gpa);
+    try single.stamps.append(gpa, t0);
+    try std.testing.expectEqual(@as(i64, 0), try single.activeSeconds(gpa));
+}
+
+test "a subagent's time overlaps its parent's rather than adding to it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cwd = Io.Dir.cwd();
+
+    const dir_path = try std.fs.path.join(arena, &.{ base, "project" });
+    const subagents = try std.fs.path.join(arena, &.{ dir_path, "sess-1", "subagents" });
+    try cwd.createDirPath(io, subagents);
+
+    // The conversation spans 10:00–10:10 and delegates the middle of it. The
+    // subagent's two messages land *inside* that window, which is the whole
+    // point: they are the same ten minutes of someone's day, not six more.
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ dir_path, "sess-1.jsonl" }),
+        .data =
+        \\{"type":"assistant","timestamp":"2026-07-28T10:00:00.000Z","message":{"id":"msg_p1","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":100}}}
+        \\{"type":"assistant","timestamp":"2026-07-28T10:10:00.000Z","message":{"id":"msg_p2","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":100}}}
+        \\
+        ,
+    });
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ subagents, "agent-1.jsonl" }),
+        .data =
+        \\{"type":"assistant","timestamp":"2026-07-28T10:02:00.000Z","message":{"id":"msg_s1","model":"claude-opus-5","usage":{"input_tokens":5,"output_tokens":20}}}
+        \\{"type":"assistant","timestamp":"2026-07-28T10:08:00.000Z","message":{"id":"msg_s2","model":"claude-opus-5","usage":{"input_tokens":5,"output_tokens":20}}}
+        \\
+        ,
+    });
+
+    var scanner: Scanner = .init(arena, io, .none(arena, io));
+    defer scanner.deinit();
+    const totals = try scanner.project(dir_path);
+
+    // Ten minutes, the width of the window. Summing the two transcripts
+    // separately would give sixteen — more time than the window holds, and the
+    // error grows with every subagent a pipeline runs in parallel.
+    try std.testing.expectEqual(@as(i64, 10 * 60), try totals.activeSeconds(arena));
+
+    // Active time can never exceed the span it happened in. Worth asserting
+    // rather than reasoning about: it is the invariant the union is there for.
+    const span = epochSeconds("2026-07-28T10:10:00.000Z").? -
+        epochSeconds("2026-07-28T10:00:00.000Z").?;
+    try std.testing.expect(try totals.activeSeconds(arena) <= span);
+}
+
 test "a cached run agrees with a cold one, and notices an appended transcript" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -834,6 +976,10 @@ test "a cached run agrees with a cold one, and notices an appended transcript" {
     try std.testing.expectEqual(from_disk.sessions, from_cache.sessions);
     try std.testing.expectEqualStrings(from_disk.last, from_cache.last);
     try std.testing.expectEqual(from_disk.models.items.len, from_cache.models.items.len);
+    try std.testing.expectEqual(
+        try from_disk.activeSeconds(arena),
+        try from_cache.activeSeconds(arena),
+    );
     // The shared message was counted once by both routes, not once per file.
     try std.testing.expectEqual(@as(u64, 2), from_cache.counts.messages);
     try std.testing.expectEqual(@as(u64, 120), from_cache.counts.output);

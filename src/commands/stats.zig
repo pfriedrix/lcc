@@ -98,6 +98,7 @@ const Widths = struct {
     input: usize,
     output: usize,
     cost: usize,
+    active: usize,
     last: usize,
 };
 
@@ -113,6 +114,7 @@ fn measure(rows: []const Row, cells: []const Cells) Widths {
         .input = "CONTEXT".len,
         .output = "OUTPUT".len,
         .cost = "~USD".len,
+        .active = "ACTIVE".len,
         .last = "LAST".len,
     };
     for (rows, cells) |row, cell| {
@@ -122,6 +124,7 @@ fn measure(rows: []const Row, cells: []const Cells) Widths {
         w.input = @max(w.input, cell.input.len);
         w.output = @max(w.output, cell.output.len);
         w.cost = @max(w.cost, cell.cost.len);
+        w.active = @max(w.active, ui.displayWidth(cell.active));
         w.last = @max(w.last, ui.displayWidth(cell.last));
         for (cell.models) |model| {
             w.label = @max(w.label, ui.displayWidth(model.label) + model_indent);
@@ -144,6 +147,7 @@ const Cells = struct {
     input: []const u8,
     output: []const u8,
     cost: []const u8,
+    active: []const u8,
     last: []const u8,
     models: []const ModelCells = &.{},
 };
@@ -165,6 +169,7 @@ fn format(app: app_mod.App, row: Row, opts: Opts, now: i64) !Cells {
             .input = "—",
             .output = "—",
             .cost = "—",
+            .active = "—",
             .last = "—",
         };
     }
@@ -176,6 +181,9 @@ fn format(app: app_mod.App, row: Row, opts: Opts, now: i64) !Cells {
         .input = try std.fmt.allocPrint(gpa, "{f}", .{ui.count(counts.contextTokens())}),
         .output = try std.fmt.allocPrint(gpa, "{f}", .{ui.count(counts.output)}),
         .cost = try formatCost(gpa, row.totals),
+        .active = try std.fmt.allocPrint(gpa, "{f}", .{
+            ui.duration(try row.totals.activeSeconds(gpa)),
+        }),
         .last = if (usage.epochSeconds(row.totals.last)) |at|
             try std.fmt.allocPrint(gpa, "{f}", .{ui.age(now - at)})
         else
@@ -233,26 +241,28 @@ fn renderTable(app: app_mod.App, rows: []const Row, opts: Opts) !void {
     // pasted somewhere. Which cell that is depends on whether ORIGIN is drawn,
     // both in the header and in every row below it.
     const origin = anyTagged(rows);
-    app.ui.hint("{f}  {f}  {f}  {f}  {f}  {f}  {f}{s}", .{
+    app.ui.hint("{f}  {f}  {f}  {f}  {f}  {f}  {f}  {f}{s}", .{
         ui.pad("WORKTREE", w.label),
         ui.pad("SESS", w.sessions),
         ui.pad("MSGS", w.messages),
         ui.pad("CONTEXT", w.input),
         ui.pad("OUTPUT", w.output),
         ui.pad("~USD", w.cost),
+        ui.pad("ACTIVE", w.active),
         ui.pad("LAST", if (origin) w.last else 0),
         if (origin) "  ORIGIN" else "",
     });
 
     for (rows, cells) |row, cell| {
         const tagged = row.tag.len > 0;
-        app.ui.info("{f}  {f}  {f}  {f}  {f}  {f}  {f}{f}", .{
+        app.ui.info("{f}  {f}  {f}  {f}  {f}  {f}  {f}  {f}{f}", .{
             ui.cyan(try pad(app.gpa, row.label, w.label)),
             ui.dim(try pad(app.gpa, cell.sessions, w.sessions)),
             ui.dim(try pad(app.gpa, cell.messages, w.messages)),
             ui.pad(cell.input, w.input),
             ui.pad(cell.output, w.output),
             ui.pad(cell.cost, w.cost),
+            ui.pad(cell.active, w.active),
             ui.dim(try pad(app.gpa, cell.last, if (tagged) w.last else 0)),
             ui.dim(if (tagged)
                 try std.fmt.allocPrint(app.gpa, "  {s}", .{row.tag})
@@ -272,19 +282,23 @@ fn renderTable(app: app_mod.App, rows: []const Row, opts: Opts) !void {
         }
     }
 
-    app.ui.hint("{f}  {f}  {f}  {f}  {f}  {s}", .{
+    app.ui.hint("{f}  {f}  {f}  {f}  {f}  {f}  {s}", .{
         ui.pad("TOTAL", w.label),
         ui.pad(total_cells.sessions, w.sessions),
         ui.pad(total_cells.messages, w.messages),
         ui.pad(total_cells.input, w.input),
         ui.pad(total_cells.output, w.output),
-        total_cells.cost,
+        ui.pad(total_cells.cost, w.cost),
+        total_cells.active,
     });
 
     app.ui.hint(
         "CONTEXT counts fresh input plus cache writes and reads; ~USD is Anthropic list price, not what a subscription bills.",
         .{},
     );
+    app.ui.hint("ACTIVE is time worked, not elapsed — a gap over {f} is a break and counts for nothing.", .{
+        ui.duration(usage.idle_gap_seconds),
+    });
     if (total.unpriced) {
         app.ui.hint("A trailing + marks a total missing a model lcc has no price for.", .{});
     }
@@ -299,7 +313,7 @@ fn renderJson(app: app_mod.App, rows: []const Row, skipped: usize) !void {
         if (i > 0) try out.appendSlice(w, ",");
         const counts = row.totals.counts;
         try out.appendSlice(w, try std.fmt.allocPrint(w,
-            \\{{"branch":{f},"path":{f},"tag":"{s}","sessions":{d},"messages":{d},"input":{d},"output":{d},"cache_write_5m":{d},"cache_write_1h":{d},"cache_read":{d},"cost_usd":{d:.4},"unpriced":{},"last":{f},"models":[
+            \\{{"branch":{f},"path":{f},"tag":"{s}","sessions":{d},"messages":{d},"input":{d},"output":{d},"cache_write_5m":{d},"cache_write_1h":{d},"cache_read":{d},"cost_usd":{d:.4},"unpriced":{},"last":{f},"active_seconds":{d},"models":[
         , .{
             std.json.fmt(row.label, .{}),
             std.json.fmt(row.path, .{}),
@@ -314,6 +328,7 @@ fn renderJson(app: app_mod.App, rows: []const Row, skipped: usize) !void {
             counts.cost_usd,
             row.totals.unpriced,
             std.json.fmt(row.totals.last, .{}),
+            try row.totals.activeSeconds(w),
         }));
         for (try row.totals.modelsBySpend(w), 0..) |model, j| {
             if (j > 0) try out.appendSlice(w, ",");
@@ -332,7 +347,13 @@ fn renderJson(app: app_mod.App, rows: []const Row, skipped: usize) !void {
         }
         try out.appendSlice(w, "]}");
     }
-    try out.appendSlice(w, try std.fmt.allocPrint(w, "],\"skipped_transcripts\":{d}}}\n", .{skipped}));
+    // The idle gap travels with the numbers it defines: `active_seconds` is
+    // meaningless to a consumer that cannot see where the cut-off was put.
+    try out.appendSlice(w, try std.fmt.allocPrint(
+        w,
+        "],\"skipped_transcripts\":{d},\"idle_gap_seconds\":{d}}}\n",
+        .{ skipped, usage.idle_gap_seconds },
+    ));
     app.ui.payload("{s}", .{out.items});
 }
 
@@ -393,6 +414,35 @@ test "the origin column is headed, and absent when no worktree has one" {
     try std.testing.expect(!std.mem.endsWith(u8, row, " "));
 }
 
+test "the active column reports time worked, between ~USD and LAST" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var totals: usage.Totals = .{ .counts = .{ .messages = 3, .output = 900 }, .sessions = 1 };
+    const t0: i64 = 1_800_000_000;
+    for ([_]i64{ t0, t0 + 4 * 60, t0 + 10 * 60 }) |at| try totals.stamps.append(arena, at);
+
+    const table = try renderToString(arena, &.{testRow("feature/pe-1", totals)});
+    var lines = std.mem.splitScalar(u8, table, '\n');
+
+    const header = lines.next().?;
+    const cost_at = std.mem.indexOf(u8, header, "~USD").?;
+    const active_at = std.mem.indexOf(u8, header, "ACTIVE").?;
+    const last_at = std.mem.indexOf(u8, header, "LAST").?;
+    try std.testing.expect(cost_at < active_at and active_at < last_at);
+
+    // Four minutes then six, no break between them.
+    try std.testing.expect(std.mem.indexOf(u8, lines.next().?, "10m") != null);
+
+    // A worktree nobody has opened has no time worked, and says so with the
+    // same dash as every other column rather than a misleading 0m.
+    const untouched = try renderToString(arena, &.{testRow("feature/pe-2", .{})});
+    var idle = std.mem.splitScalar(u8, untouched, '\n');
+    _ = idle.next();
+    try std.testing.expect(std.mem.indexOf(u8, idle.next().?, "0m") == null);
+}
+
 test "measure sizes every column to its widest cell, header included" {
     const rows = [_]Row{testRow("feature/pe-256-app-hangs-on-launch", .{})};
     const cells = [_]Cells{.{
@@ -401,6 +451,7 @@ test "measure sizes every column to its widest cell, header included" {
         .input = "238.8M",
         .output = "980k",
         .cost = "169.84",
+        .active = "9h40m",
         .last = "2m",
         .models = &.{.{
             .label = "haiku-4-5",
@@ -434,6 +485,7 @@ test "a model name longer than every branch still fits the label column" {
         .input = "1",
         .output = "1",
         .cost = "0.01",
+        .active = "1m",
         .last = "1m",
         .models = &.{.{
             .label = "some-very-long-model-id-here",
