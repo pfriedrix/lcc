@@ -48,6 +48,10 @@ pub const Stored = struct {
     envExclude: ?[]const []const u8 = null,
     activeStates: ?[]const []const u8 = null,
     startTaskCommand: ?[]const u8 = null,
+    /// Which of the repo's local-scope MCP servers a worktree is worth handing.
+    /// Absent carries all of them. A server the work never calls still costs every
+    /// agent in the session its name and its instructions, on every turn.
+    mcpCarry: ?[]const []const u8 = null,
 };
 
 pub const Config = struct {
@@ -135,6 +139,7 @@ pub fn save(
     }
     if (patch.activeStates) |v| merged.activeStates = v;
     if (patch.startTaskCommand) |v| merged.startTaskCommand = v;
+    if (patch.mcpCarry) |v| merged.mcpCarry = v;
 
     const body = try std.json.Stringify.valueAlloc(gpa, merged, .{
         .whitespace = .indent_2,

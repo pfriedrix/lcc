@@ -307,6 +307,7 @@ Session transcripts are what `claude --resume` replays — check before deleting
 | `startTaskCommand` | `""` | Passed to `claude` as its first argument. Placeholders: `{identifier}`, `{branch}`, `{url}` |
 | `linkPatterns` | `[".env", ".env.*", "CLAUDE.md", "CLAUDE.local.md", ".claude/settings.local.json"]` | Which files to symlink into each worktree |
 | `linkExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
+| `mcpCarry` | absent — all of them | Which of the repo's local-scope MCP servers are worth carrying |
 | `clientId` | built-in | Linear OAuth application. Override with `LCC_CLIENT_ID` or `lcc auth setup --client-id <id>` |
 
 `{repoRoot}` and `{repoParent}` always resolve against the **main** worktree, so running `lcc` from inside a worktree puts the next one beside its siblings instead of nesting it one level deeper.
@@ -362,6 +363,8 @@ Symlinks cannot solve the same problem for MCP servers, because they are not in 
 So `lcc start` and `lcc open` read the repo's local-scope servers and pass them to Claude Code as `--mcp-config <file>`, generated per repo under `~/.config/lcc/mcp/`. Without `--strict-mcp-config` they add to the user, global and plugin scopes rather than replacing them, and the servers keep whatever authentication they already had. `~/.claude.json` itself is only ever read: it is Claude Code's own working state, rewritten whole when a session ends, so an outside write survives only until the next exit.
 
 Two things this cannot do. A server that was never authenticated stays unauthenticated — `/mcp` in a session is the only thing that fixes that, and the worktree is not why it is dark. And a session that is *already* running cannot be handed servers retroactively, which is why `lcc start --json` reports what a launch would have carried instead of carrying it.
+
+`mcpCarry` narrows the set to the names it lists, matched case-insensitively, keeping the file's order. Carrying everything is the default because it is the answer that never surprises anyone, but it is not free: a server the work never calls still spends every agent in the session its name and its instructions, on every turn — and a pipeline that fans out to twenty subagents pays that twenty times over. Measured across eight pipeline runs in this repo's worktrees, `linear-server` and `xcode` accounted for every local-scope call that was made; `clickup`, `notion` and `sentry` were carried into all eight and never touched once. A name the repo does not have is ignored, and a list that matches nothing launches without MCP rather than with an empty config — leaving the key out is how you say "all of them".
 
 ## Layout
 
