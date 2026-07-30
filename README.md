@@ -193,6 +193,8 @@ That third one is there because the first two are read out of local refs, and lo
 
 Anything else is kept, and `lcc` reports how many unmerged commits it found and prints the `git branch -D` you would need. `--keep-branch` skips the check entirely.
 
+The delete itself goes through `git branch -d` for a plain merge, so git gets to confirm it independently — but git's own check sees only HEAD and the branch's upstream, and neither of those can see `origin/<default>`. A branch merged there while local `main` is behind, with its remote branch deleted on merge (which `lcc`'s own `fetch --prune` then reflects), is in none of them: `-d` refuses a merge `lcc` has already proved. That refusal is answered with `-D` and a line saying so, rather than handed back as a failure. A delete that fails for any other reason now quotes what git said.
+
 `lcc remove --merged` runs that check across the whole repo and offers everything that passes in one checkbox list — including branches that outlived their worktree, which nothing else ever cleans up:
 
 ```

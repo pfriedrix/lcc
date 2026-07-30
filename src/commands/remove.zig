@@ -356,12 +356,13 @@ fn disposeBranch(
         return;
     }
 
-    repo.deleteBranch(branch, d.needsForce()) catch {
-        app.ui.warn("Could not delete branch {s}", .{branch});
+    const forced = repo.deleteVerified(d) catch {
+        app.ui.warn("Could not delete branch {s} — {s}", .{ branch, git.last_error });
         app.ui.hint("  Delete manually with: git branch -D {s}", .{branch});
         return;
     };
     app.ui.success("Deleted branch {f}", .{ui.cyan(branch)});
+    if (forced) app.ui.hint("  git's own check could not see the merge — used -D.", .{});
 }
 
 fn purgeDerived(app: app_mod.App, sized: []const dd.Sized, root: []const u8) !u64 {
@@ -506,13 +507,14 @@ fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
         }
 
         if (opts.keep_branch) continue;
-        repo.deleteBranch(row.branch, row.disposition.needsForce()) catch {
-            app.ui.warn("Could not delete branch {s}", .{row.branch});
+        const forced = repo.deleteVerified(row.disposition) catch {
+            app.ui.warn("Could not delete branch {s} — {s}", .{ row.branch, git.last_error });
             app.ui.hint("  Delete manually with: git branch -D {s}", .{row.branch});
             continue;
         };
         branches_gone += 1;
         app.ui.success("Deleted branch {f}", .{ui.cyan(row.branch)});
+        if (forced) app.ui.hint("  git's own check could not see the merge — used -D.", .{});
     }
 
     app.ui.info("", .{});
