@@ -374,7 +374,31 @@ pub const Repo = struct {
         const flag: []const u8 = if (force) "-D" else "-d";
         const out = exec.run(self.gpa, self.io, &.{ "git", "branch", flag, branch }, self.root) catch
             return Error.GitFailed;
-        if (!out.ok()) return Error.GitFailed;
+        if (!out.ok()) {
+            last_error = exec.message(out);
+            return Error.GitFailed;
+        }
+    }
+
+    /// Deletes a branch this repo has already vouched for, and does not take git's
+    /// "not fully merged" for an answer when lcc's own check says otherwise. True
+    /// when it took the force to do it.
+    ///
+    /// `-d` re-checks the merge against HEAD and the branch's upstream, and those two
+    /// are the whole of what it can see. A branch merged into `origin/<default>`
+    /// while local `<default>` is behind sits in neither — and `lcc remove`'s own
+    /// `fetch --prune` is what takes the upstream away, so the ordinary case (pull
+    /// request merged, remote branch deleted with it, nothing pulled since) is
+    /// refused. Ancestry against `origin/<default>` already proved those commits
+    /// survive, so the retry spends nothing but a second opinion that was blind.
+    pub fn deleteVerified(self: Repo, d: BranchDisposition) Error!bool {
+        self.deleteBranch(d.branch, d.needsForce()) catch |err| {
+            // Nothing left to escalate to: `-D` is what already failed.
+            if (d.needsForce()) return err;
+            try self.deleteBranch(d.branch, true);
+            return true;
+        };
+        return false;
     }
 
     pub fn removeWorktree(self: Repo, worktree_path: []const u8, force: bool) !void {
@@ -496,9 +520,15 @@ pub const BranchDisposition = struct {
         };
     }
 
-    /// `git branch -d` refuses a branch whose commits are not in the ancestry of
-    /// the branch it is run from — which is every safe reason here except a plain
-    /// merge, both of the others being ways of surviving a rewrite.
+    /// Whether git has to be told not to re-check the merge itself.
+    ///
+    /// It re-checks against HEAD and the branch's own upstream, and that is the
+    /// whole of what it can see. `upstream_gone` and `merged_pr` are both ways of
+    /// surviving a rewrite those two cannot describe, so they need `-D` outright.
+    /// A plain merge asks for `-d` and keeps git's second opinion — which it can
+    /// still withhold, since ancestry here is judged against `origin/<default>` as
+    /// well, and that is a ref `-d` never consults. `deleteVerified` is where that
+    /// refusal is dealt with.
     pub fn needsForce(self: BranchDisposition) bool {
         return self.reason != .merged;
     }
@@ -741,6 +771,60 @@ test "a squash-merged branch reads as unmerged until a pull request vouches for 
     try std.testing.expect(vouched.needsForce());
     // The count survives the upgrade — it is what the confirmation shows.
     try std.testing.expectEqual(@as(u32, 1), vouched.unmerged);
+}
+
+test "a branch merged where only origin can see it still gets deleted" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const origin = try std.fs.path.join(arena, &.{ base, "origin.git" });
+    const proj = try std.fs.path.join(arena, &.{ base, "proj" });
+    const other = try std.fs.path.join(arena, &.{ base, "other" });
+
+    try runGit(gpa, io, base, &.{ "init", "-q", "--bare", "origin.git" });
+    try runGit(gpa, io, base, &.{ "init", "-q", "-b", "master", "proj" });
+    try runGit(gpa, io, proj, &.{ "commit", "-q", "--allow-empty", "-m", "init" });
+    try runGit(gpa, io, proj, &.{ "remote", "add", "origin", origin });
+    try runGit(gpa, io, proj, &.{ "push", "-q", "-u", "origin", "master" });
+
+    try runGit(gpa, io, proj, &.{ "checkout", "-q", "-b", "feature/x" });
+    try runGit(gpa, io, proj, &.{ "commit", "-q", "--allow-empty", "-m", "the work" });
+    try runGit(gpa, io, proj, &.{ "push", "-q", "-u", "origin", "feature/x" });
+    try runGit(gpa, io, proj, &.{ "checkout", "-q", "master" });
+
+    // The merge happens elsewhere, the way it really does: on GitHub, followed by
+    // the remote branch being deleted. Nothing pulls master here afterwards.
+    try runGit(gpa, io, base, &.{ "clone", "-q", origin, "other" });
+    // A bare repo's HEAD names whatever `init.defaultBranch` says, which need not be
+    // the branch that was pushed — so the clone is put on master explicitly.
+    try runGit(gpa, io, other, &.{ "checkout", "-q", "-B", "master", "origin/master" });
+    try runGit(gpa, io, other, &.{ "merge", "-q", "--no-ff", "origin/feature/x", "-m", "merge" });
+    try runGit(gpa, io, other, &.{ "push", "-q", "origin", "HEAD:master" });
+    try runGit(gpa, io, other, &.{ "push", "-q", "origin", "--delete", "feature/x" });
+
+    const repo: Repo = .{ .gpa = arena, .io = io, .root = proj };
+    try repo.fetchPrune();
+
+    // lcc sees the merge, because it looks at origin/master too.
+    const d = try repo.branchDisposition("feature/x");
+    try std.testing.expect(d.safe);
+    try std.testing.expectEqual(DispositionReason.merged, d.reason);
+
+    // git does not: local master is behind, and the upstream that could have
+    // vouched was pruned a moment ago by lcc's own fetch. `-d` alone refuses.
+    try std.testing.expectError(Error.GitFailed, repo.deleteBranch("feature/x", false));
+    try std.testing.expect(std.mem.indexOf(u8, last_error, "not fully merged") != null);
+
+    try std.testing.expect(try repo.deleteVerified(d));
+    try std.testing.expect(!repo.succeeds(&.{ "git", "rev-parse", "--verify", "-q", "refs/heads/feature/x" }));
 }
 
 test "withMergedPr never overrides a verdict that already stands" {

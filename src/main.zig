@@ -55,6 +55,7 @@ const usage =
     \\    -y, --yes              skip the confirmation prompt
     \\    --keep-derived-data    leave the Xcode DerivedData folder in place
     \\    --keep-branch          leave the git branch in place
+    \\    --keep-xcode           don't ask Xcode to close the worktree it has open
     \\    --sessions             also delete the Claude Code session transcripts
     \\  clean                    Delete what worktrees that no longer exist left behind
     \\    --build-data           only Xcode DerivedData
@@ -248,6 +249,8 @@ fn removeCommand(app: app_mod.App, args: []const []const u8) !void {
             opts.keep_derived_data = true;
         } else if (eq(arg, "--keep-branch")) {
             opts.keep_branch = true;
+        } else if (eq(arg, "--keep-xcode")) {
+            opts.keep_xcode = true;
         } else if (eq(arg, "--sessions")) {
             opts.sessions = true;
         } else if (eq(arg, "--merged")) {

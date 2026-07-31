@@ -12,12 +12,17 @@ const prompt = @import("../prompt.zig");
 const rc = @import("../remote_cache.zig");
 const ui = @import("../ui.zig");
 const usage = @import("../usage.zig");
+const xcode = @import("../xcode.zig");
 
 pub const Opts = struct {
     force: bool = false,
     yes: bool = false,
     keep_derived_data: bool = false,
     keep_branch: bool = false,
+    /// Leave a running Xcode alone — it is not even asked what it has open. The
+    /// escape hatch for anyone who would rather deal with their own windows than
+    /// have a CLI reach into them.
+    keep_xcode: bool = false,
     /// Decide from local refs alone — no fetch, and no asking GitHub what became
     /// of a branch's pull request. Everything still works; a squash-merged branch
     /// whose remote branch is still there just goes back to reading as unmerged.
@@ -33,6 +38,9 @@ pub const Opts = struct {
 const Attached = struct {
     derived: []dd.Sized = &.{},
     sessions: []cp.Sized = &.{},
+    /// What a running Xcode still has open in it. Closed before the directory goes,
+    /// so no window is left on a path that no longer exists.
+    xcode: xcode.Open = .{},
     /// What those sessions spent. A transcript's disk size says nothing about
     /// the work it holds — this is the number that makes deleting one a
     /// decision rather than a shrug.
@@ -93,7 +101,23 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         .derived = try dd.withSizes(app.gpa, app.io, derived),
         .sessions = try cp.withSizes(app.gpa, app.io, sessions),
         .spent = try scanner.projectDirs(session_dirs),
+        .xcode = try heldByXcode(app, opts, picked.entry.path),
     };
+
+    if (attached.xcode.unanswered) {
+        app.ui.warn("Could not ask Xcode what it has open — it may be holding this worktree.", .{});
+        app.ui.hint("  {s}", .{automation_hint});
+    }
+
+    // Unsaved editor work is not lcc's to throw away. Xcode's scripting interface
+    // offers no way to save it, and removing the worktree would take it along, so
+    // the run stops here instead of asking a question with no good answer.
+    if (attached.xcode.unsaved.len > 0 and !opts.force) {
+        app.ui.warn("Xcode has unsaved changes in this worktree — nothing removed.", .{});
+        for (attached.xcode.unsaved) |doc| app.ui.hint("  {s}", .{doc.path});
+        app.ui.hint("Save them in Xcode, or remove anyway with: lcc remove --force", .{});
+        return;
+    }
 
     var disposition: ?git.BranchDisposition = if (picked.entry.branch != null and !opts.keep_branch)
         try repo.branchDisposition(picked.entry.branch.?)
@@ -119,6 +143,8 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         }
     }
 
+    const closed = closeXcode(app, attached.xcode);
+
     repo.removeWorktree(picked.entry.path, opts.force) catch |err| {
         if (opts.force) return err;
         app.ui.warn("{s}", .{git.last_error});
@@ -131,6 +157,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         ) orelse std.process.exit(app_mod.cancelled_exit_code);
         if (!forced) {
             app.ui.hint("Aborted.", .{});
+            noteReopen(app, closed);
             return;
         }
         try repo.removeWorktree(picked.entry.path, true);
@@ -156,6 +183,47 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     }
 
     try disposeBranch(app, repo, picked.entry.branch, disposition);
+}
+
+const automation_hint =
+    "Allow it under System Settings → Privacy & Security → Automation, or use --keep-xcode.";
+
+/// What Xcode has open under `worktree`, or nothing when `--keep-xcode` says not to
+/// involve it — in which case Xcode is never asked in the first place.
+fn heldByXcode(app: app_mod.App, opts: Opts, worktree: []const u8) !xcode.Open {
+    if (opts.keep_xcode) return .{};
+    const all = try xcode.openDocuments(app.gpa, app.io);
+    return all.inside(app.gpa, app.io, worktree);
+}
+
+/// Hands the worktree back before git deletes it. True when a window actually
+/// closed, which a removal that then fails owes the user an explanation for.
+///
+/// Never fatal, like the fetch: a window lcc could not close is a stale window the
+/// user closes themselves, which is exactly where they were before lcc tried.
+fn closeXcode(app: app_mod.App, held: xcode.Open) bool {
+    if (held.workspaces.len == 0) return false;
+
+    xcode.closeDocuments(app.gpa, app.io, held.workspaces) catch {
+        app.ui.warn("Could not close {s} in Xcode — {s}", .{
+            held.workspaces[0].name(),
+            xcode.last_error,
+        });
+        app.ui.hint("  {s}", .{automation_hint});
+        return false;
+    };
+    for (held.workspaces) |doc| {
+        app.ui.success("Closed {f} in Xcode", .{ui.cyan(doc.name())});
+    }
+    return true;
+}
+
+/// The worktree survived a removal that had already closed its window — Xcode
+/// opening a project is itself enough to leave untracked files behind, so this is
+/// a normal way for the sequence to end, not a rare one.
+fn noteReopen(app: app_mod.App, closed: bool) void {
+    if (!closed) return;
+    app.ui.hint("  Its Xcode window is closed — reopen with: lcc open xcode", .{});
 }
 
 /// Brings the remote-tracking refs up to date before anything is judged by them.
@@ -212,6 +280,17 @@ fn confirmMessage(
     const w = app.gpa;
     try out.appendSlice(w, try std.fmt.allocPrint(w, "Remove worktree {s}?\n", .{label}));
     try out.appendSlice(w, try std.fmt.allocPrint(w, "    worktree   {s}\n", .{picked.entry.path}));
+    for (attached.xcode.workspaces) |doc| {
+        try out.appendSlice(w, try std.fmt.allocPrint(w, "    xcode      {s}  (open — will be closed)\n", .{
+            doc.name(),
+        }));
+    }
+    // Only reachable under --force; without it, unsaved work stops the run.
+    for (attached.xcode.unsaved) |doc| {
+        try out.appendSlice(w, try std.fmt.allocPrint(w, "    unsaved    {s}  (in Xcode — the changes go too)\n", .{
+            doc.name(),
+        }));
+    }
     for (attached.derived) |item| {
         try out.appendSlice(w, try std.fmt.allocPrint(w, "    build data {s}  ({f})\n", .{
             item.entry.name, ui.bytes(item.size),
@@ -277,12 +356,13 @@ fn disposeBranch(
         return;
     }
 
-    repo.deleteBranch(branch, d.needsForce()) catch {
-        app.ui.warn("Could not delete branch {s}", .{branch});
+    const forced = repo.deleteVerified(d) catch {
+        app.ui.warn("Could not delete branch {s} — {s}", .{ branch, git.last_error });
         app.ui.hint("  Delete manually with: git branch -D {s}", .{branch});
         return;
     };
     app.ui.success("Deleted branch {f}", .{ui.cyan(branch)});
+    if (forced) app.ui.hint("  git's own check could not see the merge — used -D.", .{});
 }
 
 fn purgeDerived(app: app_mod.App, sized: []const dd.Sized, root: []const u8) !u64 {
@@ -404,9 +484,19 @@ fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
 
     for (picked) |row| {
         if (row.worktree) |entry| {
+            // Same rule as the single-worktree path: unsaved work outranks a merged
+            // branch. The row is skipped whole, since the worktree still holds it.
+            if (row.attached.xcode.unsaved.len > 0 and !opts.force) {
+                app.ui.warn("Kept {f} — Xcode has unsaved changes in it", .{ui.cyan(row.branch)});
+                app.ui.hint("  Save them there, or rerun with: lcc remove --merged --force", .{});
+                continue;
+            }
+            const closed = closeXcode(app, row.attached.xcode);
+
             repo.removeWorktree(entry.path, opts.force) catch {
                 app.ui.warn("Kept {f} — {s}", .{ ui.cyan(row.branch), git.last_error });
                 app.ui.hint("  Retry with: lcc remove --merged --force", .{});
+                noteReopen(app, closed);
                 continue;
             };
             worktrees_gone += 1;
@@ -417,13 +507,14 @@ fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
         }
 
         if (opts.keep_branch) continue;
-        repo.deleteBranch(row.branch, row.disposition.needsForce()) catch {
-            app.ui.warn("Could not delete branch {s}", .{row.branch});
+        const forced = repo.deleteVerified(row.disposition) catch {
+            app.ui.warn("Could not delete branch {s} — {s}", .{ row.branch, git.last_error });
             app.ui.hint("  Delete manually with: git branch -D {s}", .{row.branch});
             continue;
         };
         branches_gone += 1;
         app.ui.success("Deleted branch {f}", .{ui.cyan(row.branch)});
+        if (forced) app.ui.hint("  git's own check could not see the merge — used -D.", .{});
     }
 
     app.ui.info("", .{});
@@ -479,18 +570,29 @@ fn attach(
         try dd.list(app.gpa, app.io, dd_root);
     const cp_all = try cp.list(app.gpa, app.io, cp_root);
 
+    // Xcode is asked once for the whole batch, the same way `du` is: what it has
+    // open does not change per row, only which row each document belongs to.
+    const held: xcode.Open = if (opts.keep_xcode) .{} else try xcode.openDocuments(app.gpa, app.io);
+    if (held.unanswered) {
+        app.ui.warn("Could not ask Xcode what it has open — it may be holding some of these.", .{});
+        app.ui.hint("  {s}", .{automation_hint});
+    }
+
     var paths: std.ArrayList([]const u8) = .empty;
     const derived = try app.gpa.alloc([]dd.Entry, rows.len);
     const sessions = try app.gpa.alloc([]cp.Entry, rows.len);
+    const in_xcode = try app.gpa.alloc(xcode.Open, rows.len);
 
     for (rows, 0..) |row, i| {
         const entry = row.worktree orelse {
             derived[i] = &.{};
             sessions[i] = &.{};
+            in_xcode[i] = .{};
             continue;
         };
         derived[i] = try dd.forWorktree(app.gpa, app.io, dd_all, entry.path);
         sessions[i] = try cp.forWorktree(app.gpa, app.io, cp_all, entry.path);
+        in_xcode[i] = try held.inside(app.gpa, app.io, entry.path);
         for (derived[i]) |e| try paths.append(app.gpa, e.path);
         for (sessions[i]) |e| try paths.append(app.gpa, e.path);
     }
@@ -524,6 +626,7 @@ fn attach(
             .derived = dd_sized,
             .sessions = cp_sized,
             .spent = try scanner.projectDirs(session_dirs),
+            .xcode = in_xcode[i],
         };
     }
 }
@@ -553,15 +656,27 @@ fn rowLabel(
             ui.count(row.attached.spent.counts.contextTokens()),
         });
 
-    return std.fmt.allocPrint(gpa, "{f}  {f}  {f}  {f}  {s}", .{
+    const where = if (row.worktree) |entry|
+        disk.abbreviate(gpa, environ, entry.path)
+    else
+        "branch only — no worktree left";
+
+    // A row Xcode is holding says so: closing that window is part of what ticking
+    // the row does, and unsaved work in it is what will hold the row back.
+    const note = if (row.attached.xcode.unsaved.len > 0)
+        "  — unsaved in Xcode"
+    else if (row.attached.xcode.workspaces.len > 0)
+        "  — open in Xcode"
+    else
+        "";
+
+    return std.fmt.allocPrint(gpa, "{f}  {f}  {f}  {f}  {s}{s}", .{
         ui.pad(row.branch, branch_width),
         ui.pad(row.reason(gpa), reason_width),
         ui.pad(reclaim, 8),
         ui.pad(spent, 7),
-        if (row.worktree) |entry|
-            disk.abbreviate(gpa, environ, entry.path)
-        else
-            "branch only — no worktree left",
+        where,
+        note,
     });
 }
 
@@ -655,4 +770,22 @@ test "a bulk row shows what it frees and what it spent" {
     }).withMergedPr(412);
     const pr_label = try rowLabel(arena, &environ, by_pr, 22, 11, .{});
     try std.testing.expect(std.mem.indexOf(u8, pr_label, "merged #412") != null);
+
+    // A worktree Xcode still has open says so, and unsaved work in it says that
+    // instead — the row is about to be held back rather than closed.
+    const doc: xcode.Document = .{
+        .app = "/Applications/Xcode.app",
+        .path = "/Users/me/Projects/App/.lcc/worktrees/pe-101/App.xcodeproj",
+        .resolved = "/Users/me/Projects/App/.lcc/worktrees/pe-101/App.xcodeproj",
+    };
+
+    var opened = row;
+    opened.attached.xcode = .{ .workspaces = &.{doc} };
+    const open_label = try rowLabel(arena, &environ, opened, 22, 11, .{});
+    try std.testing.expect(std.mem.indexOf(u8, open_label, "open in Xcode") != null);
+
+    var dirty = row;
+    dirty.attached.xcode = .{ .workspaces = &.{doc}, .unsaved = &.{doc} };
+    const dirty_label = try rowLabel(arena, &environ, dirty, 22, 11, .{});
+    try std.testing.expect(std.mem.indexOf(u8, dirty_label, "unsaved in Xcode") != null);
 }
