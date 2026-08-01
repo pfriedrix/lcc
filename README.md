@@ -165,7 +165,7 @@ Every key is always present; absent values are `null`, never dropped.
 | `worktree.matched_by` | how an existing worktree was recognised — `branch` (exact name) or `issue` (the `PE-N` matched, i.e. the issue was renamed). `null` for one this run created |
 | `worktree.is_cwd` | whether this very process is standing in it, which is what tells a caller there is nothing left to open |
 | `worktree.created` / `base` | the strategy (`new`, `reused_local`, `tracking_remote`) and what a new branch was cut from; `null` when the worktree already existed |
-| `mcp` | the local-scope MCP servers a session launched through lcc would get, and the file passed as `--mcp-config`; `null` when the repo has none. A caller that is already running cannot be handed servers retroactively — this is here so it can tell whether a missing server is one lcc would have supplied |
+| `mcp` | the local-scope MCP servers a session launched through lcc would get, and the file passed as `--mcp-config`; `null` when there are none to carry, including when `mcpCarry` filters them all. A caller that is already running cannot be handed servers retroactively — this is here so it can tell whether a missing server is one lcc would have supplied |
 
 Failures come back in the same shape, on stdout, with exit code 1:
 
@@ -307,7 +307,7 @@ Session transcripts are what `claude --resume` replays — check before deleting
 | `startTaskCommand` | `""` | Passed to `claude` as its first argument. Placeholders: `{identifier}`, `{branch}`, `{url}` |
 | `linkPatterns` | `[".env", ".env.*", "CLAUDE.md", "CLAUDE.local.md", ".claude/settings.local.json"]` | Which files to symlink into each worktree |
 | `linkExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
-| `mcpCarry` | absent — all of them | Which of the repo's local-scope MCP servers are worth carrying |
+| `mcpCarry` | absent — all of them | Which local-scope MCP servers to carry; setup accepts a comma-separated list, `all`, or `none` |
 | `clientId` | built-in | Linear OAuth application. Override with `LCC_CLIENT_ID` or `lcc auth setup --client-id <id>` |
 
 `{repoRoot}` and `{repoParent}` always resolve against the **main** worktree, so running `lcc` from inside a worktree puts the next one beside its siblings instead of nesting it one level deeper.
@@ -364,7 +364,7 @@ So `lcc start` and `lcc open` read the repo's local-scope servers and pass them 
 
 Two things this cannot do. A server that was never authenticated stays unauthenticated — `/mcp` in a session is the only thing that fixes that, and the worktree is not why it is dark. And a session that is *already* running cannot be handed servers retroactively, which is why `lcc start --json` reports what a launch would have carried instead of carrying it.
 
-`mcpCarry` narrows the set to the names it lists, matched case-insensitively, keeping the file's order. Carrying everything is the default because it is the answer that never surprises anyone, but it is not free: a server the work never calls still spends every agent in the session its name and its instructions, on every turn — and a pipeline that fans out to twenty subagents pays that twenty times over. Measured across eight pipeline runs in this repo's worktrees, `linear-server` and `xcode` accounted for every local-scope call that was made; `clickup`, `notion` and `sentry` were carried into all eight and never touched once. A name the repo does not have is ignored, and a list that matches nothing launches without MCP rather than with an empty config — leaving the key out is how you say "all of them".
+`mcpCarry` narrows the set to the names it lists, matched case-insensitively, keeping the file's order. `lcc setup` accepts a comma-separated list, `all` to remove the key and carry every server, or `none` to write an empty list and carry none. Carrying everything is the default because it is the answer that never surprises anyone, but it is not free: a server the work never calls still spends every agent in the session its name and its instructions, on every turn — and a pipeline that fans out to twenty subagents pays that twenty times over. Measured across eight pipeline runs in this repo's worktrees, `linear-server` and `xcode` accounted for every local-scope call that was made; `clickup`, `notion` and `sentry` were carried into all eight and never touched once. A name the repo does not have is ignored, and a list that matches nothing launches without MCP rather than with an empty config.
 
 ## Layout
 

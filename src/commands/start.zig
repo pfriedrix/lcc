@@ -540,9 +540,10 @@ const Report = struct {
     /// `startTaskCommand` is unset.
     start_task_command: ?[]const u8,
     /// The local-scope MCP servers lcc would carry into the worktree, and the file
-    /// it would pass as `--mcp-config`. Null when the repo has none. A caller that
-    /// is *already* running cannot be given servers retroactively — this is here so
-    /// it can say what a session launched through lcc would have.
+    /// it would pass as `--mcp-config`. Null when there are none to carry, including
+    /// when `mcpCarry` filters them all. A caller that is *already* running cannot be
+    /// given servers retroactively — this is here so it can say what a session
+    /// launched through lcc would have.
     mcp: ?ReportMcp,
 };
 
