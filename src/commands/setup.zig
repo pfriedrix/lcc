@@ -14,6 +14,22 @@ pub fn run(app: app_mod.App) !void {
     app.ui.info("", .{});
     app.ui.flush();
 
+    const alternate_agent: config.Agent = switch (cfg.agent) {
+        .claude => .codex,
+        .codex => .claude,
+    };
+    const agent_choices = [_]prompt.Item{
+        .{ .label = agentName(cfg.agent), .haystack = @tagName(cfg.agent) },
+        .{ .label = agentName(alternate_agent), .haystack = @tagName(alternate_agent) },
+    };
+    const agent_index = try prompt.search(
+        app.gpa,
+        app.io,
+        "Coding agent:",
+        &agent_choices,
+    ) orelse std.process.exit(app_mod.cancelled_exit_code);
+    const agent = if (agent_index == 0) cfg.agent else alternate_agent;
+
     const start_task_command = try prompt.input(
         app.gpa,
         app.io,
@@ -44,27 +60,39 @@ pub fn run(app: app_mod.App) !void {
         joined_patterns,
     ) orelse std.process.exit(app_mod.cancelled_exit_code);
 
-    const joined_mcp = if (cfg.mcpCarry) |servers|
-        if (servers.len == 0) "none" else try std.mem.join(app.gpa, ", ", servers)
-    else
-        "all";
-    const mcp_raw = try prompt.input(
-        app.gpa,
-        app.io,
-        "MCP servers to carry (comma-separated; all or none):",
-        joined_mcp,
-    ) orelse std.process.exit(app_mod.cancelled_exit_code);
+    var mcp_carry: ?config.McpCarry = null;
+    if (agent == .claude) {
+        const joined_mcp = if (cfg.mcpCarry) |servers|
+            if (servers.len == 0) "none" else try std.mem.join(app.gpa, ", ", servers)
+        else
+            "all";
+        const mcp_raw = try prompt.input(
+            app.gpa,
+            app.io,
+            "MCP servers to carry (comma-separated; all or none):",
+            joined_mcp,
+        ) orelse std.process.exit(app_mod.cancelled_exit_code);
+        mcp_carry = try parseMcpCarry(app.gpa, mcp_raw);
+    }
 
     try config.save(app.gpa, app.io, app.environ, .{
+        .agent = agent,
         .startTaskCommand = start_task_command,
         .worktreeTemplate = worktree_template,
         .activeStates = try splitList(app.gpa, states_raw),
         .linkPatterns = try splitList(app.gpa, patterns_raw),
-        .mcpCarry = try parseMcpCarry(app.gpa, mcp_raw),
+        .mcpCarry = mcp_carry,
     });
 
     const where = try config.path(app.gpa, app.environ);
     app.ui.success("Saved to {s}", .{where});
+}
+
+fn agentName(agent: config.Agent) []const u8 {
+    return switch (agent) {
+        .claude => "Claude Code",
+        .codex => "Codex",
+    };
 }
 
 fn splitList(gpa: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
