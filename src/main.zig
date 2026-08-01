@@ -307,6 +307,7 @@ test {
     _ = @import("xcode.zig");
     _ = @import("commands/list.zig");
     _ = @import("commands/remove.zig");
+    _ = @import("commands/setup.zig");
     _ = @import("commands/start.zig");
     _ = @import("commands/stats.zig");
 }
@@ -320,6 +321,7 @@ fn describe(err: anyerror) []const u8 {
         error.UnknownOption => "Unknown option. Run `lcc --help`.",
         error.MissingOptionValue => "Missing value for option. Run `lcc --help`.",
         error.MissingClientId => "auth setup requires --client-id <id>.",
+        error.InvalidConfig => "Configuration is invalid. Fix ~/.config/lcc/config.json.",
         error.TooManyArguments => "Too many arguments. Run `lcc --help`.",
         error.NoHomeDirectory => "HOME is not set.",
         else => @errorName(err),

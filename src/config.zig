@@ -48,6 +48,28 @@ pub const Stored = struct {
     envExclude: ?[]const []const u8 = null,
     activeStates: ?[]const []const u8 = null,
     startTaskCommand: ?[]const u8 = null,
+    /// Which of the repo's local-scope MCP servers a worktree is worth handing.
+    /// Absent carries all of them. A server the work never calls still costs every
+    /// agent in the session its name and its instructions, on every turn.
+    mcpCarry: ?[]const []const u8 = null,
+};
+
+/// How a settings update changes the physical `mcpCarry` key. `all` removes the
+/// key, preserving the distinction between carrying everything and carrying none.
+pub const McpCarry = union(enum) {
+    all,
+    only: []const []const u8,
+};
+
+/// Values to merge into the stored configuration. A null field is left untouched.
+pub const Patch = struct {
+    clientId: ?[]const u8 = null,
+    worktreeTemplate: ?[]const u8 = null,
+    linkPatterns: ?[]const []const u8 = null,
+    linkExclude: ?[]const []const u8 = null,
+    activeStates: ?[]const []const u8 = null,
+    startTaskCommand: ?[]const u8 = null,
+    mcpCarry: ?McpCarry = null,
 };
 
 pub const Config = struct {
@@ -57,6 +79,7 @@ pub const Config = struct {
     linkExclude: []const []const u8,
     activeStates: []const []const u8,
     startTaskCommand: []const u8,
+    mcpCarry: ?[]const []const u8,
 };
 
 pub fn dir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
@@ -90,7 +113,7 @@ pub fn loadStored(
     return std.json.parseFromSliceLeaky(Stored, gpa, raw, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
-    }) catch return .{};
+    }) catch return error.InvalidConfig;
 }
 
 pub fn load(
@@ -110,6 +133,7 @@ pub fn load(
         .linkExclude = stored.linkExclude orelse stored.envExclude orelse &default_link_exclude,
         .activeStates = stored.activeStates orelse &default_active_states,
         .startTaskCommand = stored.startTaskCommand orelse "",
+        .mcpCarry = stored.mcpCarry,
     };
 }
 
@@ -119,7 +143,7 @@ pub fn save(
     gpa: std.mem.Allocator,
     io: Io,
     environ: *const std.process.Environ.Map,
-    patch: Stored,
+    patch: Patch,
 ) !void {
     var merged = try loadStored(gpa, io, environ);
     if (patch.clientId) |v| merged.clientId = v;
@@ -135,6 +159,10 @@ pub fn save(
     }
     if (patch.activeStates) |v| merged.activeStates = v;
     if (patch.startTaskCommand) |v| merged.startTaskCommand = v;
+    if (patch.mcpCarry) |carry| switch (carry) {
+        .all => merged.mcpCarry = null,
+        .only => |v| merged.mcpCarry = v,
+    };
 
     const body = try std.json.Stringify.valueAlloc(gpa, merged, .{
         .whitespace = .indent_2,

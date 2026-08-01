@@ -46,17 +46,26 @@ pub fn claudeJsonPath(
 }
 
 /// The local-scope servers `repo_root` owns, written where `claude --mcp-config`
-/// can read them. Null when the repo has none — then there is nothing to carry and
-/// no flag to pass. A malformed or unreadable `~/.claude.json` is also null: MCP
-/// servers are a convenience, and failing a worktree over them would be worse than
-/// launching without.
+/// can read them. Null when the repo has none or `mcpCarry` excludes them all — then
+/// there is no flag to pass. A malformed or unreadable `~/.claude.json` is also null:
+/// MCP servers are a convenience, and failing a worktree over them would be worse
+/// than launching without.
+///
+/// `mcpCarry` in lcc's own config narrows the set. The allow-list is read here rather
+/// than passed in because this is already the one place that knows a worktree needs
+/// servers handed to it at all, and both call sites would otherwise thread a list they
+/// have no other use for.
 pub fn carry(
     gpa: std.mem.Allocator,
     io: Io,
     environ: *const std.process.Environ.Map,
     repo_root: []const u8,
 ) !?Carried {
-    const servers = readServers(gpa, io, environ, repo_root) orelse return null;
+    const found = readServers(gpa, io, environ, repo_root) orelse return null;
+    if (found.count() == 0) return null;
+
+    const stored = try config.loadStored(gpa, io, environ);
+    const servers = if (stored.mcpCarry) |allow| try only(gpa, found, allow) else found;
     if (servers.count() == 0) return null;
 
     // `{"mcpServers": {…}}` — the shape `--mcp-config` reads, same as `.mcp.json`.
@@ -72,6 +81,26 @@ pub fn carry(
     try cwd.writeFile(io, .{ .sub_path = path, .data = body });
 
     return .{ .path = path, .names = try gpa.dupe([]const u8, servers.keys()) };
+}
+
+/// `servers` reduced to the names `allow` lists, in the file's order so the hint lcc
+/// prints still matches what Claude Code loads. A name in `allow` this repo does not
+/// have is not an error: the list is written once and outlives any one repo's set.
+fn only(
+    gpa: std.mem.Allocator,
+    servers: std.json.ObjectMap,
+    allow: []const []const u8,
+) !std.json.ObjectMap {
+    var kept: std.json.ObjectMap = .empty;
+    for (servers.keys(), servers.values()) |name, value| {
+        for (allow) |wanted| {
+            if (std.ascii.eqlIgnoreCase(name, wanted)) {
+                try kept.put(gpa, name, value);
+                break;
+            }
+        }
+    }
+    return kept;
 }
 
 /// One file per repository, named after it the way Claude Code names its project
@@ -228,4 +257,53 @@ test "carry is null when there is nothing to carry" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = broken, .data = "{\"projects\": " });
     try environ.put("LCC_CLAUDE_JSON", broken);
     try std.testing.expect((try carry(arena, io, &environ, "/repo/app")) == null);
+}
+
+test "mcpCarry narrows what a worktree is handed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const json_path = try std.fs.path.join(arena, &.{ base, "claude.json" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = json_path, .data = testing.claude_json });
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("HOME", base);
+    try environ.put("LCC_CLAUDE_JSON", json_path);
+
+    // The list matches names case-insensitively but keeps the source file's order.
+    // A name this repo does not have is simply not found.
+    try config.save(arena, io, &environ, .{ .mcpCarry = .{ .only = &.{ "XCODE", "linear-server", "notion" } } });
+    const narrowed = (try carry(arena, io, &environ, "/repo/app")).?;
+    try std.testing.expectEqual(@as(usize, 2), narrowed.names.len);
+    try std.testing.expectEqualStrings("linear-server", narrowed.names[0]);
+    try std.testing.expectEqualStrings("xcode", narrowed.names[1]);
+
+    const written = try Io.Dir.cwd().readFileAlloc(io, narrowed.path, arena, .limited(1 << 20));
+    try std.testing.expect(std.mem.indexOf(u8, written, "linear-server") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "xcode") != null);
+
+    // An allow-list that matches nothing is "launch without MCP", like an empty repo.
+    try config.save(arena, io, &environ, .{ .mcpCarry = .{ .only = &.{"clickup"} } });
+    try std.testing.expect((try carry(arena, io, &environ, "/repo/app")) == null);
+
+    // An empty list is not a way to say "all of them" — that is what leaving it out does.
+    try config.save(arena, io, &environ, .{ .mcpCarry = .{ .only = &.{} } });
+    try std.testing.expect((try carry(arena, io, &environ, "/repo/app")) == null);
+
+    // `all` clears the key and restores the default of carrying every local server.
+    try config.save(arena, io, &environ, .{ .mcpCarry = .all });
+    const all = (try carry(arena, io, &environ, "/repo/app")).?;
+    try std.testing.expectEqual(@as(usize, 2), all.names.len);
+
+    const config_path = try config.path(arena, &environ);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "{\"mcpCarry\": \"linear-server\"}" });
+    try std.testing.expectError(error.InvalidConfig, carry(arena, io, &environ, "/repo/app"));
 }
