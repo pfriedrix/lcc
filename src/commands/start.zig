@@ -1,15 +1,8 @@
-//! `lcc start` — pick an issue (or name one), bootstrap a worktree, launch Claude.
-//!
-//! Two shapes, one path through the work. Interactively it asks what it needs and
-//! ends by handing the terminal to Claude Code. With `--json` it asks nothing,
-//! launches nothing, and prints what it resolved — the shape a caller that is
-//! *already* inside Claude Code can use, so `/start-task` can ask lcc where an
-//! issue lives instead of probing git for the branch and the worktree itself.
-
 const std = @import("std");
 const Io = std.Io;
 const app_mod = @import("../app.zig");
 const claude = @import("../claude.zig");
+const codex = @import("../codex.zig");
 const config = @import("../config.zig");
 const disk = @import("../disk.zig");
 const git = @import("../git.zig");
@@ -29,7 +22,6 @@ pub const Opts = struct {
     all: bool = false,
     /// `PE-256` — resolve that issue directly and skip the picker.
     issue: ?[]const u8 = null,
-    /// Machine mode: JSON on stdout, no prompts, no Claude Code.
     json: bool = false,
     /// Base for a branch that does not exist yet. Interactive mode asks when it
     /// cannot tell; `--json` has nobody to ask, so it takes this or the default branch.
@@ -89,7 +81,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
 
     // The main checkout already *is* the directory those servers are keyed on, so
     // handing them back would only duplicate what Claude Code loads by itself.
-    const carried = if (wt.is_main_checkout)
+    const carried = if (cfg.agent == .codex or wt.is_main_checkout)
         null
     else
         try mcp.carry(app.gpa, app.io, app.environ, repo.root);
@@ -99,14 +91,20 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         return;
     }
 
+    const launch_label = switch (cfg.agent) {
+        .claude => "Launching Claude Code",
+        .codex => "Launching Codex",
+    };
     app.ui.info("", .{});
-    app.ui.info("{f} in {f}", .{ ui.bold("Launching Claude Code"), ui.dim(wt.path) });
+    app.ui.info("{f} in {f}", .{ ui.bold(launch_label), ui.dim(wt.path) });
     app.ui.hint("Linear: {s}", .{selected.url});
     // Only says anything when this issue has been worked on before — picking up
     // a task should show what it has already cost.
-    const spent = usage.forWorktree(app.gpa, app.io, app.environ, wt.path);
-    if (!spent.empty()) {
-        app.ui.hint("Spent here: {f}", .{usage.brief(spent, app_mod.nowSeconds(app.io))});
+    if (cfg.agent == .claude) {
+        const spent = usage.forWorktree(app.gpa, app.io, app.environ, wt.path);
+        if (!spent.empty()) {
+            app.ui.hint("Spent here: {f}", .{usage.brief(spent, app_mod.nowSeconds(app.io))});
+        }
     }
     if (carried) |c| {
         app.ui.hint("MCP: carrying {d} local server(s) from {s} — {s}", .{
@@ -118,20 +116,23 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     app.ui.info("", .{});
     app.ui.flush();
 
-    var extra: std.ArrayList([]const u8) = .empty;
-    if (carried) |c| try extra.appendSlice(app.gpa, &.{ "--mcp-config", c.path });
-
     const trimmed_command = std.mem.trim(u8, cfg.startTaskCommand, " \t");
-    if (trimmed_command.len > 0) {
-        // `--mcp-config` takes a *list* of files, so it swallows any plain argument
-        // that follows — the prompt included, which then fails to be found as a
-        // config file. `--` ends the list. Only emitted alongside a flag, so a
-        // launch without MCP servers passes the prompt exactly as it always has.
-        if (extra.items.len > 0) try extra.append(app.gpa, "--");
-        try extra.append(app.gpa, try expandCommand(app.gpa, cfg.startTaskCommand, selected, wt.branch));
-    }
-
-    const code = try claude.launch(app.gpa, app.io, wt.path, extra.items);
+    const initial_prompt = if (trimmed_command.len > 0)
+        try expandCommand(app.gpa, cfg.startTaskCommand, selected, wt.branch)
+    else
+        null;
+    const code = switch (cfg.agent) {
+        .claude => blk: {
+            var extra: std.ArrayList([]const u8) = .empty;
+            if (carried) |c| try extra.appendSlice(app.gpa, &.{ "--mcp-config", c.path });
+            if (initial_prompt) |value| {
+                if (extra.items.len > 0) try extra.append(app.gpa, "--");
+                try extra.append(app.gpa, value);
+            }
+            break :blk try claude.launch(app.gpa, app.io, wt.path, extra.items);
+        },
+        .codex => try codex.launch(app.gpa, app.io, wt.path, .{ .start = initial_prompt }),
+    };
     std.process.exit(code);
 }
 
@@ -536,8 +537,6 @@ const Report = struct {
     worktree: ReportWorktree,
     repo: ReportRepo,
     links: ReportLinks,
-    /// What lcc would hand Claude Code, placeholders expanded. Null when
-    /// `startTaskCommand` is unset.
     start_task_command: ?[]const u8,
     /// The local-scope MCP servers lcc would carry into the worktree, and the file
     /// it would pass as `--mcp-config`. Null when there are none to carry, including
@@ -1021,10 +1020,7 @@ fn expandCommand(
             if (std.mem.indexOfScalarPos(u8, template, i, '}')) |close| {
                 const key = template[i + 1 .. close];
                 const value: ?[]const u8 =
-                    if (std.mem.eql(u8, key, "identifier")) issue.identifier
-                    else if (std.mem.eql(u8, key, "branch")) branch
-                    else if (std.mem.eql(u8, key, "url")) issue.url
-                    else null;
+                    if (std.mem.eql(u8, key, "identifier")) issue.identifier else if (std.mem.eql(u8, key, "branch")) branch else if (std.mem.eql(u8, key, "url")) issue.url else null;
                 if (value) |v| {
                     try out.appendSlice(gpa, v);
                     i = close + 1;

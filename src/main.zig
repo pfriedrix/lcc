@@ -1,6 +1,3 @@
-//! lcc — pick a Linear issue, get a git worktree with the gitignored files
-//! symlinked in and Claude Code running.
-
 const std = @import("std");
 const Io = std.Io;
 
@@ -13,6 +10,7 @@ const remove_cmd = @import("commands/remove.zig");
 const setup_cmd = @import("commands/setup.zig");
 const start_cmd = @import("commands/start.zig");
 const stats_cmd = @import("commands/stats.zig");
+const config = @import("config.zig");
 const ui = @import("ui.zig");
 
 const version = "0.1.0";
@@ -20,12 +18,12 @@ const version = "0.1.0";
 const usage =
     \\Usage: lcc <command> [options]
     \\
-    \\Pick a Linear issue → git worktree + symlinked local files + Claude Code
+    \\Pick a Linear issue → git worktree + symlinked local files + coding agent
     \\
     \\Commands:
     \\  start [PE-N]             Bootstrap a worktree for an issue — picker when none is named
     \\    --all                  show all assigned issues regardless of activeStates filter
-    \\    --json                 print what was resolved instead of launching Claude (needs PE-N)
+    \\    --json                 print what was resolved instead of launching an agent (needs PE-N)
     \\    --base <ref>           base a new branch on <ref> instead of asking
     \\    --repo <path>          the repository the issue's code is in, when lcc cannot
     \\                           tell — it remembers the answer per issue, and finds a
@@ -44,9 +42,9 @@ const usage =
     \\  stats                    What each worktree has spent on Claude Code
     \\    --models               break every worktree down by model
     \\    --json                 print the numbers instead of a table
-    \\  open | o [claude|xcode]  Open a worktree — Claude Code (default) or Xcode
-    \\                           resumes when the worktree has transcripts, else starts fresh
-    \\    --no-resume            never pass --resume, even when it has them
+    \\  open | o [claude|codex|xcode]
+    \\                           Open a worktree in the configured agent, or override it
+    \\    --no-resume            start the selected agent fresh
     \\  remove | rm              Remove a worktree, its branch, and its Xcode build data
     \\    --merged               bulk: every worktree and branch already merged
     \\    --local                decide from local refs only — no fetch, no asking
@@ -201,8 +199,12 @@ fn openCommand(app: app_mod.App, args: []const []const u8) !void {
         } else return error.TooManyArguments;
     }
 
-    const target = open_cmd.resolveTarget(target_arg) orelse {
-        app.ui.fail("Unknown open target '{s}'. Use one of: claude, xcode.", .{target_arg.?});
+    const configured = if (target_arg == null)
+        (try config.load(app.gpa, app.io, app.environ)).agent
+    else
+        config.Agent.claude;
+    const target = open_cmd.resolveTarget(target_arg, configured) orelse {
+        app.ui.fail("Unknown open target '{s}'. Use one of: claude, codex, xcode.", .{target_arg.?});
         std.process.exit(1);
     };
     return open_cmd.run(app, target, no_resume);
@@ -316,6 +318,7 @@ fn describe(err: anyerror) []const u8 {
     return switch (err) {
         error.NotAGitRepository => "Not inside a git repository. Run `lcc` from within your repo.",
         error.ClaudeNotFound => "Could not find `claude` on PATH. Install Claude Code: https://docs.claude.com/en/docs/claude-code",
+        error.CodexNotFound => "Could not find `codex` on PATH. Install Codex CLI: https://developers.openai.com/codex/cli/",
         error.NotATerminal => "lcc needs an interactive terminal for this command.",
         error.UnknownCommand => "Unknown command. Run `lcc --help`.",
         error.UnknownOption => "Unknown option. Run `lcc --help`.",

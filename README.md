@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.16-orange.svg)](#build)
 
-One command to go from "I should work on PE-N" to a clean git worktree with your gitignored files symlinked in and Claude Code already running.
+One command to go from "I should work on PE-N" to a clean git worktree with your gitignored files symlinked in and your configured coding agent already running.
 
 ```
 $ lcc start
@@ -16,14 +16,14 @@ $ lcc start
 ✓ Linked .claude/settings.local.json
 ✓ Linked .env
 ✓ Linked .env.local
-[claude opens in worktree]
+[configured agent opens in worktree]
 ```
 
-A single ~1.5 MB binary with no runtime. It shells out to `git`, `claude`, `gh`, `open`, `du`, `defaults` and `plutil` — everything else is the Zig standard library plus macOS's own Security framework.
+A single ~1.5 MB binary with no runtime. It shells out to `git`, the configured `claude` or `codex` executable, `gh`, `open`, `du`, `defaults` and `plutil` — everything else is the Zig standard library plus macOS's own Security framework.
 
 ## Build
 
-Requires [Zig 0.16](https://ziglang.org/download/) and macOS.
+Requires [Zig 0.16](https://ziglang.org/download/) and macOS. Install either [Claude Code](https://docs.anthropic.com/en/docs/claude-code/setup) or [Codex CLI](https://developers.openai.com/codex/cli/) and make its `claude` or `codex` executable available on `PATH`.
 
 ```bash
 git clone https://github.com/pfriedrix/lcc ~/Documents/Projects/lcc
@@ -56,14 +56,16 @@ For headless machines, `lcc auth --token <pat>` stores a Linear personal API tok
 
 ```bash
 lcc                  # print the command list
-lcc start            # pick an issue, bootstrap worktree, launch Claude
+lcc start            # pick an issue, bootstrap worktree, launch the configured agent
 lcc start PE-256     # that issue, no picker
-lcc start PE-256 --json   # resolve it and print the result instead of launching Claude
+lcc start PE-256 --json   # resolve it and print the result instead of launching an agent
 lcc start --all      # ignore the activeStates filter
-lcc setup            # configure startTaskCommand, worktreeTemplate, activeStates, linkPatterns
+lcc setup            # choose Claude Code or Codex and configure worktree behavior
 lcc list             # dashboard of every worktree (--local to skip the network columns)
 lcc stats            # what each worktree has spent on Claude Code (--models for the breakdown)
-lcc open             # pick a worktree and resume Claude in it, if it has sessions (--no-resume for fresh)
+lcc open             # pick a worktree and open the configured agent
+lcc open claude      # explicitly open Claude Code, overriding the configured agent
+lcc open codex       # explicitly resume Codex's latest session in that worktree
 lcc open xcode       # pick a worktree and open it in Xcode instead
 lcc remove           # pick a worktree, remove it + its branch + Xcode build data
 lcc remove --merged  # bulk: every worktree and branch whose work already landed
@@ -74,6 +76,8 @@ lcc auth --logout    # clear the token from the Keychain
 ```
 
 `ls`, `o` and `rm` are accepted as aliases for `list`, `open` and `remove`.
+
+Codex support covers setup, start, and open. Token statistics and session cleanup continue to read Claude Code transcripts; they do not inspect or remove Codex sessions.
 
 ### The dashboard
 
@@ -133,7 +137,7 @@ Running `lcc start PE-256` twice therefore opens the same worktree twice, whatev
 
 ### `lcc start --json`
 
-Machine mode, for a caller that is already inside Claude Code — a `/start-task` slash command that owns the issue tracker can use it instead of probing git for the branch and the worktree itself. It requires an identifier, asks nothing (a new branch comes off `--base` or the default branch), and does not launch Claude Code, so it is safe to call from inside a session lcc itself started.
+Machine mode, for a caller that is already inside an agent session — a `/start-task` slash command that owns the issue tracker can use it instead of probing git for the branch and the worktree itself. It requires an identifier, asks nothing (a new branch comes off `--base` or the default branch), and does not launch an agent, so it is safe to call from inside a session lcc itself started.
 
 ```bash
 $ lcc start PE-256 --json
@@ -165,7 +169,7 @@ Every key is always present; absent values are `null`, never dropped.
 | `worktree.matched_by` | how an existing worktree was recognised — `branch` (exact name) or `issue` (the `PE-N` matched, i.e. the issue was renamed). `null` for one this run created |
 | `worktree.is_cwd` | whether this very process is standing in it, which is what tells a caller there is nothing left to open |
 | `worktree.created` / `base` | the strategy (`new`, `reused_local`, `tracking_remote`) and what a new branch was cut from; `null` when the worktree already existed |
-| `mcp` | the local-scope MCP servers a session launched through lcc would get, and the file passed as `--mcp-config`; `null` when there are none to carry, including when `mcpCarry` filters them all. A caller that is already running cannot be handed servers retroactively — this is here so it can tell whether a missing server is one lcc would have supplied |
+| `mcp` | the local-scope MCP servers a Claude session launched through lcc would get, and the file passed as `--mcp-config`; always `null` for Codex, and also `null` when Claude has none to carry. A caller that is already running cannot be handed servers retroactively |
 
 Failures come back in the same shape, on stdout, with exit code 1:
 
@@ -174,6 +178,10 @@ Failures come back in the same shape, on stdout, with exit code 1:
 ```
 
 Codes: `usage`, `not_authenticated`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`, `worktree_path_exists`, `git_failed`, `bad_repo`, `repo_unconfirmed` — the last one is the picker above in a mode with nobody to ask: pass `--repo <path>`, or run it once interactively and the answer is remembered. Progress lines and the human-readable error go to stderr, so stdout holds nothing but the payload — including git's own output, which is captured rather than inherited in this mode.
+
+### `lcc open`
+
+Bare `lcc open` follows the agent selected by `lcc setup`. `lcc open claude`, `lcc open codex`, and `lcc open xcode` override that preference case-insensitively. Claude resumes only when the worktree has transcripts; Codex runs `codex resume --last`. Pass `--no-resume` to start either agent fresh. Xcode behavior is unchanged.
 
 ### `lcc open xcode`
 
@@ -332,13 +340,16 @@ Session transcripts are what `claude --resume` replays — check before deleting
 
 | Key | Default | Meaning |
 |---|---|---|
+| `agent` | `"claude"` | Coding agent launched by `start` and bare `open`: `"claude"` or `"codex"` |
 | `worktreeTemplate` | `{repoRoot}/.lcc/worktrees/{branchLeaf}` | Where worktrees go. Placeholders: `{repoRoot}`, `{repoParent}`, `{repoName}`, `{branch}`, `{branchLeaf}` |
 | `activeStates` | `["Todo", "In Progress"]` | Which Linear states to offer, in this order |
-| `startTaskCommand` | `""` | Passed to `claude` as its first argument. Placeholders: `{identifier}`, `{branch}`, `{url}` |
+| `startTaskCommand` | `""` | Passed to the configured agent as its initial prompt. Placeholders: `{identifier}`, `{branch}`, `{url}` |
 | `linkPatterns` | `[".env", ".env.*", "CLAUDE.md", "CLAUDE.local.md", ".claude/settings.local.json"]` | Which files to symlink into each worktree |
 | `linkExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
-| `mcpCarry` | absent — all of them | Which local-scope MCP servers to carry; setup accepts a comma-separated list, `all`, or `none` |
+| `mcpCarry` | absent — all of them | Which local-scope MCP servers to carry into Claude; setup accepts a comma-separated list, `all`, or `none` |
 | `clientId` | built-in | Linear OAuth application. Override with `LCC_CLIENT_ID` or `lcc auth setup --client-id <id>` |
+
+`lcc setup` prompts for the coding agent first. Selecting Codex skips the Claude-only MCP prompt and preserves any existing `mcpCarry` value, so switching back to Claude restores the previous selection.
 
 `{repoRoot}` and `{repoParent}` always resolve against the **main** worktree, so running `lcc` from inside a worktree puts the next one beside its siblings instead of nesting it one level deeper.
 
@@ -390,7 +401,7 @@ A self-signed certificate works and never expires on someone else's schedule (Ke
 
 Symlinks cannot solve the same problem for MCP servers, because they are not in the repository. `claude mcp add` without `-s user` stores a server under `projects["<absolute cwd>"].mcpServers` in `~/.claude.json` — the key *is* the directory. A worktree is a different directory, so it starts with none of them: the checkout where `linear-server` was added is the only place it exists.
 
-So `lcc start` and `lcc open` read the repo's local-scope servers and pass them to Claude Code as `--mcp-config <file>`, generated per repo under `~/.config/lcc/mcp/`. Without `--strict-mcp-config` they add to the user, global and plugin scopes rather than replacing them, and the servers keep whatever authentication they already had. `~/.claude.json` itself is only ever read: it is Claude Code's own working state, rewritten whole when a session ends, so an outside write survives only until the next exit.
+When Claude is selected, `lcc start` and `lcc open` read the repo's local-scope servers and pass them to Claude Code as `--mcp-config <file>`, generated per repo under `~/.config/lcc/mcp/`. Codex launches never read this configuration and never receive Claude MCP arguments. Without `--strict-mcp-config` the Claude launch adds servers to the user, global and plugin scopes rather than replacing them, and the servers keep whatever authentication they already had. `~/.claude.json` itself is only ever read: it is Claude Code's own working state, rewritten whole when a session ends, so an outside write survives only until the next exit.
 
 Two things this cannot do. A server that was never authenticated stays unauthenticated — `/mcp` in a session is the only thing that fixes that, and the worktree is not why it is dark. And a session that is *already* running cannot be handed servers retroactively, which is why `lcc start --json` reports what a launch would have carried instead of carrying it.
 
