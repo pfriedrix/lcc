@@ -141,7 +141,9 @@ The plan reaches the agent through `{plan}` in `startTaskCommand`, and what trav
 { "startTaskCommand": "/start-task {identifier} --plan {plan}" }
 ```
 
-A plan is a document, and inlining one would put it in an `argv` element and in the `start_task_command` field of `--json`, which a caller parses — for bytes the agent can read off disk itself. It is resolved to an absolute path, because the agent runs with the worktree as its cwd, and checked before the Keychain is even touched, so a wrong one fails with `plan_not_found` rather than after a worktree exists. Without `--plan`, `{plan}` expands to nothing.
+`{plan}` is the only channel, so `--plan` without it in the template is refused rather than launched. Otherwise the flag's one remaining effect would be to switch plan mode off, leaving the session neither planning here nor holding a plan from anywhere — and `startTaskCommand` is empty by default, so that would be the out-of-the-box behavior.
+
+A plan is a document, and inlining one would put it in an `argv` element and in the `start_task_command` field of `--json`, which a caller parses — for bytes the agent can read off disk itself. It is resolved to an absolute path, because the agent runs with the worktree as its cwd, and checked before the Keychain is even touched: a path that is not there fails with `plan_not_found`, one that is a directory says so, and one that exists but cannot be read comes back as `plan_unreadable` rather than claiming to be missing. Without `--plan`, `{plan}` expands to nothing.
 
 There is no auto-detection: the newest file in `~/.claude/plans` is not picked up on its own.
 
@@ -208,7 +210,7 @@ Failures come back in the same shape, on stdout, with exit code 1:
 { "error": { "code": "issue_not_found", "message": "No issue PE-999 in Linear." } }
 ```
 
-Codes: `usage`, `not_authenticated`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`, `worktree_path_exists`, `git_failed`, `bad_repo`, `plan_not_found`, `repo_unconfirmed` — the last one is the picker above in a mode with nobody to ask: pass `--repo <path>`, or run it once interactively and the answer is remembered. Progress lines and the human-readable error go to stderr, so stdout holds nothing but the payload — including git's own output, which is captured rather than inherited in this mode.
+Codes: `usage`, `not_authenticated`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`, `worktree_path_exists`, `git_failed`, `bad_repo`, `plan_not_found`, `plan_unreadable`, `repo_unconfirmed` — the last one is the picker above in a mode with nobody to ask: pass `--repo <path>`, or run it once interactively and the answer is remembered. Progress lines and the human-readable error go to stderr, so stdout holds nothing but the payload — including git's own output, which is captured rather than inherited in this mode.
 
 ### `lcc open`
 
@@ -375,7 +377,7 @@ Session transcripts are what `claude --resume` replays — check before deleting
 |---|---|---|
 | `worktreeTemplate` | `{repoRoot}/.lcc/worktrees/{branchLeaf}` | Where worktrees go. Placeholders: `{repoRoot}`, `{repoParent}`, `{repoName}`, `{branch}`, `{branchLeaf}` |
 | `activeStates` | `["Todo", "In Progress"]` | Which Linear states to offer, in this order |
-| `startTaskCommand` | `""` | Passed to Claude Code as its initial prompt. Placeholders: `{identifier}`, `{branch}`, `{url}`, `{plan}` (the `--plan` path, empty without it) |
+| `startTaskCommand` | `""` | Passed to Claude Code as its initial prompt. Placeholders: `{identifier}`, `{branch}`, `{url}`, `{plan}` (the `--plan` path, empty without it — and required in the template before `--plan` is accepted) |
 | `linkPatterns` | `[".env", ".env.*", "CLAUDE.md", "CLAUDE.local.md", ".claude/settings.local.json"]` | Which files to symlink into each worktree |
 | `linkExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
 | `mcpCarry` | absent — all of them | Which local-scope MCP servers to carry into Claude; setup accepts a comma-separated list, `all`, or `none` |
