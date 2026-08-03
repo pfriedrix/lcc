@@ -77,6 +77,23 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
 
     const cfg = try config.load(app.gpa, app.io, app.environ);
 
+    // `{plan}` is the only thing that carries a plan to the agent, and
+    // `startTaskCommand` is empty by default — so without the placeholder, `--plan`
+    // has one remaining effect: switching plan mode off. That leaves the session
+    // neither planning here nor holding a plan from elsewhere, which is the one
+    // state this design says cannot exist. The template alone answers it, so it is
+    // answered here: a command that refuses must not first cut a branch and a
+    // worktree it then abandons.
+    if (plan_path != null and !templateCarriesPlan(cfg.startTaskCommand)) {
+        bail(
+            app,
+            opts.json,
+            "usage",
+            "--plan needs {{plan}} in startTaskCommand — nothing else carries it to the agent. Add it with `lcc setup`.",
+            .{},
+        );
+    }
+
     const token = oauth.ensureFreshToken(app.gpa, app.io, cfg.clientId) catch |err| {
         bail(app, opts.json, "auth_failed", "{s}: {s}", .{ @errorName(err), oauth.last_detail });
     };
@@ -122,21 +139,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     else
         null;
 
-    // `{plan}` is the only thing that carries a plan to the agent, and
-    // `startTaskCommand` is empty by default — so without the placeholder, `--plan`
-    // has one remaining effect: switching plan mode off. That leaves the session
-    // neither planning here nor holding a plan from elsewhere, which is the one
-    // state this design says cannot exist. Refuse it rather than launch it and
-    // print a `Plan:` line asserting a handover that did not happen.
-    if (plan_path != null and (expanded == null or !expanded.?.used_plan)) {
-        bail(
-            app,
-            opts.json,
-            "usage",
-            "--plan needs {{plan}} in startTaskCommand — nothing else carries it to the agent. Add it with `lcc setup`.",
-            .{},
-        );
-    }
     const initial_prompt: ?[]const u8 = if (expanded) |e| e.text else null;
 
     if (opts.json) {
@@ -1085,6 +1087,41 @@ pub const Expanded = struct {
     used_plan: bool,
 };
 
+const Placeholder = enum { identifier, branch, url, plan };
+
+/// One placeholder, and where the template resumes after it.
+const Recognized = struct {
+    key: Placeholder,
+    end: usize,
+};
+
+/// The whole of the placeholder syntax, stated once. Anything this declines —
+/// an unclosed brace, an unknown key — is template text, which is why both scans
+/// step a single byte and keep looking rather than giving up on the rest.
+fn placeholderAt(template: []const u8, i: usize) ?Recognized {
+    if (template[i] != '{') return null;
+    const close = std.mem.indexOfScalarPos(u8, template, i, '}') orelse return null;
+    const key = std.meta.stringToEnum(Placeholder, template[i + 1 .. close]) orelse return null;
+    return .{ .key = key, .end = close + 1 };
+}
+
+/// Whether `startTaskCommand` has a `{plan}` for a plan path to travel through —
+/// asked of the template on its own, before there is an issue, a branch or a
+/// worktree to ask it against. `expandCommand` answers the same question as
+/// `used_plan`, and both read `placeholderAt`, so the two cannot drift.
+pub fn templateCarriesPlan(template: []const u8) bool {
+    var i: usize = 0;
+    while (i < template.len) {
+        if (placeholderAt(template, i)) |found| {
+            if (found.key == .plan) return true;
+            i = found.end;
+            continue;
+        }
+        i += 1;
+    }
+    return false;
+}
+
 /// `{plan}` is the absolute path to a plan file, never its contents: the result
 /// becomes one `argv` element and, in `--json`, one field of a payload a caller
 /// parses. A 20KB plan inlined there would bloat both for bytes the agent can
@@ -1100,18 +1137,19 @@ pub fn expandCommand(
     var used_plan = false;
     var i: usize = 0;
     while (i < template.len) {
-        if (template[i] == '{') {
-            if (std.mem.indexOfScalarPos(u8, template, i, '}')) |close| {
-                const key = template[i + 1 .. close];
-                const value: ?[]const u8 =
-                    if (std.mem.eql(u8, key, "identifier")) issue.identifier else if (std.mem.eql(u8, key, "branch")) branch else if (std.mem.eql(u8, key, "url")) issue.url else if (std.mem.eql(u8, key, "plan")) (plan_path orelse "") else null;
-                if (value) |v| {
-                    if (std.mem.eql(u8, key, "plan")) used_plan = true;
-                    try out.appendSlice(gpa, v);
-                    i = close + 1;
-                    continue;
-                }
-            }
+        if (placeholderAt(template, i)) |found| {
+            const value: []const u8 = switch (found.key) {
+                .identifier => issue.identifier,
+                .branch => branch,
+                .url => issue.url,
+                .plan => blk: {
+                    used_plan = true;
+                    break :blk plan_path orelse "";
+                },
+            };
+            try out.appendSlice(gpa, value);
+            i = found.end;
+            continue;
         }
         try out.append(gpa, template[i]);
         i += 1;
