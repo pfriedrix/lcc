@@ -360,14 +360,89 @@ pub const Repo = struct {
         return std.mem.eql(u8, out, "[gone]");
     }
 
+    /// Commits `to_ref` has that `from_ref` does not — `git rev-list --count A..B`.
+    ///
+    /// Null, not zero, when the range cannot be resolved. Zero is a real answer
+    /// meaning "nothing new", and the two are opposites wherever the *smallest*
+    /// count wins: a base whose ref is missing would otherwise come back as the
+    /// nearest one. Each caller states its own policy for the null.
+    pub fn countAhead(self: Repo, from_ref: []const u8, to_ref: []const u8) ?u32 {
+        const range = std.fmt.allocPrint(self.gpa, "{s}..{s}", .{ from_ref, to_ref }) catch return null;
+        const out = self.capture(&.{ "git", "rev-list", "--count", range }) orelse return null;
+        return std.fmt.parseInt(u32, out, 10) catch null;
+    }
+
     fn countUnmerged(self: Repo, branch: []const u8, base: []const u8) u32 {
         const origin_base = std.fmt.allocPrint(self.gpa, "origin/{s}", .{base}) catch return 0;
         for ([_][]const u8{ origin_base, base }) |ref| {
-            const range = std.fmt.allocPrint(self.gpa, "{s}..{s}", .{ ref, branch }) catch continue;
-            const out = self.capture(&.{ "git", "rev-list", "--count", range }) orelse continue;
-            return std.fmt.parseInt(u32, out, 10) catch continue;
+            if (self.countAhead(ref, branch)) |count| return count;
         }
+        // Deliberate, and now visibly so rather than hidden in an `orelse continue`
+        // chain that looked like an answer: this number goes into a confirmation
+        // line, where "unknown" and "nothing unmerged" both mean say nothing alarming.
         return 0;
+    }
+
+    /// The commit HEAD points at *where lcc was invoked*, which is a different
+    /// commit from `root`'s HEAD whenever the user is standing in a linked
+    /// worktree. Resolved once so every count afterwards can name it explicitly
+    /// and still run in `root`.
+    ///
+    /// Null on an empty repository, or a worktree directory that is no longer there.
+    pub fn headSha(self: Repo) ?[]const u8 {
+        return self.captureIn(self.cwd, &.{ "git", "rev-parse", "HEAD" });
+    }
+
+    /// The live `origin/release/*` branches with their tip dates, `origin/`
+    /// stripped.
+    ///
+    /// Remote only, and deliberately not `listBranches`: that merges local and
+    /// remote into one deduplicated set, so a stale local `release/2.4.1` left
+    /// behind by a shipped release is indistinguishable there from one still being
+    /// stabilised — and the release-project veto would read it as "trunk is past
+    /// v2.4.1", which is the one conclusion it must not draw.
+    pub fn remoteReleaseBranches(self: Repo) Error![]RemoteBranch {
+        const out = self.capture(&.{
+            "git",                                                 "for-each-ref",
+            "--format=%(refname:short)%09%(committerdate:unix)", "refs/remotes/origin/release/",
+        }) orelse return Error.GitFailed;
+
+        var found: std.ArrayList(RemoteBranch) = .empty;
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            const row = std.mem.trim(u8, line, " \t\r");
+            if (row.len == 0) continue;
+            const tab = std.mem.indexOfScalar(u8, row, '\t') orelse continue;
+            const ref = row[0..tab];
+            if (std.mem.endsWith(u8, ref, "/HEAD")) continue;
+            const name = if (std.mem.startsWith(u8, ref, "origin/")) ref["origin/".len..] else ref;
+            try found.append(self.gpa, .{
+                .branch = name,
+                .committed_at = std.fmt.parseInt(i64, row[tab + 1 ..], 10) catch 0,
+            });
+        }
+        return found.toOwnedSlice(self.gpa);
+    }
+
+    /// Every tag, in git's own order — which is lexical, so `v2.10.0` comes before
+    /// `v2.9.0` and ordering them is the caller's job.
+    ///
+    /// `for-each-ref` rather than `git tag`, because `git tag` honours `column.ui`
+    /// and `tag.sort` from the user's config: the shape of its output is not lcc's
+    /// to depend on. This is one line per ref whatever the machine is configured like.
+    pub fn listTags(self: Repo) Error![][]const u8 {
+        const out = self.capture(&.{
+            "git", "for-each-ref", "--format=%(refname:short)", "refs/tags/",
+        }) orelse return Error.GitFailed;
+
+        var found: std.ArrayList([]const u8) = .empty;
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            const tag = std.mem.trim(u8, line, " \t\r");
+            if (tag.len == 0) continue;
+            try found.append(self.gpa, tag);
+        }
+        return found.toOwnedSlice(self.gpa);
     }
 
     pub fn deleteBranch(self: Repo, branch: []const u8, force: bool) Error!void {
@@ -420,6 +495,15 @@ pub const Repo = struct {
 pub var last_error: []const u8 = "";
 
 pub const Strategy = enum { reused_local, tracking_remote, new };
+
+/// A branch that exists on `origin`, named without the remote prefix.
+pub const RemoteBranch = struct {
+    /// `release/2.5.2` — `origin/` already stripped.
+    branch: []const u8,
+    /// Tip commit date, Unix seconds. Not part of any decision; it lets a caller
+    /// say how stale its local view of `origin` is.
+    committed_at: i64,
+};
 
 pub const WorktreeResult = struct {
     path: []const u8,
@@ -717,6 +801,74 @@ test "repoRoot answers the main worktree from inside a linked worktree" {
     const branch = (try repo.currentBranch()).?;
     defer gpa.free(branch);
     try std.testing.expectEqualStrings("feature/x", branch);
+}
+
+test "release branches are read off origin, and a stale local one does not count" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const origin = try std.fs.path.join(arena, &.{ base, "origin.git" });
+    const proj = try std.fs.path.join(arena, &.{ base, "proj" });
+
+    try runGit(gpa, io, base, &.{ "init", "-q", "--bare", "origin.git" });
+    try runGit(gpa, io, base, &.{ "init", "-q", "-b", "main", "proj" });
+    try runGit(gpa, io, proj, &.{ "commit", "-q", "--allow-empty", "-m", "init" });
+    try runGit(gpa, io, proj, &.{ "remote", "add", "origin", origin });
+    try runGit(gpa, io, proj, &.{ "push", "-q", "-u", "origin", "main" });
+
+    // One release still being stabilised, pushed.
+    try runGit(gpa, io, proj, &.{ "checkout", "-q", "-b", "release/2.5.2" });
+    try runGit(gpa, io, proj, &.{ "commit", "-q", "--allow-empty", "-m", "stabilise" });
+    try runGit(gpa, io, proj, &.{ "push", "-q", "-u", "origin", "release/2.5.2" });
+
+    // …and one left behind locally after its release shipped. `listBranches`
+    // cannot tell these two apart, which is the whole reason for the new call.
+    try runGit(gpa, io, proj, &.{ "checkout", "-q", "-b", "release/2.4.1", "main" });
+    try runGit(gpa, io, proj, &.{ "checkout", "-q", "main" });
+
+    try runGit(gpa, io, proj, &.{ "tag", "v2.4.1" });
+    try runGit(gpa, io, proj, &.{ "tag", "v2.10.0" });
+    try runGit(gpa, io, proj, &.{ "tag", "v2.9.0" });
+
+    const repo: Repo = .{ .gpa = arena, .io = io, .root = proj };
+    try repo.fetchPrune();
+
+    const live = try repo.remoteReleaseBranches();
+    try std.testing.expectEqual(@as(usize, 1), live.len);
+    try std.testing.expectEqualStrings("release/2.5.2", live[0].branch);
+    try std.testing.expect(live[0].committed_at > 0);
+
+    // The confusion this exists to avoid: the shipped release's branch is still
+    // sitting there locally, and `listBranches` reports it identically.
+    const merged_view = try repo.listBranches();
+    var saw_stale = false;
+    for (merged_view) |name| {
+        if (std.mem.eql(u8, name, "release/2.4.1")) saw_stale = true;
+    }
+    try std.testing.expect(saw_stale);
+
+    // Tags come back whole, in git's lexical order — ordering them is the caller's
+    // job, and `v2.10.0` before `v2.9.0` is why.
+    const tags = try repo.listTags();
+    try std.testing.expectEqual(@as(usize, 3), tags.len);
+
+    // Null, not zero, for a ref that is not there. Zero means "nothing new", and
+    // in a contest for the *smallest* count a missing ref would otherwise win.
+    try std.testing.expect(repo.countAhead("origin/release/9.9.9", "HEAD") == null);
+    try std.testing.expectEqual(@as(u32, 0), repo.countAhead("HEAD", "HEAD").?);
+    // main is one commit behind the release branch's tip.
+    try std.testing.expectEqual(@as(u32, 1), repo.countAhead("origin/main", "origin/release/2.5.2").?);
+
+    const head = repo.headSha().?;
+    try std.testing.expect(head.len >= 40);
 }
 
 test "a squash-merged branch reads as unmerged until a pull request vouches for it" {
