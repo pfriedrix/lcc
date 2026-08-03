@@ -261,10 +261,12 @@ fn parseCodexUsage(arena: std.mem.Allocator, io: std.Io, path: []const u8) ?Usag
         if (!std.mem.eql(u8, payload.type orelse "", "token_count")) continue;
         const current = (payload.info orelse continue).total_token_usage orelse continue;
         const reset = current.input_tokens < previous.input_tokens or current.cached_input_tokens < previous.cached_input_tokens or current.output_tokens < previous.output_tokens;
+        const input_delta = if (reset) current.input_tokens else current.input_tokens - previous.input_tokens;
+        const cached_delta = if (reset) current.cached_input_tokens else current.cached_input_tokens - previous.cached_input_tokens;
         const delta = Counts{
-            .input = if (reset) current.input_tokens else current.input_tokens - previous.input_tokens,
+            .input = input_delta -| cached_delta,
             .output = if (reset) current.output_tokens else current.output_tokens - previous.output_tokens,
-            .cache_read = if (reset) current.cached_input_tokens else current.cached_input_tokens - previous.cached_input_tokens,
+            .cache_read = cached_delta,
         };
         total.input += delta.input;
         total.output += delta.output;

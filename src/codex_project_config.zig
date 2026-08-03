@@ -39,6 +39,7 @@ pub fn bootstrapWithIo(gpa: std.mem.Allocator, io: Io, opts: BootstrapOptions) !
         error.FileNotFound => return null,
         else => return err,
     };
+    try ensureTargetParentWithinRoot(cwd, io, arena, opts.target_root);
     var status: Status = .skipped_exists;
     if (cwd.access(io, target, .{})) |_| {} else |err| switch (err) {
         error.FileNotFound => {
@@ -63,6 +64,23 @@ pub fn bootstrapWithIo(gpa: std.mem.Allocator, io: Io, opts: BootstrapOptions) !
         .target = target,
         .status = status,
     };
+}
+
+fn ensureTargetParentWithinRoot(cwd: Io.Dir, io: Io, arena: std.mem.Allocator, target_root: []const u8) !void {
+    const target_parent = try std.fs.path.join(arena, &.{ target_root, ".codex" });
+    const target_parent_stat = cwd.statFile(io, target_parent, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    _ = target_parent_stat;
+    const canonical_root = try cwd.realPathFileAlloc(io, target_root, arena);
+    const canonical_parent = cwd.realPathFileAlloc(io, target_parent, arena) catch return error.PathOutsideTarget;
+    if (!pathWithin(canonical_root, canonical_parent)) return error.PathOutsideTarget;
+}
+
+fn pathWithin(root: []const u8, path: []const u8) bool {
+    if (std.mem.eql(u8, root, path)) return true;
+    return std.mem.startsWith(u8, path, root) and path.len > root.len and path[root.len] == std.fs.path.sep;
 }
 
 pub const Mcp = struct {
