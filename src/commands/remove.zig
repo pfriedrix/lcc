@@ -4,7 +4,6 @@
 const std = @import("std");
 const app_mod = @import("../app.zig");
 const cp = @import("../claude_projects.zig");
-const codex_projects = @import("../codex_projects.zig");
 const dd = @import("../derived_data.zig");
 const disk = @import("../disk.zig");
 const git = @import("../git.zig");
@@ -39,7 +38,6 @@ pub const Opts = struct {
 const Attached = struct {
     derived: []dd.Sized = &.{},
     sessions: []cp.Sized = &.{},
-    codex_sessions: []CodexSized = &.{},
     /// What a running Xcode still has open in it. Closed before the directory goes,
     /// so no window is left on a path that no longer exists.
     xcode: xcode.Open = .{},
@@ -53,15 +51,9 @@ const Attached = struct {
         for (self.derived) |item| total += item.size;
         if (sessions_go) {
             for (self.sessions) |item| total += item.size;
-            for (self.codex_sessions) |item| total += item.size;
         }
         return total;
     }
-};
-
-const CodexSized = struct {
-    entry: codex_projects.Entry,
-    size: u64,
 };
 
 /// One explicitly selected worktree and everything the removal needs to decide
@@ -186,7 +178,6 @@ fn prepareRemovals(
     // Sessions are matched even when they are being kept: the confirmation must
     // say that they exist rather than silently leaving them behind.
     const cp_all = try cp.list(app.gpa, app.io, cp_root);
-    const codex_all = (try codex_projects.scanWithIo(app.gpa, app.io, app.environ)).entries;
     const held: xcode.Open = if (opts.keep_xcode) .{} else try xcode.openDocuments(app.gpa, app.io);
     if (held.unanswered) {
         app.ui.warn("Could not ask Xcode what it has open — it may be holding some of these.", .{});
@@ -195,7 +186,6 @@ fn prepareRemovals(
 
     const derived = try app.gpa.alloc([]dd.Entry, removals.len);
     const sessions = try app.gpa.alloc([]cp.Entry, removals.len);
-    const codex_sessions = try app.gpa.alloc([]codex_projects.Entry, removals.len);
     const in_xcode = try app.gpa.alloc(xcode.Open, removals.len);
     var paths: std.ArrayList([]const u8) = .empty;
 
@@ -203,11 +193,9 @@ fn prepareRemovals(
         const path = removal.choice.entry.path;
         derived[i] = try dd.forWorktree(app.gpa, app.io, dd_all, path);
         sessions[i] = try cp.forWorktree(app.gpa, app.io, cp_all, path);
-        codex_sessions[i] = try codexForWorktree(app.gpa, codex_all, path);
         in_xcode[i] = try held.inside(app.gpa, app.io, path);
         for (derived[i]) |entry| try paths.append(app.gpa, entry.path);
         for (sessions[i]) |entry| try paths.append(app.gpa, entry.path);
-        for (codex_sessions[i]) |entry| try paths.append(app.gpa, entry.rollout_path);
     }
 
     if (paths.items.len > 0) {
@@ -218,7 +206,6 @@ fn prepareRemovals(
 
     var scanner: usage.Scanner = .init(app.gpa, app.io, .open(app.gpa, app.io, app.environ));
     defer scanner.deinit();
-    scanner.includeCodex(app.environ);
 
     var at: usize = 0;
     for (removals, 0..) |*removal, i| {
@@ -233,15 +220,9 @@ fn prepareRemovals(
             cp_sized[j] = .{ .entry = entry, .size = sizes[at] };
             at += 1;
         }
-        const codex_sized = try app.gpa.alloc(CodexSized, codex_sessions[i].len);
-        for (codex_sessions[i], 0..) |entry, j| {
-            codex_sized[j] = .{ .entry = entry, .size = sizes[at] };
-            at += 1;
-        }
         removal.attached = .{
             .derived = dd_sized,
             .sessions = cp_sized,
-            .codex_sessions = codex_sized,
             .spent = try scanner.worktree(cp_all, removal.choice.entry.path),
             .xcode = in_xcode[i],
         };
@@ -357,9 +338,8 @@ fn removeSelected(
         reclaimed += try purgeDerived(app, removal.attached.derived, dd_root);
         if (opts.sessions) {
             reclaimed += try purgeSessions(app, removal.attached.sessions, cp_root);
-            reclaimed += try purgeCodexSessions(app, removal.attached.codex_sessions);
         } else {
-            kept_sessions += removal.attached.sessions.len + removal.attached.codex_sessions.len;
+            kept_sessions += removal.attached.sessions.len;
         }
 
         try disposeBranch(app, repo, entry.branch, removal.disposition);
@@ -505,13 +485,6 @@ fn appendConfirmationDetails(
             if (opts.sessions) "" else "  — kept, use --sessions",
         }));
     }
-    for (attached.codex_sessions) |item| {
-        try out.appendSlice(w, try std.fmt.allocPrint(w, "    sessions   codex:{s}  ({f}){s}\n", .{
-            item.entry.session_id,
-            ui.bytes(item.size),
-            if (opts.sessions) "" else "  — kept, use --sessions",
-        }));
-    }
     if (!attached.spent.empty()) {
         try out.appendSlice(w, try std.fmt.allocPrint(w, "    spent      {f}\n", .{
             usage.brief(attached.spent, app_mod.nowSeconds(app.io)),
@@ -601,38 +574,6 @@ fn purgeSessions(app: app_mod.App, sized: []const cp.Sized, root: []const u8) !u
         });
     }
     return reclaimed;
-}
-
-fn purgeCodexSessions(app: app_mod.App, sized: []const CodexSized) !u64 {
-    var reclaimed: u64 = 0;
-    for (sized) |item| {
-        codex_projects.removeRolloutWithIo(app.io, item.entry.session_root, item.entry.rollout_path) catch |err| {
-            app.ui.warn("Could not remove codex:{s}: {s}", .{ item.entry.session_id, @errorName(err) });
-            continue;
-        };
-        reclaimed += item.size;
-        app.ui.success("Removed sessions {f} {f}", .{
-            ui.dim(try std.fmt.allocPrint(app.gpa, "codex:{s}", .{item.entry.session_id})),
-            ui.yellow(try std.fmt.allocPrint(app.gpa, "({f})", .{ui.bytes(item.size)})),
-        });
-    }
-    return reclaimed;
-}
-
-fn codexForWorktree(
-    gpa: std.mem.Allocator,
-    entries: []const codex_projects.Entry,
-    worktree: []const u8,
-) ![]codex_projects.Entry {
-    var out: std.ArrayList(codex_projects.Entry) = .empty;
-    for (entries) |entry| {
-        if (std.mem.eql(u8, entry.cwd, worktree) or
-            (std.mem.startsWith(u8, entry.cwd, worktree) and entry.cwd.len > worktree.len and entry.cwd[worktree.len] == std.fs.path.sep))
-        {
-            try out.append(gpa, entry);
-        }
-    }
-    return out.toOwnedSlice(gpa);
 }
 
 /// One candidate for bulk removal: a worktree whose branch is safely merged, or
@@ -743,7 +684,6 @@ fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
             reclaimed += try purgeDerived(app, row.attached.derived, dd_root);
             if (opts.sessions) {
                 reclaimed += try purgeSessions(app, row.attached.sessions, cp_root);
-                reclaimed += try purgeCodexSessions(app, row.attached.codex_sessions);
             }
         }
 
@@ -810,7 +750,6 @@ fn attach(
     else
         try dd.list(app.gpa, app.io, dd_root);
     const cp_all = try cp.list(app.gpa, app.io, cp_root);
-    const codex_all = (try codex_projects.scanWithIo(app.gpa, app.io, app.environ)).entries;
 
     // Xcode is asked once for the whole batch, the same way `du` is: what it has
     // open does not change per row, only which row each document belongs to.
@@ -823,24 +762,20 @@ fn attach(
     var paths: std.ArrayList([]const u8) = .empty;
     const derived = try app.gpa.alloc([]dd.Entry, rows.len);
     const sessions = try app.gpa.alloc([]cp.Entry, rows.len);
-    const codex_sessions = try app.gpa.alloc([]codex_projects.Entry, rows.len);
     const in_xcode = try app.gpa.alloc(xcode.Open, rows.len);
 
     for (rows, 0..) |row, i| {
         const entry = row.worktree orelse {
             derived[i] = &.{};
             sessions[i] = &.{};
-            codex_sessions[i] = &.{};
             in_xcode[i] = .{};
             continue;
         };
         derived[i] = try dd.forWorktree(app.gpa, app.io, dd_all, entry.path);
         sessions[i] = try cp.forWorktree(app.gpa, app.io, cp_all, entry.path);
-        codex_sessions[i] = try codexForWorktree(app.gpa, codex_all, entry.path);
         in_xcode[i] = try held.inside(app.gpa, app.io, entry.path);
         for (derived[i]) |e| try paths.append(app.gpa, e.path);
         for (sessions[i]) |e| try paths.append(app.gpa, e.path);
-        for (codex_sessions[i]) |e| try paths.append(app.gpa, e.rollout_path);
     }
 
     if (paths.items.len > 0) {
@@ -853,7 +788,6 @@ fn attach(
     // transcripts is still only counted once.
     var scanner: usage.Scanner = .init(app.gpa, app.io, .open(app.gpa, app.io, app.environ));
     defer scanner.deinit();
-    scanner.includeCodex(app.environ);
 
     var at: usize = 0;
     for (rows, 0..) |*row, i| {
@@ -867,15 +801,9 @@ fn attach(
             cp_sized[j] = .{ .entry = e, .size = sizes[at] };
             at += 1;
         }
-        const codex_sized = try app.gpa.alloc(CodexSized, codex_sessions[i].len);
-        for (codex_sessions[i], 0..) |e, j| {
-            codex_sized[j] = .{ .entry = e, .size = sizes[at] };
-            at += 1;
-        }
         row.attached = .{
             .derived = dd_sized,
             .sessions = cp_sized,
-            .codex_sessions = codex_sized,
             .spent = if (row.worktree) |entry| try scanner.worktree(cp_all, entry.path) else .{},
             .xcode = in_xcode[i],
         };

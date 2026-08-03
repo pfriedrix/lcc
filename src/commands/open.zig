@@ -2,24 +2,17 @@ const std = @import("std");
 const app_mod = @import("../app.zig");
 const claude = @import("../claude.zig");
 const claude_projects = @import("../claude_projects.zig");
-const codex = @import("../codex.zig");
-const codex_project_config = @import("../codex_project_config.zig");
-const config = @import("../config.zig");
 const git = @import("../git.zig");
 const mcp = @import("../mcp.zig");
 const ui = @import("../ui.zig");
 const usage = @import("../usage.zig");
 const xcode = @import("../xcode.zig");
 
-pub const Target = enum { claude, codex, xcode };
+pub const Target = enum { claude, xcode };
 
-pub fn resolveTarget(raw: ?[]const u8, configured: config.Agent) ?Target {
-    const value = raw orelse return switch (configured) {
-        .claude => .claude,
-        .codex => .codex,
-    };
+pub fn resolveTarget(raw: ?[]const u8) ?Target {
+    const value = raw orelse return .claude;
     if (std.ascii.eqlIgnoreCase(value, "claude")) return .claude;
-    if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
     if (std.ascii.eqlIgnoreCase(value, "xcode")) return .xcode;
     return null;
 }
@@ -34,7 +27,6 @@ pub fn run(app: app_mod.App, target: Target, no_resume: bool) !void {
 
     const message = switch (target) {
         .claude => "Pick a worktree to open in claude:",
-        .codex => "Pick a worktree to open in codex:",
         .xcode => "Pick a worktree to open in xcode:",
     };
     const picked = try app_mod.pickWorktree(app, choices, message) orelse
@@ -43,32 +35,7 @@ pub fn run(app: app_mod.App, target: Target, no_resume: bool) !void {
     switch (target) {
         .xcode => try openInXcode(app, picked),
         .claude => try openInClaude(app, repo, picked, no_resume),
-        .codex => try openInCodex(app, picked, no_resume),
     }
-}
-
-fn openInCodex(app: app_mod.App, picked: app_mod.Choice, no_resume: bool) !void {
-    const label = picked.entry.branch orelse app_mod.shortHead(picked.entry.head);
-    app.ui.info("{f} in {f} {f}", .{
-        ui.bold("Launching Codex"),
-        ui.dim(picked.entry.path),
-        ui.cyan(label),
-    });
-    const spent = usage.forWorktree(app.gpa, app.io, app.environ, picked.entry.path);
-    if (!spent.empty()) {
-        app.ui.hint("Spent here: {f}", .{usage.brief(spent, app_mod.nowSeconds(app.io))});
-    }
-    if (try codex_project_config.discoverMcpWithIo(app.gpa, app.io, picked.entry.path, app.environ)) |carried| {
-        app.ui.hint("MCP: project config has {d} server(s) — {s}", .{
-            carried.names.len,
-            try std.mem.join(app.gpa, ", ", carried.names),
-        });
-    }
-    app.ui.flush();
-
-    const action: codex.Action = if (no_resume) .{ .start = null } else .resume_last;
-    const code = try codex.launch(app.gpa, app.io, picked.entry.path, action);
-    std.process.exit(code);
 }
 
 fn openInClaude(

@@ -39,12 +39,11 @@ const usage =
     \\    --local                skip the PR and Linear columns (no network)
     \\    --no-tokens            skip the TOKENS column (skips reading transcripts)
     \\    --refresh              re-ask GitHub and Linear instead of reusing a recent answer
-    \\  stats                    What each worktree has spent across Claude Code and Codex
+    \\  stats                    What each worktree has spent in Claude Code
     \\    --models               break every worktree down by model
     \\    --json                 print the numbers instead of a table
-    \\  open | o [claude|codex|xcode]
-    \\                           Open a worktree in the configured agent, or override it
-    \\    --no-resume            start the selected agent fresh
+    \\  open | o [claude|xcode]  Open a worktree in Claude Code, or in Xcode
+    \\    --no-resume            start Claude Code fresh
     \\  remove | rm              Select and remove one or more worktrees, branches, and build data
     \\    --merged               bulk: every worktree and branch already merged
     \\    --local                decide from local refs only — no fetch, no asking
@@ -54,10 +53,10 @@ const usage =
     \\    --keep-derived-data    leave the Xcode DerivedData folder in place
     \\    --keep-branch          leave the git branch in place
     \\    --keep-xcode           don't ask Xcode to close the worktree it has open
-    \\    --sessions             also delete Claude Code and Codex session transcripts
+    \\    --sessions             also delete Claude Code session transcripts
     \\  clean                    Delete what worktrees that no longer exist left behind
     \\    --build-data           only Xcode DerivedData
-    \\    --sessions             only Claude Code and Codex session transcripts
+    \\    --sessions             only Claude Code session transcripts
     \\    -y, --yes              delete every orphaned folder without prompting
     \\
     \\  -h, --help               show this help
@@ -199,12 +198,8 @@ fn openCommand(app: app_mod.App, args: []const []const u8) !void {
         } else return error.TooManyArguments;
     }
 
-    const configured = if (target_arg == null)
-        (try config.load(app.gpa, app.io, app.environ)).agent
-    else
-        config.Agent.claude;
-    const target = open_cmd.resolveTarget(target_arg, configured) orelse {
-        app.ui.fail("Unknown open target '{s}'. Use one of: claude, codex, xcode.", .{target_arg.?});
+    const target = open_cmd.resolveTarget(target_arg) orelse {
+        app.ui.fail("Unknown open target '{s}'. Use one of: claude, xcode.", .{target_arg.?});
         std.process.exit(1);
     };
     return open_cmd.run(app, target, no_resume);
@@ -288,10 +283,6 @@ test {
     _ = @import("app.zig");
     _ = @import("claude.zig");
     _ = @import("claude_projects.zig");
-    _ = @import("codex_cache.zig");
-    _ = @import("codex_project_config.zig");
-    _ = @import("codex_projects.zig");
-    _ = @import("sessions.zig");
     _ = @import("config.zig");
     _ = @import("derived_data.zig");
     _ = @import("disk.zig");
@@ -322,7 +313,6 @@ fn describe(err: anyerror) []const u8 {
     return switch (err) {
         error.NotAGitRepository => "Not inside a git repository. Run `lcc` from within your repo.",
         error.ClaudeNotFound => "Could not find `claude` on PATH. Install Claude Code: https://docs.claude.com/en/docs/claude-code",
-        error.CodexNotFound => "Could not find `codex` on PATH. Install Codex CLI: https://developers.openai.com/codex/cli/",
         error.NotATerminal => "lcc needs an interactive terminal for this command.",
         error.UnknownCommand => "Unknown command. Run `lcc --help`.",
         error.UnknownOption => "Unknown option. Run `lcc --help`.",

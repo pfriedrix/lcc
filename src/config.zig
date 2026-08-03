@@ -36,11 +36,8 @@ const default_link_patterns = [_][]const u8{
 const default_link_exclude = [_][]const u8{ ".env.example", ".env.sample", ".env.template" };
 const default_active_states = [_][]const u8{ "Todo", "In Progress" };
 
-pub const Agent = enum { claude, codex };
-
 /// What the file may contain. Every field optional: absence means "use the default".
 pub const Stored = struct {
-    agent: ?Agent = null,
     clientId: ?[]const u8 = null,
     worktreeTemplate: ?[]const u8 = null,
     linkPatterns: ?[]const []const u8 = null,
@@ -66,7 +63,6 @@ pub const McpCarry = union(enum) {
 
 /// Values to merge into the stored configuration. A null field is left untouched.
 pub const Patch = struct {
-    agent: ?Agent = null,
     clientId: ?[]const u8 = null,
     worktreeTemplate: ?[]const u8 = null,
     linkPatterns: ?[]const []const u8 = null,
@@ -77,7 +73,6 @@ pub const Patch = struct {
 };
 
 pub const Config = struct {
-    agent: Agent,
     clientId: []const u8,
     worktreeTemplate: []const u8,
     linkPatterns: []const []const u8,
@@ -132,7 +127,6 @@ pub fn load(
         break :blk if (v.len > 0) v else null;
     };
     return .{
-        .agent = stored.agent orelse .claude,
         .clientId = env_client_id orelse stored.clientId orelse default_client_id,
         .worktreeTemplate = stored.worktreeTemplate orelse default_worktree_template,
         .linkPatterns = stored.linkPatterns orelse stored.envPatterns orelse &default_link_patterns,
@@ -152,7 +146,6 @@ pub fn save(
     patch: Patch,
 ) !void {
     var merged = try loadStored(gpa, io, environ);
-    if (patch.agent) |v| merged.agent = v;
     if (patch.clientId) |v| merged.clientId = v;
     if (patch.worktreeTemplate) |v| merged.worktreeTemplate = v;
     if (patch.linkPatterns) |v| {
