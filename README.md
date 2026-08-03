@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.16-orange.svg)](#build)
 
-One command to go from "I should work on PE-N" to a clean git worktree with your gitignored files symlinked in and your configured coding agent already running.
+One command to go from "I should work on PE-N" to a clean git worktree with your gitignored files symlinked in and Claude Code already running in plan mode.
 
 ```
 $ lcc start
@@ -16,7 +16,7 @@ $ lcc start
 ✓ Linked .claude/settings.local.json
 ✓ Linked .env
 ✓ Linked .env.local
-[configured agent opens in worktree]
+[Claude Code opens in the worktree, in plan mode]
 ```
 
 A single ~1.5 MB binary with no runtime. It shells out to `git`, `claude`, `gh`, `open`, `du`, `defaults` and `plutil` — everything else is the Zig standard library plus macOS's own Security framework.
@@ -56,8 +56,9 @@ For headless machines, `lcc auth --token <pat>` stores a Linear personal API tok
 
 ```bash
 lcc                  # print the command list
-lcc start            # pick an issue, bootstrap worktree, launch Claude Code
+lcc start            # pick an issue, bootstrap worktree, open Claude Code in plan mode
 lcc start PE-256     # that issue, no picker
+lcc start PE-256 --plan plan.md   # a plan already exists — skip plan mode
 lcc start PE-256 --json   # resolve it and print the result instead of launching an agent
 lcc start --all      # ignore the activeStates filter
 lcc setup            # configure worktree behavior
@@ -112,6 +113,37 @@ Results are ordered by *where* the match landed: the start of the identifier ran
 ### Naming the issue
 
 `lcc start PE-256` skips the picker. The issue is fetched by identifier rather than filtered out of your assigned list, so `activeStates` and the assignee do not apply — naming an issue is a more specific answer than either. `--base <ref>` cuts a new branch from `<ref>` instead of asking.
+
+### Planning
+
+`lcc start` opens the session in Claude Code's **plan mode** — `claude --permission-mode plan`. Taking a worktree is the moment a task is about to be misunderstood most cheaply, so that is where the reading, the questions and the explicit approval belong, and it is the default rather than something to remember.
+
+```
+$ lcc start PE-256
+
+Launching Claude Code in plan mode in ~/…/pe-256-app-hangs
+  Linear: https://linear.app/x/issue/PE-256/…
+```
+
+The mode governs how the session opens, not what it plans about: what to plan comes from `startTaskCommand`, which is where a slash command of your own can say what a finished plan has to contain.
+
+### Bringing a plan instead
+
+`--plan <file>` says the planning already happened — in the main checkout, in Notion, in a previous session — so the worktree opens straight into the work rather than deriving the answer a second time. Supplying one is what turns plan mode off; either the task is planned now or a plan is brought to it, and there is no third state.
+
+```bash
+lcc start PE-256 --plan ~/.claude/plans/peaceful-napping-sutton.md
+```
+
+The plan reaches the agent through `{plan}` in `startTaskCommand`, and what travels is the **absolute path, not the contents**:
+
+```json
+{ "startTaskCommand": "/start-task {identifier} --plan {plan}" }
+```
+
+A plan is a document, and inlining one would put it in an `argv` element and in the `start_task_command` field of `--json`, which a caller parses — for bytes the agent can read off disk itself. It is resolved to an absolute path, because the agent runs with the worktree as its cwd, and checked before the Keychain is even touched, so a wrong one fails with `plan_not_found` rather than after a worktree exists. Without `--plan`, `{plan}` expands to nothing.
+
+There is no auto-detection: the newest file in `~/.claude/plans` is not picked up on its own.
 
 ### Which repository
 
@@ -176,7 +208,7 @@ Failures come back in the same shape, on stdout, with exit code 1:
 { "error": { "code": "issue_not_found", "message": "No issue PE-999 in Linear." } }
 ```
 
-Codes: `usage`, `not_authenticated`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`, `worktree_path_exists`, `git_failed`, `bad_repo`, `repo_unconfirmed` — the last one is the picker above in a mode with nobody to ask: pass `--repo <path>`, or run it once interactively and the answer is remembered. Progress lines and the human-readable error go to stderr, so stdout holds nothing but the payload — including git's own output, which is captured rather than inherited in this mode.
+Codes: `usage`, `not_authenticated`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`, `worktree_path_exists`, `git_failed`, `bad_repo`, `plan_not_found`, `repo_unconfirmed` — the last one is the picker above in a mode with nobody to ask: pass `--repo <path>`, or run it once interactively and the answer is remembered. Progress lines and the human-readable error go to stderr, so stdout holds nothing but the payload — including git's own output, which is captured rather than inherited in this mode.
 
 ### `lcc open`
 
@@ -343,7 +375,7 @@ Session transcripts are what `claude --resume` replays — check before deleting
 |---|---|---|
 | `worktreeTemplate` | `{repoRoot}/.lcc/worktrees/{branchLeaf}` | Where worktrees go. Placeholders: `{repoRoot}`, `{repoParent}`, `{repoName}`, `{branch}`, `{branchLeaf}` |
 | `activeStates` | `["Todo", "In Progress"]` | Which Linear states to offer, in this order |
-| `startTaskCommand` | `""` | Passed to Claude Code as its initial prompt. Placeholders: `{identifier}`, `{branch}`, `{url}` |
+| `startTaskCommand` | `""` | Passed to Claude Code as its initial prompt. Placeholders: `{identifier}`, `{branch}`, `{url}`, `{plan}` (the `--plan` path, empty without it) |
 | `linkPatterns` | `[".env", ".env.*", "CLAUDE.md", "CLAUDE.local.md", ".claude/settings.local.json"]` | Which files to symlink into each worktree |
 | `linkExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
 | `mcpCarry` | absent — all of them | Which local-scope MCP servers to carry into Claude; setup accepts a comma-separated list, `all`, or `none` |

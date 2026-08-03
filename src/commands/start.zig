@@ -28,6 +28,9 @@ pub const Opts = struct {
     /// The repository the issue's code lives in, when neither what lcc remembers nor
     /// where the work already is can answer that — see `resolveRepo`.
     repo: ?[]const u8 = null,
+    /// A plan the agent should start from, reachable through `{plan}` in
+    /// `startTaskCommand`. Only the path travels — see `expandCommand`.
+    plan: ?[]const u8 = null,
 };
 
 pub fn run(app: app_mod.App, opts: Opts) !void {
@@ -37,6 +40,16 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     if (opts.json and opts.all) {
         bail(app, opts.json, "usage", "--all only affects the picker, which --json does not use.", .{});
     }
+    // Resolved first, and to an absolute path: the agent is launched with the
+    // worktree as its cwd, so a relative path would be read against the wrong
+    // directory. A plan that is not there costs a lookup to find out here, and a
+    // created worktree to find out later.
+    const plan_path: ?[]const u8 = if (opts.plan) |raw|
+        Io.Dir.cwd().realPathFileAlloc(app.io, raw, app.gpa) catch {
+            bail(app, opts.json, "plan_not_found", "No plan file at {s}.", .{raw});
+        }
+    else
+        null;
     // Said before the read, not after: the Keychain grants access to a binary by its
     // code signature, so a freshly built lcc can block here on a system dialog for
     // the login password. Announced, that is a wait with a reason; unannounced, it
@@ -87,14 +100,27 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     const carried: ?McpFact =
         if (claude_carried) |value| .{ .path = value.path, .names = value.names } else null;
 
+    // Expanded once, above the split: `--json` reports the very string a launch
+    // would send, and cannot drift from it by being built twice.
+    const trimmed_command = std.mem.trim(u8, cfg.startTaskCommand, " \t");
+    const initial_prompt = if (trimmed_command.len > 0)
+        try expandCommand(app.gpa, cfg.startTaskCommand, selected, wt.branch, plan_path)
+    else
+        null;
+
     if (opts.json) {
-        try report(app, cfg, repo, selected, suggested, wt, carried);
+        try report(app, repo, selected, suggested, wt, carried, initial_prompt);
         return;
     }
 
+    const launch_label = if (plan_path == null)
+        "Launching Claude Code in plan mode"
+    else
+        "Launching Claude Code";
     app.ui.info("", .{});
-    app.ui.info("{f} in {f}", .{ ui.bold("Launching Claude Code"), ui.dim(wt.path) });
+    app.ui.info("{f} in {f}", .{ ui.bold(launch_label), ui.dim(wt.path) });
     app.ui.hint("Linear: {s}", .{selected.url});
+    if (plan_path) |path| app.ui.hint("Plan: {s}", .{path});
     // Only says anything when this issue has been worked on before — picking up
     // a task should show what it has already cost.
     const spent = usage.forWorktree(app.gpa, app.io, app.environ, wt.path);
@@ -111,18 +137,15 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     app.ui.info("", .{});
     app.ui.flush();
 
-    const trimmed_command = std.mem.trim(u8, cfg.startTaskCommand, " \t");
-    const initial_prompt = if (trimmed_command.len > 0)
-        try expandCommand(app.gpa, cfg.startTaskCommand, selected, wt.branch)
-    else
-        null;
-    var extra: std.ArrayList([]const u8) = .empty;
-    if (claude_carried) |c| try extra.appendSlice(app.gpa, &.{ "--mcp-config", c.path });
-    if (initial_prompt) |value| {
-        if (extra.items.len > 0) try extra.append(app.gpa, "--");
-        try extra.append(app.gpa, value);
-    }
-    const code = try claude.launch(app.gpa, app.io, wt.path, extra.items);
+    // Either the work is planned now or a plan was brought to it; there is no
+    // third state where neither happened, so `--plan` is what opts out.
+    const args = try launchArgs(
+        app.gpa,
+        if (claude_carried) |c| c.path else null,
+        initial_prompt,
+        plan_path == null,
+    );
+    const code = try claude.launch(app.gpa, app.io, wt.path, args);
     std.process.exit(code);
 }
 
@@ -659,12 +682,12 @@ fn buildReport(
 
 fn report(
     app: app_mod.App,
-    cfg: config.Config,
     repo: git.Repo,
     issue: linear.Issue,
     suggested: []const u8,
     wt: Bootstrapped,
     carried: ?McpFact,
+    start_task_command: ?[]const u8,
 ) !void {
     // The branch that exists, not the one Linear suggests: a renamed issue has its
     // upstream and its drift on the branch the commits are actually on.
@@ -681,10 +704,7 @@ fn report(
         .repo_root = repo.root,
         .default_branch = try repo.defaultBranch(),
         .is_cwd = isCwd(app, wt.path),
-        .start_task_command = if (std.mem.trim(u8, cfg.startTaskCommand, " \t").len == 0)
-            null
-        else
-            try expandCommand(app.gpa, cfg.startTaskCommand, issue, wt.branch),
+        .start_task_command = start_task_command,
         .carried = carried,
     });
 
@@ -1001,11 +1021,43 @@ test "a created worktree reports no match and its base" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"mcp\":null") != null);
 }
 
+/// What `claude` is launched with, in order.
+///
+/// `plan_mode` opens the session in Claude Code's own plan mode, which is where a
+/// task should start: recon and questions before edits, and an explicit approval
+/// before any of it becomes code. Taking a worktree is the moment that decision is
+/// cheapest, so it is the default rather than something to remember.
+///
+/// The `--` is load-bearing and unconditional. The prompt is a positional, and one
+/// that opens with `-` — a markdown bullet, `---` front matter — is read as an
+/// option without it. It used to be appended only alongside `--mcp-config`, which
+/// made that depend on whether the repo happened to carry MCP servers.
+fn launchArgs(
+    gpa: std.mem.Allocator,
+    mcp_config: ?[]const u8,
+    initial_prompt: ?[]const u8,
+    plan_mode: bool,
+) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    if (plan_mode) try out.appendSlice(gpa, &.{ "--permission-mode", "plan" });
+    if (mcp_config) |path| try out.appendSlice(gpa, &.{ "--mcp-config", path });
+    if (initial_prompt) |value| {
+        try out.append(gpa, "--");
+        try out.append(gpa, value);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// `{plan}` is the absolute path to a plan file, never its contents: the result
+/// becomes one `argv` element and, in `--json`, one field of a payload a caller
+/// parses. A 20KB plan inlined there would bloat both for bytes the agent can
+/// read off disk itself. Absent `--plan`, it expands to nothing.
 fn expandCommand(
     gpa: std.mem.Allocator,
     template: []const u8,
     issue: linear.Issue,
     branch: []const u8,
+    plan_path: ?[]const u8,
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
@@ -1014,7 +1066,7 @@ fn expandCommand(
             if (std.mem.indexOfScalarPos(u8, template, i, '}')) |close| {
                 const key = template[i + 1 .. close];
                 const value: ?[]const u8 =
-                    if (std.mem.eql(u8, key, "identifier")) issue.identifier else if (std.mem.eql(u8, key, "branch")) branch else if (std.mem.eql(u8, key, "url")) issue.url else null;
+                    if (std.mem.eql(u8, key, "identifier")) issue.identifier else if (std.mem.eql(u8, key, "branch")) branch else if (std.mem.eql(u8, key, "url")) issue.url else if (std.mem.eql(u8, key, "plan")) (plan_path orelse "") else null;
                 if (value) |v| {
                     try out.appendSlice(gpa, v);
                     i = close + 1;
@@ -1026,4 +1078,118 @@ fn expandCommand(
         i += 1;
     }
     return out.toOwnedSlice(gpa);
+}
+
+test "expandCommand fills the placeholders and leaves anything else alone" {
+    const gpa = std.testing.allocator;
+    const issue: linear.Issue = .{
+        .id = "uuid-1",
+        .identifier = "PE-250",
+        .title = "Fix CLVisit capture",
+        .branch_name = "feature/pe-250-suggested",
+        .state_name = "In Progress",
+        .state_type = "started",
+        .priority = 2,
+        .url = "https://linear.app/x/issue/PE-250/fix",
+        .updated_at = "2026-07-27T00:00:00.000Z",
+        .assignee_name = "Someone",
+        .team_key = "PE",
+    };
+
+    const cases = [_]struct {
+        template: []const u8,
+        plan: ?[]const u8,
+        want: []const u8,
+    }{
+        .{ .template = "/start-task {identifier}", .plan = null, .want = "/start-task PE-250" },
+        .{ .template = "{branch} {url}", .plan = null, .want = "feature/pe-250-actual https://linear.app/x/issue/PE-250/fix" },
+        // A plan travels as its path, so the expansion stays one short argv element
+        // however long the plan itself is.
+        .{
+            .template = "/start-task {identifier} --plan {plan}",
+            .plan = "/Users/me/.claude/plans/x.md",
+            .want = "/start-task PE-250 --plan /Users/me/.claude/plans/x.md",
+        },
+        // Without --plan the key disappears rather than expanding to a literal.
+        .{ .template = "read {plan} then go", .plan = null, .want = "read  then go" },
+        // Unknown keys and an unclosed brace are template text, not an error.
+        .{ .template = "{nope} {identifier}", .plan = null, .want = "{nope} PE-250" },
+        .{ .template = "{unclosed", .plan = null, .want = "{unclosed" },
+    };
+
+    for (cases) |case| {
+        const got = try expandCommand(gpa, case.template, issue, "feature/pe-250-actual", case.plan);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(case.want, got);
+    }
+}
+
+test "launchArgs always separates the prompt from the options with --" {
+    const gpa = std.testing.allocator;
+
+    // A plan file opens with `---` front matter or a `-` bullet often enough that
+    // this is the common case, not the exotic one.
+    const opens_with_dash = "--- \n- step one";
+
+    const carried = try launchArgs(gpa, "/cfg/mcp.json", opens_with_dash, false);
+    defer gpa.free(carried);
+    try std.testing.expectEqual(@as(usize, 4), carried.len);
+    try std.testing.expectEqualStrings("--mcp-config", carried[0]);
+    try std.testing.expectEqualStrings("/cfg/mcp.json", carried[1]);
+    try std.testing.expectEqualStrings("--", carried[2]);
+    try std.testing.expectEqualStrings(opens_with_dash, carried[3]);
+
+    // The regression: with no MCP config to carry there was no `--` either, and
+    // the prompt reached `claude` as an option.
+    const bare = try launchArgs(gpa, null, opens_with_dash, false);
+    defer gpa.free(bare);
+    try std.testing.expectEqual(@as(usize, 2), bare.len);
+    try std.testing.expectEqualStrings("--", bare[0]);
+    try std.testing.expectEqualStrings(opens_with_dash, bare[1]);
+
+    // Nothing to say, nothing to separate.
+    const empty = try launchArgs(gpa, null, null, false);
+    defer gpa.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    const only_mcp = try launchArgs(gpa, "/cfg/mcp.json", null, false);
+    defer gpa.free(only_mcp);
+    try std.testing.expectEqual(@as(usize, 2), only_mcp.len);
+}
+
+test "launchArgs opens in plan mode, and the mode stays ahead of the separator" {
+    const gpa = std.testing.allocator;
+
+    // The default: nothing was brought, so the session starts by planning.
+    const planning = try launchArgs(gpa, null, "/start-task PE-250", true);
+    defer gpa.free(planning);
+    try std.testing.expectEqual(@as(usize, 4), planning.len);
+    try std.testing.expectEqualStrings("--permission-mode", planning[0]);
+    try std.testing.expectEqualStrings("plan", planning[1]);
+    try std.testing.expectEqualStrings("--", planning[2]);
+    try std.testing.expectEqualStrings("/start-task PE-250", planning[3]);
+
+    // Everything the mode adds is an option, so it has to land before the `--`
+    // or it becomes part of the prompt.
+    const with_mcp = try launchArgs(gpa, "/cfg/mcp.json", "/start-task PE-250", true);
+    defer gpa.free(with_mcp);
+    try std.testing.expectEqual(@as(usize, 6), with_mcp.len);
+    try std.testing.expectEqualStrings("--permission-mode", with_mcp[0]);
+    try std.testing.expectEqualStrings("plan", with_mcp[1]);
+    try std.testing.expectEqualStrings("--mcp-config", with_mcp[2]);
+    try std.testing.expectEqualStrings("--", with_mcp[4]);
+
+    // A plan was supplied, so planning already happened somewhere else.
+    const brought = try launchArgs(gpa, null, "/start-task PE-250 --plan /p.md", false);
+    defer gpa.free(brought);
+    try std.testing.expectEqual(@as(usize, 2), brought.len);
+    try std.testing.expectEqualStrings("--", brought[0]);
+
+    // No prompt is no reason to skip the mode: an empty startTaskCommand still
+    // opens a session, and it should still open it planning.
+    const no_prompt = try launchArgs(gpa, null, null, true);
+    defer gpa.free(no_prompt);
+    try std.testing.expectEqual(@as(usize, 2), no_prompt.len);
+    try std.testing.expectEqualStrings("--permission-mode", no_prompt[0]);
+    try std.testing.expectEqualStrings("plan", no_prompt[1]);
 }
