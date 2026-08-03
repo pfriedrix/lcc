@@ -4,6 +4,7 @@
 const std = @import("std");
 const app_mod = @import("../app.zig");
 const cp = @import("../claude_projects.zig");
+const codex_projects = @import("../codex_projects.zig");
 const dd = @import("../derived_data.zig");
 const disk = @import("../disk.zig");
 const prompt = @import("../prompt.zig");
@@ -19,18 +20,19 @@ pub const Opts = struct {
         if (!self.build_data and !self.sessions) return true;
         return switch (kind) {
             .build_data => self.build_data,
-            .sessions => self.sessions,
+            .sessions, .codex_sessions => self.sessions,
         };
     }
 };
 
-const Kind = enum { build_data, sessions };
+const Kind = enum { build_data, sessions, codex_sessions };
 
 /// One removable thing, whichever category it came from. The two roots differ,
 /// so each variant carries the entry its own module knows how to delete safely.
 const Target = union(Kind) {
     build_data: dd.Entry,
     sessions: cp.Entry,
+    codex_sessions: codex_projects.Entry,
 };
 
 const Candidate = struct {
@@ -42,6 +44,7 @@ const Candidate = struct {
         return switch (self.target) {
             .build_data => |e| e.name,
             .sessions => |e| e.name,
+            .codex_sessions => |e| e.session_id,
         };
     }
 
@@ -49,6 +52,7 @@ const Candidate = struct {
         return switch (self.target) {
             .build_data => |e| e.path,
             .sessions => |e| e.path,
+            .codex_sessions => |e| e.rollout_path,
         };
     }
 
@@ -57,6 +61,7 @@ const Candidate = struct {
         return switch (self.target) {
             .build_data => |e| e.workspace_path,
             .sessions => |e| e.cwd,
+            .codex_sessions => |e| e.cwd,
         };
     }
 
@@ -64,6 +69,7 @@ const Candidate = struct {
         return switch (self.target) {
             .build_data => "build data",
             .sessions => "sessions  ",
+            .codex_sessions => "sessions  ",
         };
     }
 
@@ -91,6 +97,11 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         scanned += entries.len;
         for (try cp.orphans(app.gpa, app.io, entries)) |entry| {
             try dead.append(app.gpa, .{ .sessions = entry });
+        }
+        const codex = try codex_projects.scanWithIo(app.gpa, app.io, app.environ);
+        scanned += codex.entries.len;
+        for (try codex.orphansWithIo(app.gpa, app.io)) |entry| {
+            try dead.append(app.gpa, .{ .codex_sessions = entry });
         }
     }
 
@@ -135,6 +146,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         const result = switch (item.target) {
             .build_data => |e| dd.remove(app.gpa, app.io, e, dd_root),
             .sessions => |e| cp.remove(app.gpa, app.io, e, cp_root),
+            .codex_sessions => |e| codex_projects.removeRolloutWithIo(app.io, e.session_root, e.rollout_path),
         };
         result catch |err| {
             app.ui.warn("Could not remove {s}: {s}", .{ item.name(), @errorName(err) });
@@ -159,6 +171,7 @@ fn measure(app: app_mod.App, targets: []const Target) ![]Candidate {
         paths[i] = switch (target) {
             .build_data => |e| e.path,
             .sessions => |e| e.path,
+            .codex_sessions => |e| e.rollout_path,
         };
     }
     const sizes = try disk.usage(app.gpa, app.io, paths);

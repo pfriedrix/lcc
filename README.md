@@ -62,7 +62,7 @@ lcc start PE-256 --json   # resolve it and print the result instead of launching
 lcc start --all      # ignore the activeStates filter
 lcc setup            # choose Claude Code or Codex and configure worktree behavior
 lcc list             # dashboard of every worktree (--local to skip the network columns)
-lcc stats            # what each worktree has spent on Claude Code (--models for the breakdown)
+lcc stats            # what each worktree has spent across Claude Code and Codex
 lcc open             # pick a worktree and open the configured agent
 lcc open claude      # explicitly open Claude Code, overriding the configured agent
 lcc open codex       # explicitly resume Codex's latest session in that worktree
@@ -77,7 +77,7 @@ lcc auth --logout    # clear the token from the Keychain
 
 `ls`, `o` and `rm` are accepted as aliases for `list`, `open` and `remove`.
 
-Codex support covers setup, start, and open. Token statistics and session cleanup continue to read Claude Code transcripts; they do not inspect or remove Codex sessions.
+Token statistics and session cleanup combine Claude Code transcripts with Codex rollouts. Codex discovery reads `$CODEX_HOME/sessions` and `$CODEX_HOME/archived_sessions`, falling back to `~/.codex`; active rollouts win when the same session id also exists in the archive.
 
 ### The dashboard
 
@@ -96,7 +96,7 @@ feature/pe-224-history   clean    gone   11d  —       —           In Review 
 | `STATUS` | `git status --porcelain` in the worktree — entry count, or `missing` when the directory is gone |
 | `SYNC` | `%(upstream:track)` — `↑ahead ↓behind`, `unpushed` with no upstream, `gone` once the remote branch is deleted |
 | `AGE` | how long ago the branch tip was committed |
-| `TOKENS` | context tokens the worktree's Claude Code sessions have read — see [token usage](#token-usage) |
+| `TOKENS` | context tokens the worktree's Claude Code and Codex sessions have read — see [token usage](#token-usage) |
 | `PR` | `gh pr list` for the repo, matched on head branch; open beats merged beats closed |
 | `LINEAR` | the state of the issue the branch names, e.g. `PE-256` out of `feature/pe-256-…` |
 
@@ -169,7 +169,7 @@ Every key is always present; absent values are `null`, never dropped.
 | `worktree.matched_by` | how an existing worktree was recognised — `branch` (exact name) or `issue` (the `PE-N` matched, i.e. the issue was renamed). `null` for one this run created |
 | `worktree.is_cwd` | whether this very process is standing in it, which is what tells a caller there is nothing left to open |
 | `worktree.created` / `base` | the strategy (`new`, `reused_local`, `tracking_remote`) and what a new branch was cut from; `null` when the worktree already existed |
-| `mcp` | the local-scope MCP servers a Claude session launched through lcc would get, and the file passed as `--mcp-config`; always `null` for Codex, and also `null` when Claude has none to carry. A caller that is already running cannot be handed servers retroactively |
+| `mcp` | for Claude, the local-scope servers and generated `--mcp-config`; for Codex, server names from the worktree's project `.codex/config.toml`. It is `null` when the selected provider has no carried project servers |
 
 Failures come back in the same shape, on stdout, with exit code 1:
 
@@ -248,9 +248,9 @@ Matching goes by Xcode's own answer rather than a path `lcc` assembled: Xcode sa
 
 Everything here is best-effort in one direction only. Nothing running, automation not permitted (System Settings → Privacy & Security → Automation), an Xcode too busy to answer inside the timeout — none of those stops a removal, and the last two say so rather than passing for "nothing was open". `--keep-xcode` skips the lot: Xcode is never even asked.
 
-## Claude Code session transcripts
+## Session transcripts
 
-`~/.claude/projects` grows a directory per working directory Claude Code was launched in, and worktrees make a lot of those — a few hundred MB of transcripts for worktrees deleted months ago is normal.
+`~/.claude/projects` grows a directory per working directory Claude Code was launched in. Codex stores rollout JSONL below `$CODEX_HOME/sessions` and `$CODEX_HOME/archived_sessions` (or `~/.codex` when `CODEX_HOME` is unset). Worktrees make a lot of both — a few hundred MB of transcripts for worktrees deleted months ago is normal.
 
 Claude Code names each directory after a flattened cwd, and that flattening is lossy: `/` and `.` both become `-`, so the original path cannot be recovered from the name. `lcc` reads the `cwd` field out of a transcript instead, which records the real path. A directory whose transcripts never name one is left out entirely — `lcc` cannot tell whether its worktree still exists, so it never offers to delete it.
 
@@ -260,7 +260,7 @@ Set `LCC_CLAUDE_PROJECTS` to override the location.
 
 ## Token usage
 
-Those transcripts record what every assistant message cost — the `usage` block the API returned, plus the model that produced it. Since a project directory is keyed on the cwd Claude Code ran in, and lcc already maps directories to worktrees by the `cwd` a transcript records, the same data answers "what has this task spent".
+Claude transcripts record the API usage block on assistant messages. Codex rollouts record `session_meta.cwd`, `turn_context.model`, and cumulative `token_count` events; lcc attributes by the recorded cwd and converts cumulative counters into monotonic per-model deltas, treating a counter decrease as a reset.
 
 It shows up wherever you touch a worktree, not only when you ask:
 
@@ -322,7 +322,7 @@ The cache lives under `~/.cache`, not `~/.config/lcc` like the rest of lcc's sta
 
 ## `lcc clean`
 
-The backlog of both: every DerivedData folder and every session directory whose worktree no longer exists on disk, biggest first, in one checkbox list.
+The backlog of both: every DerivedData folder, Claude project directory, and active or archived Codex rollout whose worktree no longer exists on disk, biggest first, in one checkbox list.
 
 ```
 $ lcc clean
@@ -403,7 +403,7 @@ A self-signed certificate works and never expires on someone else's schedule (Ke
 
 Symlinks cannot solve the same problem for MCP servers, because they are not in the repository. `claude mcp add` without `-s user` stores a server under `projects["<absolute cwd>"].mcpServers` in `~/.claude.json` — the key *is* the directory. A worktree is a different directory, so it starts with none of them: the checkout where `linear-server` was added is the only place it exists.
 
-When Claude is selected, `lcc start` and `lcc open` read the repo's local-scope servers and pass them to Claude Code as `--mcp-config <file>`, generated per repo under `~/.config/lcc/mcp/`. Codex launches never read this configuration and never receive Claude MCP arguments. Without `--strict-mcp-config` the Claude launch adds servers to the user, global and plugin scopes rather than replacing them, and the servers keep whatever authentication they already had. `~/.claude.json` itself is only ever read: it is Claude Code's own working state, rewritten whole when a session ends, so an outside write survives only until the next exit.
+When Claude is selected, `lcc start` and `lcc open` read the repo's local-scope servers and pass them to Claude Code as `--mcp-config <file>`, generated per repo under `~/.config/lcc/mcp/`. Codex never receives Claude MCP arguments. Instead, lcc carries the repo-root `.codex/config.toml` into a new worktree independently of `linkPatterns`; tracked copies already present win, while an ignored source config is linked. Codex loads its `mcp_servers` tables through its native trusted-project configuration, and `start --json` reports only those project server names and that project config path.
 
 Two things this cannot do. A server that was never authenticated stays unauthenticated — `/mcp` in a session is the only thing that fixes that, and the worktree is not why it is dark. And a session that is *already* running cannot be handed servers retroactively, which is why `lcc start --json` reports what a launch would have carried instead of carrying it.
 

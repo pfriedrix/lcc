@@ -55,6 +55,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
 
     var scanner: usage.Scanner = .init(app.gpa, app.io, .open(app.gpa, app.io, app.environ));
     defer scanner.deinit();
+    scanner.includeCodex(app.environ);
 
     const rows = try app.gpa.alloc(Row, entries.len);
     for (entries, 0..) |entry, i| {

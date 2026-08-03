@@ -39,7 +39,7 @@ const usage =
     \\    --local                skip the PR and Linear columns (no network)
     \\    --no-tokens            skip the TOKENS column (skips reading transcripts)
     \\    --refresh              re-ask GitHub and Linear instead of reusing a recent answer
-    \\  stats                    What each worktree has spent on Claude Code
+    \\  stats                    What each worktree has spent across Claude Code and Codex
     \\    --models               break every worktree down by model
     \\    --json                 print the numbers instead of a table
     \\  open | o [claude|codex|xcode]
@@ -54,10 +54,10 @@ const usage =
     \\    --keep-derived-data    leave the Xcode DerivedData folder in place
     \\    --keep-branch          leave the git branch in place
     \\    --keep-xcode           don't ask Xcode to close the worktree it has open
-    \\    --sessions             also delete the Claude Code session transcripts
+    \\    --sessions             also delete Claude Code and Codex session transcripts
     \\  clean                    Delete what worktrees that no longer exist left behind
     \\    --build-data           only Xcode DerivedData
-    \\    --sessions             only Claude Code session transcripts
+    \\    --sessions             only Claude Code and Codex session transcripts
     \\    -y, --yes              delete every orphaned folder without prompting
     \\
     \\  -h, --help               show this help
@@ -288,6 +288,9 @@ test {
     _ = @import("app.zig");
     _ = @import("claude.zig");
     _ = @import("claude_projects.zig");
+    _ = @import("codex_project_config.zig");
+    _ = @import("codex_projects.zig");
+    _ = @import("sessions.zig");
     _ = @import("config.zig");
     _ = @import("derived_data.zig");
     _ = @import("disk.zig");

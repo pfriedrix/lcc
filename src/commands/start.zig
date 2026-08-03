@@ -3,6 +3,7 @@ const Io = std.Io;
 const app_mod = @import("../app.zig");
 const claude = @import("../claude.zig");
 const codex = @import("../codex.zig");
+const codex_project_config = @import("../codex_project_config.zig");
 const config = @import("../config.zig");
 const disk = @import("../disk.zig");
 const git = @import("../git.zig");
@@ -81,10 +82,18 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
 
     // The main checkout already *is* the directory those servers are keyed on, so
     // handing them back would only duplicate what Claude Code loads by itself.
-    const carried = if (cfg.agent == .codex or wt.is_main_checkout)
+    const claude_carried = if (cfg.agent == .codex or wt.is_main_checkout)
         null
     else
         try mcp.carry(app.gpa, app.io, app.environ, repo.root);
+    const codex_carried = if (cfg.agent == .codex)
+        try codex_project_config.discoverMcpWithIo(app.gpa, app.io, wt.path)
+    else
+        null;
+    const carried: ?McpFact = switch (cfg.agent) {
+        .claude => if (claude_carried) |value| .{ .path = value.path, .names = value.names } else null,
+        .codex => if (codex_carried) |value| .{ .path = value.path, .names = value.names } else null,
+    };
 
     if (opts.json) {
         try report(app, cfg, repo, selected, suggested, wt, carried);
@@ -100,11 +109,9 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     app.ui.hint("Linear: {s}", .{selected.url});
     // Only says anything when this issue has been worked on before — picking up
     // a task should show what it has already cost.
-    if (cfg.agent == .claude) {
-        const spent = usage.forWorktree(app.gpa, app.io, app.environ, wt.path);
-        if (!spent.empty()) {
-            app.ui.hint("Spent here: {f}", .{usage.brief(spent, app_mod.nowSeconds(app.io))});
-        }
+    const spent = usage.forWorktree(app.gpa, app.io, app.environ, wt.path);
+    if (!spent.empty()) {
+        app.ui.hint("Spent here: {f}", .{usage.brief(spent, app_mod.nowSeconds(app.io))});
     }
     if (carried) |c| {
         app.ui.hint("MCP: carrying {d} local server(s) from {s} — {s}", .{
@@ -124,7 +131,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     const code = switch (cfg.agent) {
         .claude => blk: {
             var extra: std.ArrayList([]const u8) = .empty;
-            if (carried) |c| try extra.appendSlice(app.gpa, &.{ "--mcp-config", c.path });
+            if (claude_carried) |c| try extra.appendSlice(app.gpa, &.{ "--mcp-config", c.path });
             if (initial_prompt) |value| {
                 if (extra.items.len > 0) try extra.append(app.gpa, "--");
                 try extra.append(app.gpa, value);
@@ -393,6 +400,17 @@ fn bootstrap(
             }
         }
     }
+    if (try codex_project_config.bootstrapWithIo(app.gpa, app.io, .{
+        .source_root = repo.root,
+        .target_root = path,
+        .link_patterns = cfg.linkPatterns,
+        .project_config = .link,
+    })) |operation| {
+        switch (operation.status) {
+            .linked, .copied => try linked.append(app.gpa, operation.rel),
+            .skipped_exists => try skipped.append(app.gpa, operation.rel),
+        }
+    }
 
     return .{
         .branch = branch,
@@ -546,9 +564,9 @@ const Report = struct {
     mcp: ?ReportMcp,
 };
 
-const ReportMcp = struct {
-    config: []const u8,
-    servers: []const []const u8,
+const McpFact = struct {
+    path: []const u8,
+    names: []const []const u8,
 };
 
 const ReportIssue = struct {
@@ -599,6 +617,11 @@ const ReportLinks = struct {
     skipped: []const []const u8,
 };
 
+const ReportMcp = struct {
+    config: []const u8,
+    servers: []const []const u8,
+};
+
 /// The git and config facts a report needs, gathered by the caller so that shaping
 /// them stays pure and testable.
 const Facts = struct {
@@ -608,7 +631,7 @@ const Facts = struct {
     default_branch: []const u8,
     is_cwd: bool,
     start_task_command: ?[]const u8,
-    carried: ?mcp.Carried,
+    carried: ?McpFact,
 };
 
 fn buildReport(
@@ -670,7 +693,7 @@ fn report(
     issue: linear.Issue,
     suggested: []const u8,
     wt: Bootstrapped,
-    carried: ?mcp.Carried,
+    carried: ?McpFact,
 ) !void {
     // The branch that exists, not the one Linear suggests: a renamed issue has its
     // upstream and its drift on the branch the commits are actually on.

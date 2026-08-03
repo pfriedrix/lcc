@@ -21,6 +21,7 @@
 const std = @import("std");
 const Io = std.Io;
 const cp = @import("claude_projects.zig");
+const sessions = @import("sessions.zig");
 const uc = @import("usage_cache.zig");
 const ui = @import("ui.zig");
 
@@ -191,6 +192,7 @@ pub const Scanner = struct {
     skipped: usize = 0,
     /// What earlier runs already read. `uc.Cache.none` opts out.
     cache: uc.Cache,
+    codex: ?sessions.Snapshot = null,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, cache: uc.Cache) Scanner {
         return .{ .gpa = gpa, .io = io, .scratch = .init(gpa), .cache = cache };
@@ -200,9 +202,16 @@ pub const Scanner = struct {
     /// and a cache that needs a second call remembered is a cache that quietly
     /// stops working the first time someone adds a `return` above it.
     pub fn deinit(self: *Scanner) void {
+        if (self.codex) |*snapshot| snapshot.deinit();
         self.cache.save();
         self.scratch.deinit();
         self.seen.deinit(self.gpa);
+    }
+
+    pub fn includeCodex(self: *Scanner, environ: *const std.process.Environ.Map) void {
+        var scanner = sessions.Scanner.initWithIo(self.gpa, self.io, environ);
+        defer scanner.deinit();
+        self.codex = scanner.scan(.cached) catch null;
     }
 
     /// Usage across every `.jsonl` in one Claude Code project directory. A
@@ -272,7 +281,9 @@ pub const Scanner = struct {
         const mine = try cp.forWorktree(self.gpa, self.io, projects, worktree_path);
         const dirs = try self.gpa.alloc([]const u8, mine.len);
         for (mine, 0..) |entry, i| dirs[i] = entry.path;
-        return self.projectDirs(dirs);
+        var totals = try self.projectDirs(dirs);
+        if (self.codex) |*snapshot| try addCodex(self.gpa, &totals, snapshot.usageForWorktree(worktree_path));
+        return totals;
     }
 
     /// One transcript, from the cache when the file on disk is still the one it
@@ -452,7 +463,35 @@ pub fn forWorktree(
 
     var scanner: Scanner = .init(gpa, io, .open(gpa, io, environ));
     defer scanner.deinit();
+    scanner.includeCodex(environ);
     return scanner.worktree(projects, worktree_path) catch .{};
+}
+
+fn addCodex(gpa: std.mem.Allocator, totals: *Totals, codex: sessions.Usage) !void {
+    totals.counts.messages += codex.counts.messages;
+    totals.counts.input += codex.counts.input;
+    totals.counts.output += codex.counts.output;
+    totals.counts.cache_read += codex.counts.cache_read;
+    totals.sessions += codex.sessions;
+    if (codex.last) |last| if (std.mem.lessThan(u8, totals.last, last)) {
+        totals.last = last;
+    };
+    for (codex.models) |model| {
+        var counts: Counts = .{
+            .messages = model.counts.messages,
+            .input = model.counts.input,
+            .output = model.counts.output,
+            .cache_read = model.counts.cache_read,
+        };
+        if (priceFor(model.name)) |price| {
+            counts.cost_usd = price.cost(counts);
+            totals.counts.cost_usd += counts.cost_usd;
+        } else if (counts.tokens() > 0) {
+            totals.unpriced = true;
+        }
+        (try totals.bucket(gpa, model.name)).add(counts);
+    }
+    for (codex.stamps) |stamp| if (epochSeconds(stamp)) |at| try totals.stamps.append(gpa, at);
 }
 
 /// One line of "what this worktree has spent so far", for the commands that open

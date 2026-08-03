@@ -3,6 +3,7 @@ const app_mod = @import("../app.zig");
 const claude = @import("../claude.zig");
 const claude_projects = @import("../claude_projects.zig");
 const codex = @import("../codex.zig");
+const codex_project_config = @import("../codex_project_config.zig");
 const config = @import("../config.zig");
 const git = @import("../git.zig");
 const mcp = @import("../mcp.zig");
@@ -53,6 +54,16 @@ fn openInCodex(app: app_mod.App, picked: app_mod.Choice, no_resume: bool) !void 
         ui.dim(picked.entry.path),
         ui.cyan(label),
     });
+    const spent = usage.forWorktree(app.gpa, app.io, app.environ, picked.entry.path);
+    if (!spent.empty()) {
+        app.ui.hint("Spent here: {f}", .{usage.brief(spent, app_mod.nowSeconds(app.io))});
+    }
+    if (try codex_project_config.discoverMcpWithIo(app.gpa, app.io, picked.entry.path)) |carried| {
+        app.ui.hint("MCP: project config has {d} server(s) — {s}", .{
+            carried.names.len,
+            try std.mem.join(app.gpa, ", ", carried.names),
+        });
+    }
     app.ui.flush();
 
     const action: codex.Action = if (no_resume) .{ .start = null } else .resume_last;
