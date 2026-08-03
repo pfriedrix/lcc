@@ -61,6 +61,12 @@ lcc start PE-256     # that issue, no picker
 lcc start PE-256 --plan plan.md   # a plan already exists — skip plan mode
 lcc start PE-256 --json   # resolve it and print the result instead of launching an agent
 lcc start --all      # ignore the activeStates filter
+lcc issue show PE-256        # state, project, labels, description — reads nothing else
+lcc issue show PE-256 --json # the same, for a caller that parses it
+lcc issue state PE-256 "In Progress"    # move it, by the name on the board
+lcc issue comment PE-256 -m "done"      # add a comment
+lcc issue comment PE-256 -f plan.md     # …or read the body off disk
+lcc issue project PE-256 --assign v2.6.0   # put it in a release project
 lcc setup            # configure worktree behavior
 lcc list             # dashboard of every worktree (--local to skip the network columns)
 lcc stats            # what each worktree has spent in Claude Code
@@ -211,6 +217,177 @@ Failures come back in the same shape, on stdout, with exit code 1:
 ```
 
 Codes: `usage`, `not_authenticated`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`, `worktree_path_exists`, `git_failed`, `bad_repo`, `plan_not_found`, `plan_unreadable`, `repo_unconfirmed` — the last one is the picker above in a mode with nobody to ask: pass `--repo <path>`, or run it once interactively and the answer is remembered. Progress lines and the human-readable error go to stderr, so stdout holds nothing but the payload — including git's own output, which is captured rather than inherited in this mode.
+
+### `lcc issue`
+
+One Linear issue, named by its identifier. Unlike every other command here it needs no repository — it answers the same from anywhere, which is what lets a caller ask about an issue before deciding where its code lives.
+
+```bash
+$ lcc issue show PE-250
+PE-250  Fix CLVisit capture: dropped visits, lost headless writes, no departure
+  State     In Build
+  Project   v2.6.0
+  Assignee  Danylo Krysevych
+  Labels    for/team, source/self, type/bug
+  Branch    feature/pe-250-fix-clvisit-capture-dropped-visits-lost-headless-writes-no
+  https://linear.app/pfx-lab/issue/PE-250/fix-clvisit-capture-…
+```
+
+`show` is the read-only probe that `lcc start --json` deliberately is not: `start` cuts a branch and a worktree on the way to its answer, and a caller that only wanted to look has to undo them.
+
+```bash
+$ lcc issue show PE-250 --json
+{
+  "issue":   { "id": "…", "identifier": "PE-250", "title": "…", "url": "…",
+               "state": "In Build", "state_type": "started", "state_id": "…",
+               "team": "PE", "team_id": "…", "assignee": "…", "priority": 3,
+               "branch_name": "feature/pe-250-…", "updated_at": "2026-07-27T13:40:16.783Z" },
+  "project": { "id": "…", "name": "v2.6.0" },
+  "labels":  ["for/team", "source/self", "type/bug"],
+  "description": "## Symptom\n\n…"
+}
+```
+
+The `issue` block matches `lcc start --json`'s field for field where the two overlap, so a caller parses one shape rather than two, plus the two ids a write needs: `state_id` says whether a state change would be a no-op, and `team_id` is the UUID Linear demands wherever the human key `PE` is refused.
+
+Labels come back **grouped** — `type/bug`, not the bare `bug` Linear's API answers with. The group is the half that tells a `type/bug` from an `area/bug`, and a caller dispatching on `type/` has nothing to match without it.
+
+`project` is `null` rather than absent when the issue is in no release project, which for an issue past Todo is the thing worth noticing: it is invisible on the release board. Every key is always present; absent values are `null`, never dropped.
+
+#### `lcc issue state`
+
+A state is named the way it is written on the board, case-insensitively, and resolved against **that team's own workflow states** — fetched in the same request as the issue, so there is no window between reading the ids and writing one.
+
+```bash
+$ lcc issue state PE-283 "in progress"
+✓ PE-283: Todo → In Progress
+```
+
+Matching is on the **name alone**. Nothing here searches on Linear's `statusType`, and that is the design rather than an omission: matching on the type is what let `Canceled` resolve to `Duplicate`, because a type has as many holders as the board has columns in that group. `--type` filters a set that already matched by name — it can narrow, and it can never reach a state the name did not find.
+
+When two states really do share a name, lcc refuses in **both** modes rather than guessing:
+
+```
+✗ 2 states in PE are called 'Done': completed, canceled.
+  Narrow it: lcc issue state PE-283 "Done" --type completed
+```
+
+Two modes disagreeing about which state an issue landed in is worse than either refusing, and `(name, type)` is the pair that is unique — so a caller can retry deterministically without a human. An unknown name gets the whole board back, in board order, which is what makes the refusal actionable.
+
+A state the issue is **already in** is reported, not rewritten:
+
+```bash
+$ lcc issue state PE-283 "Backlog" --json
+{ "issue": {…}, "changed": false,
+  "from": { "id": "37e2dbec…", "name": "Backlog", "type": "backlog" },
+  "to":   { "id": "37e2dbec…", "name": "Backlog", "type": "backlog" } }
+```
+
+Linear's GitHub integration moves an issue on a branch push, so arriving to find it already there is the normal case. Writing anyway would bump `updatedAt` and put a state change in the activity feed that nobody made. `to` is read out of the mutation's own response rather than echoed from the request, so the report says what Linear ended up with.
+
+It does **not** validate the transition against a `Backlog → Todo → …` order: that is workspace policy, lcc is a generic Linear client, and a tool that refuses a legitimate `In Review → In Progress` because a table said so is a tool people work around. `from.type` and `to.type` are reported so a caller can judge a reversal itself.
+
+Codes it adds: `state_unknown`, `state_ambiguous`.
+
+#### `lcc issue comment`
+
+`-m <text>` gives the body outright, `-f <file>` reads it off disk — one or the other, never both. A markdown plan is what `-f` is for, so the body travels as a GraphQL string variable and survives quotes, backslashes, newlines and emoji intact.
+
+```bash
+$ lcc issue comment PE-250 -f plan.md --json
+{
+  "issue":   { "id": "…", "identifier": "PE-250", "url": "…" },
+  "comment": { "id": "…", "url": "…#comment-e971d540", "created_at": "2026-08-03T22:35:23.620Z" },
+  "body_bytes": 236
+}
+```
+
+It is **not idempotent**, and cannot be: calling it twice posts two comments. lcc has no way to tell a retry from a second thought, and deduping on the body would silently swallow a deliberate repeat.
+
+An empty body is refused rather than posted, and a `-f` that points at a directory says so instead of reporting the file as missing.
+
+#### `lcc issue project`
+
+A release is a Linear `Project` named `vX.Y.Z`, and `--assign` puts an issue in one. The version is **said outright** — there is no inference here and nothing is resolved: a command that writes to Linear names what it is writing. `2.6.0` and `v2.6.0` are the same release, and the name is normalised to the way the board spells it.
+
+```bash
+$ lcc issue project PE-283 --assign v2.6.0
+✓ PE-283 → v2.6.0
+```
+
+Two refusals, both of which name the flag that means it:
+
+```
+✗ PE-283 is already in v2.6.0. Moving it to v2.5.2 is a release cut — say so:
+  lcc issue project PE-283 --assign v2.5.2 --force
+✗ No project called v9.9.9 on PE. Create it:
+  lcc issue project PE-283 --assign v9.9.9 --create
+```
+
+`--create` **is** the consent, moved out of a prompt so a non-interactive caller can give it — a project created by mistake in Linear cannot be undone the way a worktree can. `--force` is the same idea for a reassignment: moving between releases is a deliberate cut, not something a command that was only meant to file an issue should do on its own.
+
+An issue already in the right project is reported, not rewritten. `changed` and `created` are separate keys, because filing an issue into an existing release and bringing a new release board into existence are different events.
+
+A project that already shipped is still a legitimate `--assign` target: dropping completed releases governs what a *resolver* may propose, not what a human may name.
+
+The created project gets a name and a one-line description. The `:rocket:` icon and the project lead are left to the Linear UI — on a mutation that only fires when a project is missing, they widen the request in exchange for decoration.
+
+Codes it adds: `bad_version`, `project_not_found`, `project_conflict`.
+
+#### `lcc issue project --resolve`
+
+The other half: which release an issue targets, **worked out** rather than named. Read-only, and it always exits 0 — an unresolved case is an answer, not a failure.
+
+Seven rules, in order. The first that can fire, does:
+
+| # | When | Answer |
+|---|---|---|
+| 1 | a version passed outright | that one, with any project it displaces reported as a conflict |
+| 2 | the issue is already in a project | that one — never silently reassigned |
+| 3 | the current branch is `release/X.Y.Z` | `vX.Y.Z` |
+| 4 | the branch was cut from one | the pull request's base, else the candidate base HEAD is fewest commits ahead of |
+| 5 | on trunk | the lowest open release project the board still accumulates for |
+| 6 | nothing open left | the next **minor** above what shipped — proposed, never taken |
+| 7 | nobody can tell | the question, with the candidates |
+
+```bash
+$ lcc issue project PE-283 --resolve --json
+{ "status": "resolved", "rule": 4, "rule_name": "nearest_base", "version": "v2.7.0",
+  "evidence": { "kind": "distance", "text": "release/2.7.0" },
+  "project": null, "confirm_before_create": false,
+  "command": "lcc issue project PE-283 --assign v2.7.0 --create",
+  "git": { "branch": "feature/pe-283-x", "default_branch": "main", "pr_base": null,
+           "release_branches": [ { "branch": "release/2.7.0", "version": "v2.7.0", "ahead": 1 } ] },
+  "notes": [] }
+```
+
+Rules 6 and 7 cannot be settled without a human, and that is exactly where moving this into a binary pays: the refusal **carries the computation**. Every semver sort, every "drop the versions already stabilising on a branch" filter, every "bump the minor, not the patch" has already run, so the caller's question is a formatting job:
+
+```json
+{ "status": "needs_confirmation", "rule": 6, "version": "v2.6.0",
+  "baseline": { "version": "v2.5.2", "source": "tag", "evidence": "git tag" },
+  "confirm_before_create": true,
+  "question": "Latest released: v2.5.2. No open release project. Create v2.6.0 and assign PE-283? [y / other version / skip]",
+  "command": "lcc issue project PE-283 --assign v2.6.0 --create" }
+```
+
+`confirm_before_create` is the one bit that matters for a writer: false for the rules that read a version off a fact that exists, true for the single rule that infers one.
+
+Some details that are easy to get wrong, and are decided here rather than left to the caller:
+
+- **Trunk wins every tie** in rule 4's contest. Falling through to the project board puts the decision where there is more evidence than a commit count, and it never files work into a release that is already stabilising. Two *release* branches tying is `ambiguous_base` — the expensive thing to guess at.
+- **A count that could not be taken loses.** An unresolvable ref comes back `null`, not `0`, so a missing branch cannot win a contest for the smallest distance.
+- **Release branches are read off `origin` only.** A stale local `release/2.4.1` left behind by a shipped release must not be mistaken for one still being stabilised.
+- **Versions are compared as numbers.** `v2.10.0` is above `v2.9.0`, which a lexical sort gets backwards — and rule 6 would then propose a release that already exists.
+- **An open project at or below what already shipped is dropped**, with a note. A `v2.4.1` forgotten in the backlog long after it went out has no branch left to veto it and would otherwise win rule 5 outright.
+- **`v2.6.0-rc1` is not `v2.6.0`.** A release candidate is invisible to the resolver rather than standing in for the release.
+- **`git: null` means git was never consulted** — rule 2 answers without it. An empty object would claim it was asked and came back bare, which is a different fact.
+
+`--fetch` refreshes the view of `origin` first. It is off by default because this runs on a hot path, and a stale view degrades to a conservative answer rather than a wrong one.
+
+`gh` is optional throughout: without it rule 4 falls back to the commit-distance contest, which needs no network, no auth and no remote — the absence costs one note.
+
+Failures take the same shape as `lcc start --json` — JSON on stdout, the human line on stderr, exit 1. Codes shared by every subcommand: `usage`, `not_authenticated`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`. `comment` adds `body_not_found`, `body_unreadable`, `body_empty`, `body_too_large`.
 
 ### `lcc open`
 
