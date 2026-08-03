@@ -47,7 +47,7 @@ test "AC1 Codex rollout is attributed to its worktree with delta-based model usa
 
     try expectCounts(.{
         .messages = 2,
-        .input = 175,
+        .input = 139,
         .output = 27,
         .cache_write_5m = 0,
         .cache_write_1h = 0,
@@ -61,7 +61,7 @@ test "AC1 Codex rollout is attributed to its worktree with delta-based model usa
     try std.testing.expectEqualStrings("gpt-5.4", wanted.models[0].name);
     try expectCounts(.{
         .messages = 2,
-        .input = 150,
+        .input = 120,
         .output = 20,
         .cache_write_5m = 0,
         .cache_write_1h = 0,
@@ -71,7 +71,7 @@ test "AC1 Codex rollout is attributed to its worktree with delta-based model usa
     try std.testing.expectEqualStrings("gpt-5.5", wanted.models[1].name);
     try expectCounts(.{
         .messages = 0,
-        .input = 25,
+        .input = 19,
         .output = 7,
         .cache_write_5m = 0,
         .cache_write_1h = 0,
@@ -229,7 +229,7 @@ test "AC3 cached scan invalidates a changed Codex rollout and equals a cold comb
     try expectUsageEqual(cold, cached);
     try expectCounts(.{
         .messages = 3,
-        .input = 85,
+        .input = 59,
         .output = 14,
         .cache_write_5m = 3,
         .cache_write_1h = 4,
