@@ -45,12 +45,12 @@ const usage =
     \\  open | o [claude|codex|xcode]
     \\                           Open a worktree in the configured agent, or override it
     \\    --no-resume            start the selected agent fresh
-    \\  remove | rm              Remove a worktree, its branch, and its Xcode build data
+    \\  remove | rm              Select and remove one or more worktrees, branches, and build data
     \\    --merged               bulk: every worktree and branch already merged
     \\    --local                decide from local refs only — no fetch, no asking
     \\                           GitHub whether the branch's PR was merged
     \\    -f, --force            force remove even with uncommitted changes
-    \\    -y, --yes              skip the confirmation prompt
+    \\    -y, --yes              skip confirmation after selecting worktrees
     \\    --keep-derived-data    leave the Xcode DerivedData folder in place
     \\    --keep-branch          leave the git branch in place
     \\    --keep-xcode           don't ask Xcode to close the worktree it has open

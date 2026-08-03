@@ -67,7 +67,7 @@ lcc open             # pick a worktree and open the configured agent
 lcc open claude      # explicitly open Claude Code, overriding the configured agent
 lcc open codex       # explicitly resume Codex's latest session in that worktree
 lcc open xcode       # pick a worktree and open it in Xcode instead
-lcc remove           # pick a worktree, remove it + its branch + Xcode build data
+lcc remove           # select worktrees, remove them + their branches + Xcode build data
 lcc remove --merged  # bulk: every worktree and branch whose work already landed
 lcc clean            # reclaim build data and transcripts left by worktrees that are gone
 lcc auth             # log in
@@ -189,7 +189,9 @@ Uses the same worktree picker, then launches Xcode instead of Claude. It looks f
 
 ## Branch cleanup
 
-`lcc remove` deletes the branch along with the worktree — but only when the commits survive somewhere else. Three things count as safe:
+`lcc remove` opens one checkbox list of every non-main worktree. Select any number with Space and press Enter; lcc inspects the whole selection, shows one combined confirmation, then removes it in one run. Nothing starts checked, so pressing Enter on an untouched list is a no-op. `-y` skips the combined confirmation but still lets you choose the worktrees. A failure or an unsaved Xcode document keeps that worktree without stopping the rest of the selection.
+
+It deletes each selected branch along with its worktree — but only when the commits survive somewhere else. Three things count as safe:
 
 - The branch is an ancestor of the default branch (an ordinary merge).
 - The branch was pushed and its upstream is now `[gone]` — what a squash-merged PR looks like locally, where ancestry can never prove the commits survived.
