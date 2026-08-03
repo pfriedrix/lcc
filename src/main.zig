@@ -306,6 +306,7 @@ test {
     _ = @import("prompt.zig");
     _ = @import("remote_cache.zig");
     _ = @import("repos.zig");
+    _ = @import("semver.zig");
     _ = @import("ui.zig");
     _ = @import("usage.zig");
     _ = @import("usage_cache.zig");
