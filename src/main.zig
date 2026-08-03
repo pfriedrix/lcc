@@ -28,6 +28,8 @@ const usage =
     \\    --repo <path>          the repository the issue's code is in, when lcc cannot
     \\                           tell — it remembers the answer per issue, and finds a
     \\                           repo that already has a branch for it on its own
+    \\    --plan <file>          a plan for the agent to start from — reaches it as
+    \\                           {plan} in startTaskCommand, as a path, not inlined
     \\  auth                     Authenticate with Linear (OAuth browser flow)
     \\    --logout               remove stored token
     \\    --status               show current authentication state
@@ -141,6 +143,10 @@ fn startCommand(app: app_mod.App, args: []const []const u8) !void {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.repo = args[i];
+        } else if (eq(arg, "--plan")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.plan = args[i];
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownOption;
         } else if (opts.issue == null) {

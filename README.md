@@ -58,6 +58,7 @@ For headless machines, `lcc auth --token <pat>` stores a Linear personal API tok
 lcc                  # print the command list
 lcc start            # pick an issue, bootstrap worktree, launch Claude Code
 lcc start PE-256     # that issue, no picker
+lcc start PE-256 --plan plan.md   # start it from a plan that already exists
 lcc start PE-256 --json   # resolve it and print the result instead of launching an agent
 lcc start --all      # ignore the activeStates filter
 lcc setup            # configure worktree behavior
@@ -112,6 +113,24 @@ Results are ordered by *where* the match landed: the start of the identifier ran
 ### Naming the issue
 
 `lcc start PE-256` skips the picker. The issue is fetched by identifier rather than filtered out of your assigned list, so `activeStates` and the assignee do not apply — naming an issue is a more specific answer than either. `--base <ref>` cuts a new branch from `<ref>` instead of asking.
+
+### Starting from a plan
+
+`--plan <file>` hands the new session a plan that already exists — one written in Claude Code's plan mode in the main checkout, say, so the planning and its approval happen somewhere cheap and the worktree session opens with the answer instead of deriving it again.
+
+```bash
+lcc start PE-256 --plan ~/.claude/plans/peaceful-napping-sutton.md
+```
+
+The plan reaches the agent through `{plan}` in `startTaskCommand`, and what travels is the **absolute path, not the contents**:
+
+```json
+{ "startTaskCommand": "/start-task {identifier} --plan {plan}" }
+```
+
+A plan is a document, and inlining one would put it in an `argv` element and in the `start_task_command` field of `--json`, which a caller parses — for bytes the agent can read off disk itself. The path is resolved and checked before anything is created, so a wrong one fails with `plan_not_found` rather than after a worktree exists. Without `--plan`, `{plan}` expands to nothing.
+
+There is no auto-detection: the newest file in `~/.claude/plans` is not picked up on its own.
 
 ### Which repository
 
@@ -176,7 +195,7 @@ Failures come back in the same shape, on stdout, with exit code 1:
 { "error": { "code": "issue_not_found", "message": "No issue PE-999 in Linear." } }
 ```
 
-Codes: `usage`, `not_authenticated`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`, `worktree_path_exists`, `git_failed`, `bad_repo`, `repo_unconfirmed` — the last one is the picker above in a mode with nobody to ask: pass `--repo <path>`, or run it once interactively and the answer is remembered. Progress lines and the human-readable error go to stderr, so stdout holds nothing but the payload — including git's own output, which is captured rather than inherited in this mode.
+Codes: `usage`, `not_authenticated`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`, `worktree_path_exists`, `git_failed`, `bad_repo`, `plan_not_found`, `repo_unconfirmed` — the last one is the picker above in a mode with nobody to ask: pass `--repo <path>`, or run it once interactively and the answer is remembered. Progress lines and the human-readable error go to stderr, so stdout holds nothing but the payload — including git's own output, which is captured rather than inherited in this mode.
 
 ### `lcc open`
 
@@ -343,7 +362,7 @@ Session transcripts are what `claude --resume` replays — check before deleting
 |---|---|---|
 | `worktreeTemplate` | `{repoRoot}/.lcc/worktrees/{branchLeaf}` | Where worktrees go. Placeholders: `{repoRoot}`, `{repoParent}`, `{repoName}`, `{branch}`, `{branchLeaf}` |
 | `activeStates` | `["Todo", "In Progress"]` | Which Linear states to offer, in this order |
-| `startTaskCommand` | `""` | Passed to Claude Code as its initial prompt. Placeholders: `{identifier}`, `{branch}`, `{url}` |
+| `startTaskCommand` | `""` | Passed to Claude Code as its initial prompt. Placeholders: `{identifier}`, `{branch}`, `{url}`, `{plan}` (the `--plan` path, empty without it) |
 | `linkPatterns` | `[".env", ".env.*", "CLAUDE.md", "CLAUDE.local.md", ".claude/settings.local.json"]` | Which files to symlink into each worktree |
 | `linkExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
 | `mcpCarry` | absent — all of them | Which local-scope MCP servers to carry into Claude; setup accepts a comma-separated list, `all`, or `none` |
