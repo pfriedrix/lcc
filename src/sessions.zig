@@ -132,22 +132,42 @@ pub fn merge(gpa: std.mem.Allocator, claude: []const Session, codex: []const Ses
 }
 
 pub const ScanMode = enum { cold, cached };
+
+/// One rollout's parse, kept so a later `.cached` scan can skip re-reading it.
+/// `size` and `mtime` together are the whole staleness test, the same pair
+/// `usage_cache` uses for Claude transcripts: a rollout only ever grows, and a
+/// rewrite that lands on the same size within the same nanosecond is not a
+/// thing Codex does.
+const Cached = struct {
+    size: u64,
+    mtime: i64,
+    usage: Usage,
+};
+
 pub const Scanner = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     environ: *const std.process.Environ.Map,
+    /// Parses that outlive the snapshot they were built for. Keys and usage both
+    /// live here, so a `Snapshot` never aliases a scanner that may outlast it.
+    store: std.heap.ArenaAllocator,
+    cache: std.StringHashMapUnmanaged(Cached) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) !Scanner {
-        return .{ .gpa = gpa, .io = std.testing.io, .environ = environ };
+        return initWithIo(gpa, std.testing.io, environ);
     }
 
     pub fn initWithIo(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map) Scanner {
-        return .{ .gpa = gpa, .io = io, .environ = environ };
+        return .{ .gpa = gpa, .io = io, .environ = environ, .store = .init(gpa) };
     }
 
-    pub fn deinit(_: *Scanner) void {}
+    pub fn deinit(self: *Scanner) void {
+        self.cache.deinit(self.gpa);
+        self.store.deinit();
+        self.* = undefined;
+    }
 
-    pub fn scan(self: *Scanner, _: ScanMode) !Snapshot {
+    pub fn scan(self: *Scanner, mode: ScanMode) !Snapshot {
         var catalog = try codex_projects.scanWithIo(self.gpa, self.io, self.environ);
         defer catalog.deinit();
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
@@ -155,17 +175,42 @@ pub const Scanner = struct {
         const arena = arena_state.allocator();
         var out: std.ArrayList(Session) = .empty;
         for (catalog.entries) |entry| {
-            const parsed = parseCodexUsage(arena, self.io, entry.rollout_path) orelse continue;
+            const parsed = self.usageFor(mode, entry.rollout_path) orelse continue;
             try out.append(arena, .{ .codex = .{
                 .session_id = try arena.dupe(u8, entry.session_id),
                 .rollout_path = try arena.dupe(u8, entry.rollout_path),
                 .session_root = try arena.dupe(u8, entry.session_root),
                 .cwd = try arena.dupe(u8, entry.cwd),
                 .archived = entry.archived,
-                .usage = parsed,
+                .usage = try cloneUsage(arena, parsed),
             } });
         }
         return .{ .arena = arena_state, .sessions = try out.toOwnedSlice(arena) };
+    }
+
+    /// One rollout's usage: from `cache` when the caller asked for `.cached` and
+    /// the file on disk is still the one that entry was built from, from the
+    /// rollout itself otherwise. `.cold` never reads the cache but still fills
+    /// it, so priming a scanner is a cold scan.
+    fn usageFor(self: *Scanner, mode: ScanMode, path: []const u8) ?Usage {
+        const info = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch return null;
+        const size = info.size;
+        // Nanoseconds are wider than `i64` at the source; a value that does not
+        // fit is not a time this decade, and 0 simply never matches.
+        const mtime = std.math.cast(i64, info.mtime.nanoseconds) orelse 0;
+
+        if (mode == .cached) {
+            if (self.cache.get(path)) |hit| {
+                if (hit.size == size and hit.mtime == mtime) return hit.usage;
+            }
+        }
+
+        const store = self.store.allocator();
+        const parsed = parseCodexUsage(store, self.io, path) orelse return null;
+        // A cache that cannot record is still a correct cache, just a cold one.
+        const key = self.cache.getKey(path) orelse (store.dupe(u8, path) catch return parsed);
+        self.cache.put(self.gpa, key, .{ .size = size, .mtime = mtime, .usage = parsed }) catch {};
+        return parsed;
     }
 };
 
