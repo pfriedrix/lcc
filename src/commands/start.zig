@@ -2,8 +2,6 @@ const std = @import("std");
 const Io = std.Io;
 const app_mod = @import("../app.zig");
 const claude = @import("../claude.zig");
-const codex = @import("../codex.zig");
-const codex_project_config = @import("../codex_project_config.zig");
 const config = @import("../config.zig");
 const disk = @import("../disk.zig");
 const git = @import("../git.zig");
@@ -81,32 +79,21 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     repos.save(app.gpa, app.io, app.environ, learned) catch {};
 
     // The main checkout already *is* the directory those servers are keyed on, so
-    // handing them back would only duplicate what the agent loads by itself. True
-    // of both agents: Codex reads the checkout's own `.codex/config.toml`.
-    const claude_carried = if (cfg.agent == .codex or wt.is_main_checkout)
+    // handing them back would only duplicate what the agent loads by itself.
+    const claude_carried = if (wt.is_main_checkout)
         null
     else
         try mcp.carry(app.gpa, app.io, app.environ, repo.root);
-    const codex_carried = if (cfg.agent == .codex and !wt.is_main_checkout)
-        try codex_project_config.discoverMcpWithIo(app.gpa, app.io, wt.path, app.environ)
-    else
-        null;
-    const carried: ?McpFact = switch (cfg.agent) {
-        .claude => if (claude_carried) |value| .{ .path = value.path, .names = value.names } else null,
-        .codex => if (codex_carried) |value| .{ .path = value.path, .names = value.names } else null,
-    };
+    const carried: ?McpFact =
+        if (claude_carried) |value| .{ .path = value.path, .names = value.names } else null;
 
     if (opts.json) {
         try report(app, cfg, repo, selected, suggested, wt, carried);
         return;
     }
 
-    const launch_label = switch (cfg.agent) {
-        .claude => "Launching Claude Code",
-        .codex => "Launching Codex",
-    };
     app.ui.info("", .{});
-    app.ui.info("{f} in {f}", .{ ui.bold(launch_label), ui.dim(wt.path) });
+    app.ui.info("{f} in {f}", .{ ui.bold("Launching Claude Code"), ui.dim(wt.path) });
     app.ui.hint("Linear: {s}", .{selected.url});
     // Only says anything when this issue has been worked on before — picking up
     // a task should show what it has already cost.
@@ -129,18 +116,13 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         try expandCommand(app.gpa, cfg.startTaskCommand, selected, wt.branch)
     else
         null;
-    const code = switch (cfg.agent) {
-        .claude => blk: {
-            var extra: std.ArrayList([]const u8) = .empty;
-            if (claude_carried) |c| try extra.appendSlice(app.gpa, &.{ "--mcp-config", c.path });
-            if (initial_prompt) |value| {
-                if (extra.items.len > 0) try extra.append(app.gpa, "--");
-                try extra.append(app.gpa, value);
-            }
-            break :blk try claude.launch(app.gpa, app.io, wt.path, extra.items);
-        },
-        .codex => try codex.launch(app.gpa, app.io, wt.path, .{ .start = initial_prompt }),
-    };
+    var extra: std.ArrayList([]const u8) = .empty;
+    if (claude_carried) |c| try extra.appendSlice(app.gpa, &.{ "--mcp-config", c.path });
+    if (initial_prompt) |value| {
+        if (extra.items.len > 0) try extra.append(app.gpa, "--");
+        try extra.append(app.gpa, value);
+    }
+    const code = try claude.launch(app.gpa, app.io, wt.path, extra.items);
     std.process.exit(code);
 }
 
@@ -401,18 +383,6 @@ fn bootstrap(
             }
         }
     }
-    if (try codex_project_config.bootstrapWithIo(app.gpa, app.io, .{
-        .source_root = repo.root,
-        .target_root = path,
-        .link_patterns = cfg.linkPatterns,
-        .project_config = .link,
-    })) |operation| {
-        switch (operation.status) {
-            .linked, .copied => try linked.append(app.gpa, operation.rel),
-            .skipped_exists => try skipped.append(app.gpa, operation.rel),
-        }
-    }
-
     return .{
         .branch = branch,
         .path = path,
