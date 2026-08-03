@@ -143,6 +143,105 @@ test "AC5 orphan discovery distinguishes live and missing cwd across active and 
     try std.testing.expectEqualStrings(archived_missing_cwd, archived_missing.cwd);
 }
 
+test "a rollout far larger than the metadata prefix is still attributed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const codex_home = try std.fs.path.join(allocator, &.{ root, "codex-home" });
+    defer allocator.free(codex_home);
+    const worktree = try std.fs.path.join(allocator, &.{ root, "worktree" });
+    defer allocator.free(worktree);
+
+    try tmp.dir.createDirPath(std.testing.io, "worktree");
+    try tmp.dir.createDirPath(std.testing.io, "codex-home/sessions/2026/08/03");
+
+    // A worked-in session is megabytes of turns behind a metadata line of a few
+    // KB. Discovery reads a bounded prefix, so the bulk must not matter — and it
+    // must not be read to find out.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    const meta = try std.fmt.allocPrint(allocator,
+        \\{{"timestamp":"2026-08-03T10:00:00Z","type":"session_meta","payload":{{"id":"huge-session","cwd":"{s}"}}}}
+        \\
+    , .{worktree});
+    defer allocator.free(meta);
+    try body.appendSlice(allocator, meta);
+    while (body.items.len < 512 * 1024) {
+        try body.appendSlice(allocator,
+            \\{"timestamp":"2026-08-03T10:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"filler"}}
+            \\
+        );
+    }
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "codex-home/sessions/2026/08/03/huge.jsonl",
+        .data = body.items,
+    });
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("HOME", root);
+    try env.put("LCC_CODEX_HOME", codex_home);
+
+    var catalog = try codex_projects.scan(allocator, &env);
+    defer catalog.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), catalog.entries.len);
+    try std.testing.expectEqualStrings(worktree, catalog.findByIdentity("codex:huge-session").?.cwd);
+}
+
+test "a second scan answers from what the first one recorded" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const codex_home = try std.fs.path.join(allocator, &.{ root, "codex-home" });
+    defer allocator.free(codex_home);
+    const worktree = try std.fs.path.join(allocator, &.{ root, "worktree" });
+    defer allocator.free(worktree);
+
+    try tmp.dir.createDirPath(std.testing.io, "worktree");
+    try tmp.dir.createDirPath(std.testing.io, "codex-home/sessions/2026/08/03");
+    const rollout = "codex-home/sessions/2026/08/03/cached.jsonl";
+    try writeRollout(allocator, tmp.dir, rollout, "cached-session", worktree);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("HOME", root);
+    try env.put("LCC_CODEX_HOME", codex_home);
+
+    {
+        var first = try codex_projects.scan(allocator, &env);
+        defer first.deinit();
+        try std.testing.expectEqualStrings(worktree, first.findByIdentity("codex:cached-session").?.cwd);
+    }
+
+    // Contents replaced with something that records nothing, the path left alone.
+    // A scan that still reports the session is a scan that did not re-read the
+    // file — which is the whole point, and is sound because the real thing cannot
+    // happen: `session_meta` is written once before any turn, a rollout is only
+    // appended to afterwards, and its name carries a start timestamp and a uuid
+    // that are never reused.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = rollout, .data = "not a rollout\n" });
+
+    var second = try codex_projects.scan(allocator, &env);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), second.entries.len);
+    try std.testing.expectEqualStrings(worktree, second.findByIdentity("codex:cached-session").?.cwd);
+
+    // And a rollout that is gone stays gone, rather than living on in the cache.
+    try tmp.dir.deleteFile(std.testing.io, rollout);
+    try writeRollout(allocator, tmp.dir, "codex-home/sessions/2026/08/03/fresh.jsonl", "fresh-session", worktree);
+    var third = try codex_projects.scan(allocator, &env);
+    defer third.deinit();
+    try std.testing.expectEqual(@as(usize, 1), third.entries.len);
+    try std.testing.expectEqualStrings("codex:fresh-session", third.entries[0].identity);
+}
+
 fn writeRollout(
     allocator: std.mem.Allocator,
     dir: std.Io.Dir,

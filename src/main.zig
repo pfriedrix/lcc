@@ -288,6 +288,7 @@ test {
     _ = @import("app.zig");
     _ = @import("claude.zig");
     _ = @import("claude_projects.zig");
+    _ = @import("codex_cache.zig");
     _ = @import("codex_project_config.zig");
     _ = @import("codex_projects.zig");
     _ = @import("sessions.zig");

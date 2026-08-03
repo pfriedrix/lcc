@@ -320,6 +320,17 @@ Nothing derived is stored. Cost is recomputed from the token counts on every rea
 
 The cache lives under `~/.cache`, not `~/.config/lcc` like the rest of lcc's state, because it is regenerable and large enough to matter — config directories end up in dotfile repos. `LCC_USAGE_CACHE` overrides the location; deleting the file costs one slow run. `lcc list --no-tokens` skips the whole thing.
 
+Codex costs the same question a different way. Its rollouts are filed by date, so nothing in a path says whose session it holds — the cwd is recorded *inside* the file, and finding out means an open and a read per rollout. That is affordable until something drives Codex in a loop: an SDK doing that leaves tens of thousands of sessions behind, and none of them are pruned either. On a machine with 46k rollouts the reads alone were 10s of `lcc list`, for an answer that is a handful of distinct directories.
+
+So each rollout's cwd and id are kept in `~/.cache/lcc/codex.json`, grouped by directory because that is where the repetition is, and keyed on the rollout's path alone. That last part is what makes it free rather than cheap — no `stat` is needed to trust an entry, because the answer cannot change: `session_meta` is the first line Codex writes, before any turn, a rollout is only appended to afterwards, and a name carries the session's start timestamp and uuid and is never reused. Rollouts the walk no longer finds are dropped once the filesystem agrees they are gone.
+
+```
+cold (cache deleted)   10.8s     46k rollouts, 767MB of ~/.codex
+warm                   0.14s     7.9MB of cache
+```
+
+Two other things stopped that scan from scaling. Only the rollouts belonging to a worktree on screen are parsed for usage now, rather than all of them and then filtering — the dashboard asks about three directories out of ten. And the metadata read is a bounded prefix into one reused buffer, not the whole file into an arena per rollout, which is what had `lcc list` peaking at 1.9GB of memory to print three rows. `LCC_CODEX_CACHE` overrides the location.
+
 ## `lcc clean`
 
 The backlog of both: every DerivedData folder, Claude project directory, and active or archived Codex rollout whose worktree no longer exists on disk, biggest first, in one checkbox list.

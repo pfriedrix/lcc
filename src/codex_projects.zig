@@ -1,7 +1,16 @@
 const std = @import("std");
 const Io = std.Io;
+const codex_cache = @import("codex_cache.zig");
 
-const rollout_limit = 64 * 1024 * 1024;
+/// Codex writes `session_meta` as a rollout's first line, so `id` and `cwd` are
+/// in the first few KB — that line carries the environment context with them and
+/// runs to around seven. Reading a bounded prefix is what keeps discovery
+/// affordable: `~/.codex/sessions` accumulates every session from every directory
+/// Codex has ever run in, tens of thousands of rollouts and hundreds of
+/// megabytes, and none of that bulk is metadata. The ceiling is set well above
+/// the observed size because overshooting costs nothing on a file smaller than
+/// it, while undershooting silently loses the session.
+const metadata_prefix_limit = 64 * 1024;
 const max_depth = 16;
 
 pub const Entry = struct {
@@ -78,14 +87,17 @@ pub fn scanWithIo(
 
     var entries: std.ArrayList(Entry) = .empty;
     var ids: std.StringHashMapUnmanaged(void) = .empty;
-    try scanRoot(arena, io, active_root, false, 0, &entries, &ids);
-    try scanRoot(arena, io, archived_root, true, 0, &entries, &ids);
+    var reader: MetadataReader = .init(gpa, io, .open(gpa, io, environ));
+    defer reader.deinit();
+    try scanRoot(arena, io, &reader, active_root, false, 0, &entries, &ids);
+    try scanRoot(arena, io, &reader, archived_root, true, 0, &entries, &ids);
     return .{ .arena = arena_state, .entries = try entries.toOwnedSlice(arena) };
 }
 
 fn scanRoot(
     arena: std.mem.Allocator,
     io: Io,
+    reader: *MetadataReader,
     root: []const u8,
     archived: bool,
     depth: usize,
@@ -99,10 +111,10 @@ fn scanRoot(
     while (iterator.next(io) catch null) |item| {
         const path = try std.fs.path.join(arena, &.{ root, item.name });
         switch (item.kind) {
-            .directory => try scanRoot(arena, io, path, archived, depth + 1, entries, ids),
+            .directory => try scanRoot(arena, io, reader, path, archived, depth + 1, entries, ids),
             .file => {
                 if (!std.mem.endsWith(u8, item.name, ".jsonl")) continue;
-                const metadata = parseMetadata(arena, io, path) orelse continue;
+                const metadata = try reader.read(arena, path) orelse continue;
                 if (ids.contains(metadata.id)) continue;
                 try ids.put(arena, metadata.id, {});
                 try entries.append(arena, .{
@@ -118,6 +130,60 @@ fn scanRoot(
         }
     }
 }
+
+/// Where the walk gets each rollout's identity and cwd: from what an earlier run
+/// recorded when it can, and from the rollout itself otherwise.
+///
+/// It also owns the prefix buffer and the JSON scratch space, and both have to be
+/// reused. `~/.codex` runs to tens of thousands of rollouts, so a prefix buffer
+/// per file is gigabytes of allocation for a few hundred bytes of answer, and it
+/// lands in the catalog's arena where nothing frees it until the command exits.
+/// What a rollout contributes is copied into that arena; the scratch is reset
+/// behind it.
+const MetadataReader = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    cache: codex_cache.Cache,
+    buffer: ?[]u8 = null,
+    scratch: std.heap.ArenaAllocator,
+
+    fn init(gpa: std.mem.Allocator, io: Io, cache: codex_cache.Cache) MetadataReader {
+        return .{ .gpa = gpa, .io = io, .cache = cache, .scratch = .init(gpa) };
+    }
+
+    /// Teardown writes the cache back, so a caller cannot forget to — the same
+    /// reasoning as `usage.Scanner.deinit`.
+    fn deinit(self: *MetadataReader) void {
+        self.cache.save();
+        self.cache.deinit();
+        if (self.buffer) |buf| self.gpa.free(buf);
+        self.scratch.deinit();
+        self.* = undefined;
+    }
+
+    /// One rollout's identity and working directory, copied into `arena`. Null
+    /// when the file cannot be read or records no usable metadata — neither is an
+    /// error, just a rollout that cannot be attributed to anything.
+    fn read(self: *MetadataReader, arena: std.mem.Allocator, path: []const u8) !?Metadata {
+        if (self.cache.lookup(path)) |hit| {
+            return .{
+                .id = try arena.dupe(u8, hit.id),
+                .cwd = try arena.dupe(u8, hit.cwd),
+            };
+        }
+
+        if (self.buffer == null) self.buffer = try self.gpa.alloc(u8, metadata_prefix_limit);
+        defer _ = self.scratch.reset(.retain_capacity);
+
+        const prefix = readPrefix(self.buffer.?, self.io, path) orelse return null;
+        const found = parseMetadata(self.scratch.allocator(), prefix) orelse return null;
+        self.cache.put(path, .{ .id = found.id, .cwd = found.cwd });
+        return .{
+            .id = try arena.dupe(u8, found.id),
+            .cwd = try arena.dupe(u8, found.cwd),
+        };
+    }
+};
 
 fn rootForPath(_: []const u8, _: bool, root: []const u8) []const u8 {
     var current = root;
@@ -138,11 +204,12 @@ const MetadataLine = struct {
     } = null,
 };
 
-fn parseMetadata(arena: std.mem.Allocator, io: Io, path: []const u8) ?Metadata {
-    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(rollout_limit)) catch return null;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
+/// The `id` and `cwd` a rollout prefix records, borrowed from `scratch` and from
+/// `prefix` itself — `MetadataReader.read` is what copies them somewhere durable.
+fn parseMetadata(scratch: std.mem.Allocator, prefix: []const u8) ?Metadata {
+    var lines = std.mem.splitScalar(u8, prefix, '\n');
     while (lines.next()) |line| {
-        const parsed = std.json.parseFromSliceLeaky(MetadataLine, arena, line, .{
+        const parsed = std.json.parseFromSliceLeaky(MetadataLine, scratch, line, .{
             .ignore_unknown_fields = true,
         }) catch continue;
         if (!std.mem.eql(u8, parsed.type orelse continue, "session_meta")) continue;
@@ -153,6 +220,25 @@ fn parseMetadata(arena: std.mem.Allocator, io: Io, path: []const u8) ?Metadata {
         return .{ .id = id, .cwd = cwd };
     }
     return null;
+}
+
+/// As much of a rollout's start as `buf` holds, or less if that is all there is.
+/// Null when the file cannot be opened or read at all.
+///
+/// The final line will usually be cut mid-JSON, which needs no handling: a line
+/// that does not parse is skipped, exactly like a line that is not
+/// `session_meta`. A rollout whose metadata somehow falls outside the prefix is
+/// skipped the same way one recording no metadata at all already was.
+///
+/// `readFileAlloc` cannot do this — its limit is a ceiling on the whole file, so
+/// a rollout past it comes back as `error.StreamTooLong` with no bytes.
+fn readPrefix(buf: []u8, io: Io, path: []const u8) ?[]const u8 {
+    var file = Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+
+    var reader = file.reader(io, &.{});
+    const n = reader.interface.readSliceShort(buf) catch return null;
+    return buf[0..n];
 }
 
 pub fn removeRollout(session_root: []const u8, rollout_path: []const u8) !void {
