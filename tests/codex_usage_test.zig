@@ -229,7 +229,7 @@ test "AC3 cached scan invalidates a changed Codex rollout and equals a cold comb
     try expectUsageEqual(cold, cached);
     try expectCounts(.{
         .messages = 3,
-        .input = 59,
+        .input = 65,
         .output = 14,
         .cache_write_5m = 3,
         .cache_write_1h = 4,
