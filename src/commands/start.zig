@@ -1077,7 +1077,7 @@ fn launchArgs(
     return out.toOwnedSlice(gpa);
 }
 
-const Expanded = struct {
+pub const Expanded = struct {
     text: []u8,
     /// Whether `{plan}` was in the template at all. `--plan` has no other channel to
     /// the agent, so a false here means the path reached nobody — which the caller
@@ -1089,7 +1089,7 @@ const Expanded = struct {
 /// becomes one `argv` element and, in `--json`, one field of a payload a caller
 /// parses. A 20KB plan inlined there would bloat both for bytes the agent can
 /// read off disk itself. Absent `--plan`, it expands to nothing.
-fn expandCommand(
+pub fn expandCommand(
     gpa: std.mem.Allocator,
     template: []const u8,
     issue: linear.Issue,

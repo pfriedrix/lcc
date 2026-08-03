@@ -314,6 +314,7 @@ test {
     _ = @import("commands/remove.zig");
     _ = @import("commands/setup.zig");
     _ = @import("commands/start.zig");
+    _ = @import("commands/start_plan_test.zig");
     _ = @import("commands/stats.zig");
 }
 
