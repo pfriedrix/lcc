@@ -304,6 +304,7 @@ test {
     _ = @import("mcp.zig");
     _ = @import("oauth.zig");
     _ = @import("prompt.zig");
+    _ = @import("release.zig");
     _ = @import("remote_cache.zig");
     _ = @import("repos.zig");
     _ = @import("semver.zig");
