@@ -58,7 +58,7 @@ fn openInCodex(app: app_mod.App, picked: app_mod.Choice, no_resume: bool) !void 
     if (!spent.empty()) {
         app.ui.hint("Spent here: {f}", .{usage.brief(spent, app_mod.nowSeconds(app.io))});
     }
-    if (try codex_project_config.discoverMcpWithIo(app.gpa, app.io, picked.entry.path)) |carried| {
+    if (try codex_project_config.discoverMcpWithIo(app.gpa, app.io, picked.entry.path, app.environ)) |carried| {
         app.ui.hint("MCP: project config has {d} server(s) — {s}", .{
             carried.names.len,
             try std.mem.join(app.gpa, ", ", carried.names),

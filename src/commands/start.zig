@@ -81,13 +81,14 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     repos.save(app.gpa, app.io, app.environ, learned) catch {};
 
     // The main checkout already *is* the directory those servers are keyed on, so
-    // handing them back would only duplicate what Claude Code loads by itself.
+    // handing them back would only duplicate what the agent loads by itself. True
+    // of both agents: Codex reads the checkout's own `.codex/config.toml`.
     const claude_carried = if (cfg.agent == .codex or wt.is_main_checkout)
         null
     else
         try mcp.carry(app.gpa, app.io, app.environ, repo.root);
-    const codex_carried = if (cfg.agent == .codex)
-        try codex_project_config.discoverMcpWithIo(app.gpa, app.io, wt.path)
+    const codex_carried = if (cfg.agent == .codex and !wt.is_main_checkout)
+        try codex_project_config.discoverMcpWithIo(app.gpa, app.io, wt.path, app.environ)
     else
         null;
     const carried: ?McpFact = switch (cfg.agent) {

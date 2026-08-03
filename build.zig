@@ -97,6 +97,11 @@ pub fn build(b: *std.Build) void {
             .import = "codex_project_config",
             .source = "src/codex_project_config.zig",
         },
+        .{
+            .file = "tests/codex_project_config_env_test.zig",
+            .import = "codex_project_config",
+            .source = "src/codex_project_config.zig",
+        },
     };
     for (contract_tests) |contract| {
         const contract_mod = b.createModule(.{

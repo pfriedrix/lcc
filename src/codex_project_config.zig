@@ -1,6 +1,8 @@
 const std = @import("std");
 const Io = std.Io;
 
+const codex_projects = @import("codex_projects.zig");
+
 pub const ProjectConfig = enum { copy, link };
 pub const Status = enum { copied, linked, skipped_exists };
 pub const BootstrapOptions = struct {
@@ -99,11 +101,15 @@ pub fn discoverMcp(
     repo_root: []const u8,
     environ: *const std.process.Environ.Map,
 ) !?Mcp {
-    _ = environ;
-    return discoverMcpWithIo(gpa, std.testing.io, repo_root);
+    return discoverMcpWithIo(gpa, std.testing.io, repo_root, environ);
 }
 
-pub fn discoverMcpWithIo(gpa: std.mem.Allocator, io: Io, repo_root: []const u8) !?Mcp {
+pub fn discoverMcpWithIo(
+    gpa: std.mem.Allocator,
+    io: Io,
+    repo_root: []const u8,
+    environ: *const std.process.Environ.Map,
+) !?Mcp {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -115,6 +121,14 @@ pub fn discoverMcpWithIo(gpa: std.mem.Allocator, io: Io, repo_root: []const u8) 
         },
         else => return err,
     };
+    // A repo whose `.codex` *is* the Codex home carries nothing: Codex already
+    // loads that file by itself, so reporting its servers as the project's would
+    // double-count what the agent reads natively. This is the same reason `start`
+    // skips the Claude carry on the main checkout.
+    if (isCodexHomeConfig(io, arena, path, environ)) {
+        arena_state.deinit();
+        return null;
+    }
     var names: std.ArrayList([]const u8) = .empty;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |raw| {
@@ -129,6 +143,25 @@ pub fn discoverMcpWithIo(gpa: std.mem.Allocator, io: Io, repo_root: []const u8) 
         return null;
     }
     return .{ .arena = arena_state, .path = path, .names = try names.toOwnedSlice(arena) };
+}
+
+/// Whether `path` is the very file Codex loads on its own — `$CODEX_HOME/config.toml`,
+/// or `$HOME/.codex/config.toml` when that is unset. Compared canonically, so a
+/// `.codex` symlinked at the Codex home is recognised too. Anything that cannot be
+/// resolved is not the home config: a missing global config means every repo-local
+/// one is genuinely the project's.
+fn isCodexHomeConfig(
+    io: Io,
+    arena: std.mem.Allocator,
+    path: []const u8,
+    environ: *const std.process.Environ.Map,
+) bool {
+    const codex_home = codex_projects.home(arena, environ) catch return false;
+    const home_config = std.fs.path.join(arena, &.{ codex_home, "config.toml" }) catch return false;
+    const cwd = Io.Dir.cwd();
+    const canonical_home = cwd.realPathFileAlloc(io, home_config, arena) catch return false;
+    const canonical_path = cwd.realPathFileAlloc(io, path, arena) catch return false;
+    return std.mem.eql(u8, canonical_home, canonical_path);
 }
 
 fn parseMcpHeader(line: []const u8) ?[]const u8 {
