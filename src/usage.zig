@@ -192,7 +192,10 @@ pub const Scanner = struct {
     skipped: usize = 0,
     /// What earlier runs already read. `uc.Cache.none` opts out.
     cache: uc.Cache,
-    codex: ?sessions.Snapshot = null,
+    /// Set once `includeCodex` has been called. Holds the rollout catalog and the
+    /// parses made from it, so the worktrees a command asks about are discovered
+    /// once between them and each rollout is read at most once.
+    codex: ?sessions.Scanner = null,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, cache: uc.Cache) Scanner {
         return .{ .gpa = gpa, .io = io, .scratch = .init(gpa), .cache = cache };
@@ -202,16 +205,18 @@ pub const Scanner = struct {
     /// and a cache that needs a second call remembered is a cache that quietly
     /// stops working the first time someone adds a `return` above it.
     pub fn deinit(self: *Scanner) void {
-        if (self.codex) |*snapshot| snapshot.deinit();
+        if (self.codex) |*scanner| scanner.deinit();
         self.cache.save();
         self.scratch.deinit();
         self.seen.deinit(self.gpa);
     }
 
+    /// Counts Codex sessions towards every worktree this scanner is asked about
+    /// from here on. Nothing is read yet: `~/.codex` is walked on the first
+    /// worktree that needs it, and a rollout is only parsed once some worktree
+    /// claims it.
     pub fn includeCodex(self: *Scanner, environ: *const std.process.Environ.Map) void {
-        var scanner = sessions.Scanner.initWithIo(self.gpa, self.io, environ);
-        defer scanner.deinit();
-        self.codex = scanner.scan(.cached) catch null;
+        self.codex = sessions.Scanner.initWithIo(self.gpa, self.io, environ);
     }
 
     /// Usage across every `.jsonl` in one Claude Code project directory. A
@@ -282,7 +287,9 @@ pub const Scanner = struct {
         const dirs = try self.gpa.alloc([]const u8, mine.len);
         for (mine, 0..) |entry, i| dirs[i] = entry.path;
         var totals = try self.projectDirs(dirs);
-        if (self.codex) |*snapshot| try addCodex(self.gpa, &totals, snapshot.usageForWorktree(worktree_path));
+        if (self.codex) |*scanner| {
+            try addCodex(self.gpa, &totals, scanner.usageForWorktree(.cached, worktree_path));
+        }
         return totals;
     }
 

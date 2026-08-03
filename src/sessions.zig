@@ -100,24 +100,42 @@ pub const Snapshot = struct {
     }
 
     pub fn usageForWorktree(self: *Snapshot, worktree: []const u8) Usage {
-        const arena = self.arena.allocator();
-        var result: Usage = .{};
-        var models: std.ArrayList(ModelUsage) = .empty;
-        var stamps: std.ArrayList([]const u8) = .empty;
+        var total: Accumulator = .{ .arena = self.arena.allocator() };
         for (self.sessions) |entry| {
             if (!sameWorktree(entry.cwd(), worktree)) continue;
-            const one = entry.usage();
-            result.sessions += 1;
-            result.counts.add(one.counts);
-            if (one.last) |last| {
-                if (result.last == null or std.mem.lessThan(u8, result.last.?, last)) result.last = last;
-            }
-            for (one.models) |model| addModel(arena, &models, model) catch return .{};
-            stamps.appendSlice(arena, one.stamps) catch return .{};
+            total.add(entry.usage()) catch return .{};
         }
-        result.models = models.toOwnedSlice(arena) catch return .{};
-        result.stamps = stamps.toOwnedSlice(arena) catch return .{};
-        return result;
+        return total.finish() catch .{};
+    }
+};
+
+/// Several sessions' usage folded into one worktree's total. Shared by the
+/// snapshot, which folds sessions it already holds, and the scanner, which folds
+/// rollouts as it parses them — so the two cannot disagree about what a worktree
+/// has spent.
+const Accumulator = struct {
+    arena: std.mem.Allocator,
+    total: Usage = .{},
+    models: std.ArrayList(ModelUsage) = .empty,
+    stamps: std.ArrayList([]const u8) = .empty,
+
+    fn add(self: *Accumulator, one: Usage) !void {
+        self.total.sessions += 1;
+        self.total.counts.add(one.counts);
+        if (one.last) |last| {
+            if (self.total.last == null or std.mem.lessThan(u8, self.total.last.?, last)) {
+                self.total.last = last;
+            }
+        }
+        for (one.models) |model| try addModel(self.arena, &self.models, model);
+        try self.stamps.appendSlice(self.arena, one.stamps);
+    }
+
+    fn finish(self: *Accumulator) !Usage {
+        var out = self.total;
+        out.models = try self.models.toOwnedSlice(self.arena);
+        out.stamps = try self.stamps.toOwnedSlice(self.arena);
+        return out;
     }
 };
 
@@ -152,6 +170,13 @@ pub const Scanner = struct {
     /// live here, so a `Snapshot` never aliases a scanner that may outlast it.
     store: std.heap.ArenaAllocator,
     cache: std.StringHashMapUnmanaged(Cached) = .empty,
+    /// Which rollouts exist and whose directory each belongs to, discovered on
+    /// first use and kept. Walking `~/.codex` is itself thousands of file reads,
+    /// and a command that asks about twenty worktrees must not pay for it twenty
+    /// times. Rollouts appearing after the first question are not picked up — the
+    /// scanners here live for the length of one command, and Codex is not writing
+    /// into `~/.codex` during it.
+    catalog: ?codex_projects.Catalog = null,
 
     pub fn init(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) !Scanner {
         return initWithIo(gpa, std.testing.io, environ);
@@ -162,19 +187,53 @@ pub const Scanner = struct {
     }
 
     pub fn deinit(self: *Scanner) void {
+        if (self.catalog) |*catalog| catalog.deinit();
         self.cache.deinit(self.gpa);
         self.store.deinit();
         self.* = undefined;
     }
 
+    /// Every rollout on disk, with the directory each ran in — metadata only.
+    /// Nothing is parsed for usage here, which is the point: discovery is cheap
+    /// and answers "whose is this", and only the rollouts someone asks about get
+    /// read in full.
+    ///
+    /// A tree that cannot be walked is an empty one. Usage is decoration on
+    /// commands that have other work to do.
+    fn entries(self: *Scanner) []const codex_projects.Entry {
+        if (self.catalog == null) {
+            self.catalog = codex_projects.scanWithIo(self.gpa, self.io, self.environ) catch
+                return &.{};
+        }
+        return self.catalog.?.entries;
+    }
+
+    /// What one worktree's Codex sessions have spent, parsing only the rollouts
+    /// that belong to it.
+    ///
+    /// This is what the dashboards actually want, and the difference is not
+    /// small: `~/.codex` holds every session from every directory Codex has ever
+    /// run in, while a worktree owns a handful of them. Folding usage here rather
+    /// than building a snapshot first is what lets the rest stay unread.
+    pub fn usageForWorktree(self: *Scanner, mode: ScanMode, worktree: []const u8) Usage {
+        var total: Accumulator = .{ .arena = self.store.allocator() };
+        for (self.entries()) |entry| {
+            if (!sameWorktree(entry.cwd, worktree)) continue;
+            const parsed = self.usageFor(mode, entry.rollout_path) orelse continue;
+            total.add(parsed) catch return .{};
+        }
+        return total.finish() catch .{};
+    }
+
+    /// Every rollout, parsed. For callers that need the sessions themselves
+    /// rather than one worktree's total; `usageForWorktree` is the cheaper
+    /// question and the one the dashboards ask.
     pub fn scan(self: *Scanner, mode: ScanMode) !Snapshot {
-        var catalog = try codex_projects.scanWithIo(self.gpa, self.io, self.environ);
-        defer catalog.deinit();
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         errdefer arena_state.deinit();
         const arena = arena_state.allocator();
         var out: std.ArrayList(Session) = .empty;
-        for (catalog.entries) |entry| {
+        for (self.entries()) |entry| {
             const parsed = self.usageFor(mode, entry.rollout_path) orelse continue;
             try out.append(arena, .{ .codex = .{
                 .session_id = try arena.dupe(u8, entry.session_id),
