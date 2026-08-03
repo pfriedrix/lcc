@@ -65,6 +65,58 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // The contract tests under `tests/` were authored against the module they pin
+    // and import it by name — `@import("sessions")`, not a path — so each needs its
+    // own test artifact with that one module wired in. Hanging them off the same
+    // `test` step is the whole point: they are the only thing pinning the Codex
+    // acceptance criteria, and reached solely through an ad-hoc `zig test --dep`
+    // they were green in a transcript nobody re-runs.
+    const contract_tests = [_]struct {
+        file: []const u8,
+        import: []const u8,
+        source: []const u8,
+    }{
+        .{
+            .file = "tests/codex_usage_test.zig",
+            .import = "sessions",
+            .source = "src/sessions.zig",
+        },
+        .{
+            .file = "tests/codex_sessions_test.zig",
+            .import = "codex_projects",
+            .source = "src/codex_projects.zig",
+        },
+        .{
+            .file = "tests/codex_project_config_test.zig",
+            .import = "codex_project_config",
+            .source = "src/codex_project_config.zig",
+        },
+        .{
+            .file = "tests/codex_project_config_safety_test.zig",
+            .import = "codex_project_config",
+            .source = "src/codex_project_config.zig",
+        },
+        .{
+            .file = "tests/codex_project_config_env_test.zig",
+            .import = "codex_project_config",
+            .source = "src/codex_project_config.zig",
+        },
+    };
+    for (contract_tests) |contract| {
+        const contract_mod = b.createModule(.{
+            .root_source_file = b.path(contract.file),
+            .target = target,
+            .optimize = optimize,
+        });
+        contract_mod.addImport(contract.import, b.createModule(.{
+            .root_source_file = b.path(contract.source),
+            .target = target,
+            .optimize = optimize,
+        }));
+        const contract_test = b.addTest(.{ .root_module = contract_mod });
+        test_step.dependOn(&b.addRunArtifact(contract_test).step);
+    }
 }
 
 /// Which certificate to sign the installed binary with. Nothing has to be set up for

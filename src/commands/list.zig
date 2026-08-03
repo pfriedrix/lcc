@@ -229,6 +229,7 @@ fn tokenTask(app: app_mod.App, choices: []const app_mod.Choice, cells: [][]const
 
     var scanner: usage.Scanner = .init(app.gpa, app.io, .open(app.gpa, app.io, app.environ));
     defer scanner.deinit();
+    scanner.includeCodex(app.environ);
 
     for (choices, 0..) |choice, i| {
         const totals = scanner.worktree(projects, choice.entry.path) catch continue;
