@@ -1,4 +1,4 @@
-//! `lcc remove` — drop a worktree, its Xcode build data, and its branch.
+//! `lcc remove` — drop selected worktrees, their Xcode build data, and branches.
 //! `--merged` does the same in bulk for everything whose work is already safe.
 
 const std = @import("std");
@@ -56,6 +56,14 @@ const Attached = struct {
     }
 };
 
+/// One explicitly selected worktree and everything the removal needs to decide
+/// and explain before changing the filesystem.
+const Removal = struct {
+    choice: app_mod.Choice,
+    attached: Attached = .{},
+    disposition: ?git.BranchDisposition = null,
+};
+
 pub fn run(app: app_mod.App, opts: Opts) !void {
     const repo = try app.repo();
     if (opts.merged) return runMerged(app, repo, opts);
@@ -68,73 +76,22 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         return;
     }
 
-    const picked = try app_mod.pickWorktree(app, choices, "Pick a worktree to remove:") orelse
-        std.process.exit(app_mod.cancelled_exit_code);
-
-    // Match before removing: once the directory is gone the folders still resolve by
-    // path, but the user needs to see what is about to go in the confirmation.
-    const dd_root = try dd.root(app.gpa, app.io, app.environ);
-    const cp_root = try cp.root(app.gpa, app.environ);
-
-    const derived: []dd.Entry = if (opts.keep_derived_data)
-        &.{}
-    else
-        try dd.forWorktree(app.gpa, app.io, try dd.list(app.gpa, app.io, dd_root), picked.entry.path);
-    // Matched even when they are being kept — "not silently" means the row shows up.
-    const sessions = try cp.forWorktree(
-        app.gpa,
-        app.io,
-        try cp.list(app.gpa, app.io, cp_root),
-        picked.entry.path,
-    );
-
-    if (derived.len + sessions.len > 0) {
-        app.ui.step("Measuring what the worktree left behind ({d})…", .{derived.len + sessions.len});
-        app.ui.flush();
-    }
-    var scanner: usage.Scanner = .init(app.gpa, app.io, .open(app.gpa, app.io, app.environ));
-    defer scanner.deinit();
-    const session_dirs = try app.gpa.alloc([]const u8, sessions.len);
-    for (sessions, 0..) |entry, i| session_dirs[i] = entry.path;
-
-    const attached: Attached = .{
-        .derived = try dd.withSizes(app.gpa, app.io, derived),
-        .sessions = try cp.withSizes(app.gpa, app.io, sessions),
-        .spent = try scanner.projectDirs(session_dirs),
-        .xcode = try heldByXcode(app, opts, picked.entry.path),
-    };
-
-    if (attached.xcode.unanswered) {
-        app.ui.warn("Could not ask Xcode what it has open — it may be holding this worktree.", .{});
-        app.ui.hint("  {s}", .{automation_hint});
-    }
-
-    // Unsaved editor work is not lcc's to throw away. Xcode's scripting interface
-    // offers no way to save it, and removing the worktree would take it along, so
-    // the run stops here instead of asking a question with no good answer.
-    if (attached.xcode.unsaved.len > 0 and !opts.force) {
-        app.ui.warn("Xcode has unsaved changes in this worktree — nothing removed.", .{});
-        for (attached.xcode.unsaved) |doc| app.ui.hint("  {s}", .{doc.path});
-        app.ui.hint("Save them in Xcode, or remove anyway with: lcc remove --force", .{});
+    const selected = try selectWorktrees(app, choices);
+    if (selected.len == 0) {
+        app.ui.hint("Nothing selected.", .{});
         return;
     }
 
-    var disposition: ?git.BranchDisposition = if (picked.entry.branch != null and !opts.keep_branch)
-        try repo.branchDisposition(picked.entry.branch.?)
-    else
-        null;
-    // Only a branch local refs cannot vouch for is worth a round trip — and that
-    // is exactly the branch whose pull request was squash-merged.
-    if (disposition) |d| {
-        if (d.reason == .unmerged and !opts.local) {
-            if (pullRequests(app, repo, &.{d.branch})) |prs| {
-                if (github.mergedFor(prs, d.branch)) |number| disposition = d.withMergedPr(number);
-            }
-        }
-    }
+    // Match before removing: once a directory is gone the folders still resolve by
+    // path, but the user needs to see everything about to go in one confirmation.
+    const dd_root = try dd.root(app.gpa, app.io, app.environ);
+    const cp_root = try cp.root(app.gpa, app.environ);
+    const removals = try prepareRemovals(app, repo, selected, opts, dd_root, cp_root);
+    const actionable = try withoutUnsavedWork(app, removals, opts);
+    if (actionable.len == 0) return;
 
     if (!opts.yes) {
-        const message = try confirmMessage(app, picked, attached, disposition, opts);
+        const message = try confirmRemovalsMessage(app, actionable, opts);
         const answer = try prompt.confirm(app.gpa, app.io, message, false) orelse
             std.process.exit(app_mod.cancelled_exit_code);
         if (!answer) {
@@ -143,37 +100,256 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         }
     }
 
-    const closed = closeXcode(app, attached.xcode);
+    try removeSelected(app, repo, actionable, opts, dd_root, cp_root);
+}
 
-    repo.removeWorktree(picked.entry.path, opts.force) catch |err| {
-        if (opts.force) return err;
-        app.ui.warn("{s}", .{git.last_error});
-        app.ui.flush();
-        const forced = try prompt.confirm(
-            app.gpa,
-            app.io,
-            "Worktree has uncommitted changes or is locked. Force remove?",
-            false,
-        ) orelse std.process.exit(app_mod.cancelled_exit_code);
-        if (!forced) {
-            app.ui.hint("Aborted.", .{});
-            noteReopen(app, closed);
-            return;
+fn selectWorktrees(app: app_mod.App, choices: []const app_mod.Choice) ![]const app_mod.Choice {
+    const items = try app.gpa.alloc(prompt.Item, choices.len);
+    for (choices, 0..) |choice, i| {
+        items[i] = .{ .label = try app_mod.worktreeLabel(app.gpa, choice) };
+    }
+
+    app.ui.flush();
+    const chosen = try prompt.checkbox(
+        app.gpa,
+        app.io,
+        "Select worktrees to remove (space toggles, enter confirms):",
+        items,
+        false,
+    ) orelse std.process.exit(app_mod.cancelled_exit_code);
+    return choicesAt(app.gpa, choices, chosen);
+}
+
+fn choicesAt(
+    gpa: std.mem.Allocator,
+    choices: []const app_mod.Choice,
+    indices: []const usize,
+) ![]const app_mod.Choice {
+    const subset = try gpa.alloc(app_mod.Choice, indices.len);
+    for (indices, 0..) |index, i| subset[i] = choices[index];
+    return subset;
+}
+
+/// Resolves branch safety, Xcode windows, build data, sessions, sizes, and usage
+/// for the entire selection in batches. A large selection should not mean one
+/// fetch, `du`, AppleScript query, or transcript scan per worktree.
+fn prepareRemovals(
+    app: app_mod.App,
+    repo: git.Repo,
+    selected: []const app_mod.Choice,
+    opts: Opts,
+    dd_root: []const u8,
+    cp_root: []const u8,
+) ![]Removal {
+    const removals = try app.gpa.alloc(Removal, selected.len);
+    for (selected, 0..) |choice, i| {
+        removals[i] = .{
+            .choice = choice,
+            .disposition = if (choice.entry.branch != null and !opts.keep_branch)
+                try repo.branchDisposition(choice.entry.branch.?)
+            else
+                null,
+        };
+    }
+
+    // Local refs cannot recognize a squash merge while its remote branch still
+    // exists. Ask GitHub once for every selected branch that needs that answer.
+    if (!opts.local and !opts.keep_branch) {
+        var asked: std.ArrayList([]const u8) = .empty;
+        for (removals) |removal| {
+            const disposition = removal.disposition orelse continue;
+            if (disposition.reason == .unmerged) try asked.append(app.gpa, disposition.branch);
         }
-        try repo.removeWorktree(picked.entry.path, true);
-    };
+        if (asked.items.len > 0) {
+            if (pullRequests(app, repo, asked.items)) |prs| {
+                for (removals) |*removal| {
+                    const disposition = removal.disposition orelse continue;
+                    const number = github.mergedFor(prs, disposition.branch) orelse continue;
+                    removal.disposition = disposition.withMergedPr(number);
+                }
+            }
+        }
+    }
 
-    app.ui.success("Removed worktree {f}", .{
-        ui.cyan(picked.entry.branch orelse app_mod.shortHead(picked.entry.head)),
-    });
+    const dd_all: []dd.Entry = if (opts.keep_derived_data)
+        &.{}
+    else
+        try dd.list(app.gpa, app.io, dd_root);
+    // Sessions are matched even when they are being kept: the confirmation must
+    // say that they exist rather than silently leaving them behind.
+    const cp_all = try cp.list(app.gpa, app.io, cp_root);
+    const held: xcode.Open = if (opts.keep_xcode) .{} else try xcode.openDocuments(app.gpa, app.io);
+    if (held.unanswered) {
+        app.ui.warn("Could not ask Xcode what it has open — it may be holding some of these.", .{});
+        app.ui.hint("  {s}", .{automation_hint});
+    }
 
+    const derived = try app.gpa.alloc([]dd.Entry, removals.len);
+    const sessions = try app.gpa.alloc([]cp.Entry, removals.len);
+    const in_xcode = try app.gpa.alloc(xcode.Open, removals.len);
+    var paths: std.ArrayList([]const u8) = .empty;
+
+    for (removals, 0..) |removal, i| {
+        const path = removal.choice.entry.path;
+        derived[i] = try dd.forWorktree(app.gpa, app.io, dd_all, path);
+        sessions[i] = try cp.forWorktree(app.gpa, app.io, cp_all, path);
+        in_xcode[i] = try held.inside(app.gpa, app.io, path);
+        for (derived[i]) |entry| try paths.append(app.gpa, entry.path);
+        for (sessions[i]) |entry| try paths.append(app.gpa, entry.path);
+    }
+
+    if (paths.items.len > 0) {
+        app.ui.step("Measuring build data and sessions ({d})…", .{paths.items.len});
+        app.ui.flush();
+    }
+    const sizes = try disk.usage(app.gpa, app.io, paths.items);
+
+    var scanner: usage.Scanner = .init(app.gpa, app.io, .open(app.gpa, app.io, app.environ));
+    defer scanner.deinit();
+
+    var at: usize = 0;
+    for (removals, 0..) |*removal, i| {
+        const dd_sized = try app.gpa.alloc(dd.Sized, derived[i].len);
+        for (derived[i], 0..) |entry, j| {
+            dd_sized[j] = .{ .entry = entry, .size = sizes[at] };
+            at += 1;
+        }
+
+        const cp_sized = try app.gpa.alloc(cp.Sized, sessions[i].len);
+        const session_dirs = try app.gpa.alloc([]const u8, sessions[i].len);
+        for (sessions[i], 0..) |entry, j| {
+            cp_sized[j] = .{ .entry = entry, .size = sizes[at] };
+            session_dirs[j] = entry.path;
+            at += 1;
+        }
+        removal.attached = .{
+            .derived = dd_sized,
+            .sessions = cp_sized,
+            .spent = try scanner.projectDirs(session_dirs),
+            .xcode = in_xcode[i],
+        };
+    }
+    return removals;
+}
+
+fn confirmRemovalsMessage(app: app_mod.App, removals: []const Removal, opts: Opts) ![]u8 {
+    if (removals.len == 1) {
+        const removal = removals[0];
+        return confirmMessage(app, removal.choice, removal.attached, removal.disposition, opts);
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(app.gpa, try std.fmt.allocPrint(app.gpa, "Remove {d} worktrees?\n", .{removals.len}));
+    for (removals) |removal| {
+        const label = removal.choice.entry.branch orelse app_mod.shortHead(removal.choice.entry.head);
+        try out.appendSlice(app.gpa, try std.fmt.allocPrint(app.gpa, "\n  {s}\n", .{label}));
+        try appendConfirmationDetails(
+            app,
+            &out,
+            removal.choice,
+            removal.attached,
+            removal.disposition,
+            opts,
+        );
+    }
+    return out.toOwnedSlice(app.gpa);
+}
+
+/// Xcode cannot save through AppleScript, so an unsaved document removes its
+/// whole worktree from the actionable subset. Reporting that before the combined
+/// confirmation keeps every line in the prompt truthful about what Enter does.
+fn withoutUnsavedWork(app: app_mod.App, removals: []const Removal, opts: Opts) ![]const Removal {
+    if (opts.force) return removals;
+
+    var actionable: std.ArrayList(Removal) = .empty;
+    for (removals) |removal| {
+        if (removal.attached.xcode.unsaved.len == 0) {
+            try actionable.append(app.gpa, removal);
+            continue;
+        }
+
+        const entry = removal.choice.entry;
+        const label = entry.branch orelse app_mod.shortHead(entry.head);
+        app.ui.warn("Kept {f} — Xcode has unsaved changes in it", .{ui.cyan(label)});
+        for (removal.attached.xcode.unsaved) |doc| app.ui.hint("  {s}", .{doc.path});
+        app.ui.hint("  Save them there, or rerun with: lcc remove --force", .{});
+    }
+    return actionable.toOwnedSlice(app.gpa);
+}
+
+fn removeSelected(
+    app: app_mod.App,
+    repo: git.Repo,
+    removals: []const Removal,
+    opts: Opts,
+    dd_root: []const u8,
+    cp_root: []const u8,
+) !void {
+    var removed: usize = 0;
+    var kept_sessions: usize = 0;
     var reclaimed: u64 = 0;
-    reclaimed += try purgeDerived(app, attached.derived, dd_root);
-    if (opts.sessions) {
-        reclaimed += try purgeSessions(app, attached.sessions, cp_root);
-    } else if (attached.sessions.len > 0) {
+
+    for (removals) |removal| {
+        const entry = removal.choice.entry;
+        const label = entry.branch orelse app_mod.shortHead(entry.head);
+
+        // Unsaved editor work is not lcc's to throw away. Skip this row without
+        // stopping the rest of an explicitly selected batch.
+        if (removal.attached.xcode.unsaved.len > 0 and !opts.force) {
+            app.ui.warn("Kept {f} — Xcode has unsaved changes in it", .{ui.cyan(label)});
+            for (removal.attached.xcode.unsaved) |doc| app.ui.hint("  {s}", .{doc.path});
+            app.ui.hint("  Save them there, or rerun with: lcc remove --force", .{});
+            continue;
+        }
+
+        const closed = closeXcode(app, removal.attached.xcode);
+        const gone = remove: {
+            repo.removeWorktree(entry.path, opts.force) catch {
+                if (opts.force) {
+                    app.ui.warn("Kept {f} — {s}", .{ ui.cyan(label), git.last_error });
+                    noteReopen(app, closed);
+                    break :remove false;
+                }
+
+                app.ui.warn("Could not remove {f} — {s}", .{ ui.cyan(label), git.last_error });
+                app.ui.flush();
+                const message = try std.fmt.allocPrint(
+                    app.gpa,
+                    "{s} has uncommitted changes or is locked. Force remove?",
+                    .{label},
+                );
+                const forced = try prompt.confirm(app.gpa, app.io, message, false) orelse
+                    std.process.exit(app_mod.cancelled_exit_code);
+                if (!forced) {
+                    app.ui.hint("Kept {s}.", .{label});
+                    noteReopen(app, closed);
+                    break :remove false;
+                }
+                repo.removeWorktree(entry.path, true) catch {
+                    app.ui.warn("Kept {f} — {s}", .{ ui.cyan(label), git.last_error });
+                    noteReopen(app, closed);
+                    break :remove false;
+                };
+            };
+            break :remove true;
+        };
+        if (!gone) continue;
+
+        removed += 1;
+        app.ui.success("Removed worktree {f}", .{ui.cyan(label)});
+        reclaimed += try purgeDerived(app, removal.attached.derived, dd_root);
+        if (opts.sessions) {
+            reclaimed += try purgeSessions(app, removal.attached.sessions, cp_root);
+        } else {
+            kept_sessions += removal.attached.sessions.len;
+        }
+
+        try disposeBranch(app, repo, entry.branch, removal.disposition);
+    }
+
+    if (kept_sessions > 0) {
         app.ui.hint("Kept {d} session transcript folder{s} — delete with: lcc remove --sessions", .{
-            attached.sessions.len, plural(attached.sessions.len),
+            kept_sessions, plural(kept_sessions),
         });
     }
     if (reclaimed > 0) {
@@ -181,20 +357,13 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
             ui.bold(try std.fmt.allocPrint(app.gpa, "{f}", .{ui.bytes(reclaimed)})),
         });
     }
-
-    try disposeBranch(app, repo, picked.entry.branch, disposition);
+    if (removals.len > 1) {
+        app.ui.success("Removed {d} of {d} selected worktrees.", .{ removed, removals.len });
+    }
 }
 
 const automation_hint =
     "Allow it under System Settings → Privacy & Security → Automation, or use --keep-xcode.";
-
-/// What Xcode has open under `worktree`, or nothing when `--keep-xcode` says not to
-/// involve it — in which case Xcode is never asked in the first place.
-fn heldByXcode(app: app_mod.App, opts: Opts, worktree: []const u8) !xcode.Open {
-    if (opts.keep_xcode) return .{};
-    const all = try xcode.openDocuments(app.gpa, app.io);
-    return all.inside(app.gpa, app.io, worktree);
-}
 
 /// Hands the worktree back before git deletes it. True when a window actually
 /// closed, which a removal that then fails owes the user an explanation for.
@@ -279,6 +448,19 @@ fn confirmMessage(
     var out: std.ArrayList(u8) = .empty;
     const w = app.gpa;
     try out.appendSlice(w, try std.fmt.allocPrint(w, "Remove worktree {s}?\n", .{label}));
+    try appendConfirmationDetails(app, &out, picked, attached, disposition, opts);
+    return out.toOwnedSlice(w);
+}
+
+fn appendConfirmationDetails(
+    app: app_mod.App,
+    out: *std.ArrayList(u8),
+    picked: app_mod.Choice,
+    attached: Attached,
+    disposition: ?git.BranchDisposition,
+    opts: Opts,
+) !void {
+    const w = app.gpa;
     try out.appendSlice(w, try std.fmt.allocPrint(w, "    worktree   {s}\n", .{picked.entry.path}));
     for (attached.xcode.workspaces) |doc| {
         try out.appendSlice(w, try std.fmt.allocPrint(w, "    xcode      {s}  (open — will be closed)\n", .{
@@ -315,7 +497,6 @@ fn confirmMessage(
             d.branch, try describeDisposition(w, d),
         }));
     }
-    return out.toOwnedSlice(w);
 }
 
 fn describeDisposition(gpa: std.mem.Allocator, d: git.BranchDisposition) ![]const u8 {
@@ -711,6 +892,51 @@ fn selectRows(app: app_mod.App, rows: []const Row, opts: Opts) ![]const Row {
 
 fn plural(n: anytype) []const u8 {
     return if (n == 1) "" else "s";
+}
+
+test "worktree multi-selection preserves zero one and many choices" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const choices = [_]app_mod.Choice{
+        .{ .entry = .{
+            .path = "/tmp/one",
+            .branch = "feature/one",
+            .head = "11111111",
+            .locked = false,
+            .prunable = false,
+            .is_main = false,
+        }, .managed = true },
+        .{ .entry = .{
+            .path = "/tmp/two",
+            .branch = "feature/two",
+            .head = "22222222",
+            .locked = false,
+            .prunable = false,
+            .is_main = false,
+        }, .managed = true },
+        .{ .entry = .{
+            .path = "/tmp/detached",
+            .branch = null,
+            .head = "33333333",
+            .locked = false,
+            .prunable = false,
+            .is_main = false,
+        }, .managed = false },
+    };
+
+    const none = try choicesAt(arena, &choices, &.{});
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+
+    const one = try choicesAt(arena, &choices, &.{1});
+    try std.testing.expectEqualStrings("feature/two", one[0].entry.branch.?);
+
+    const many = try choicesAt(arena, &choices, &.{ 0, 2 });
+    try std.testing.expectEqual(@as(usize, 2), many.len);
+    try std.testing.expectEqualStrings("/tmp/one", many[0].entry.path);
+    try std.testing.expectEqualStrings("/tmp/detached", many[1].entry.path);
+    try std.testing.expect(many[1].entry.branch == null);
 }
 
 test "a bulk row shows what it frees and what it spent" {
