@@ -40,6 +40,9 @@ pub const State = enum {
 pub const PullRequest = struct {
     number: u32,
     branch: []const u8,
+    /// What the pull request merges *into*. The one fact that says which release
+    /// a feature branch was cut for, and it rides on a request lcc already makes.
+    base: []const u8 = "",
     state: State,
     draft: bool,
 
@@ -53,6 +56,7 @@ pub const PullRequest = struct {
 const RawPr = struct {
     number: u32,
     headRefName: []const u8,
+    baseRefName: []const u8 = "",
     state: []const u8,
     isDraft: bool = false,
 };
@@ -122,6 +126,7 @@ pub fn forBranches(
             out.append(gpa, .{
                 .number = pr.number,
                 .branch = pr.headRefName,
+                .base = pr.baseRefName,
                 .state = parseState(pr.state),
                 .draft = pr.isDraft,
             }) catch return null;
@@ -141,7 +146,7 @@ fn buildQuery(gpa: std.mem.Allocator, branches: []const []const u8) ![]const u8 
         try q.appendSlice(gpa, try std.fmt.allocPrint(
             gpa,
             "b{d}:pullRequests(headRefName:{s},first:{d},orderBy:{{field:CREATED_AT,direction:DESC}})" ++
-                "{{nodes{{number state isDraft headRefName}}}}",
+                "{{nodes{{number state isDraft headRefName baseRefName}}}}",
             .{ i, literal, per_branch },
         ));
     }
