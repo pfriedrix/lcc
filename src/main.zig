@@ -4,6 +4,7 @@ const Io = std.Io;
 const app_mod = @import("app.zig");
 const auth_cmd = @import("commands/auth.zig");
 const clean_cmd = @import("commands/clean.zig");
+const issue_cmd = @import("commands/issue.zig");
 const list_cmd = @import("commands/list.zig");
 const open_cmd = @import("commands/open.zig");
 const remove_cmd = @import("commands/remove.zig");
@@ -32,6 +33,18 @@ const usage =
     \\    --plan <file>          start from a plan that already exists instead of
     \\                           opening in plan mode — reaches the agent as {plan}
     \\                           in startTaskCommand, as a path, not inlined
+    \\  issue <sub> PE-N         Read or write one Linear issue — no repository needed
+    \\    show                   state, project, labels and description — read-only
+    \\    state "<name>"         move it, by the team's own workflow-state name
+    \\      --type <type>        narrow a name two states share
+    \\    comment -m <text>      add a comment — or -f <file> to read it off disk
+    \\    project --assign vX.Y.Z
+    \\                           put it in a release project
+    \\      --create             create the project when it does not exist yet
+    \\      --force              move it out of a project it is already in
+    \\    project --resolve      work out which release it targets — read-only
+    \\      --fetch              refresh the view of origin first
+    \\    --json                 print the result instead of a human summary
     \\  auth                     Authenticate with Linear (OAuth browser flow)
     \\    --logout               remove stored token
     \\    --status               show current authentication state
@@ -122,6 +135,7 @@ fn dispatch(app: app_mod.App, args: []const []const u8) !void {
     if (eq(first, "open") or eq(first, "o")) return openCommand(app, args[1..]);
     if (eq(first, "remove") or eq(first, "rm")) return removeCommand(app, args[1..]);
     if (eq(first, "clean")) return cleanCommand(app, args[1..]);
+    if (eq(first, "issue")) return issueCommand(app, args[1..]);
     if (eq(first, "start")) return startCommand(app, args[1..]);
     if (eq(first, "stats")) return statsCommand(app, args[1..]);
     if (std.mem.startsWith(u8, first, "-")) return error.UnknownOption;
@@ -161,6 +175,104 @@ fn startCommand(app: app_mod.App, args: []const []const u8) !void {
     var machine = app;
     machine.ui.divert = opts.json;
     return start_cmd.run(machine, opts);
+}
+
+fn issueCommand(app: app_mod.App, args: []const []const u8) !void {
+    if (args.len == 0) return error.MissingIssueSubcommand;
+
+    const verb = issue_cmd.resolveVerb(args[0]) orelse {
+        app.ui.fail("Unknown issue subcommand '{s}'. Use one of: show, state, comment, project.", .{args[0]});
+        std.process.exit(1);
+    };
+
+    var opts: issue_cmd.Opts = .{ .sub = issue_cmd.Sub.empty(verb) };
+    // Past the verb, the way `auth setup` starts at 1.
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (eq(arg, "--json")) {
+            opts.json = true;
+            continue;
+        }
+        switch (opts.sub) {
+            .show => {},
+            .state => |*sub| {
+                if (eq(arg, "--type")) {
+                    i += 1;
+                    if (i >= args.len) return error.MissingOptionValue;
+                    sub.type = args[i];
+                    continue;
+                }
+            },
+            .comment => |*sub| {
+                if (eq(arg, "-m") or eq(arg, "--message")) {
+                    i += 1;
+                    if (i >= args.len) return error.MissingOptionValue;
+                    sub.body = args[i];
+                    continue;
+                }
+                if (eq(arg, "-f") or eq(arg, "--file")) {
+                    i += 1;
+                    if (i >= args.len) return error.MissingOptionValue;
+                    sub.file = args[i];
+                    continue;
+                }
+            },
+            .project => |*sub| {
+                if (eq(arg, "--assign")) {
+                    i += 1;
+                    if (i >= args.len) return error.MissingOptionValue;
+                    sub.assign = args[i];
+                    continue;
+                }
+                if (eq(arg, "--resolve")) {
+                    sub.resolve = true;
+                    continue;
+                }
+                if (eq(arg, "--fetch")) {
+                    sub.fetch = true;
+                    continue;
+                }
+                if (eq(arg, "--create")) {
+                    sub.create = true;
+                    continue;
+                }
+                if (eq(arg, "--force")) {
+                    sub.force = true;
+                    continue;
+                }
+            },
+        }
+        if (std.mem.startsWith(u8, arg, "-")) return error.UnknownOption;
+        if (opts.issue == null) {
+            opts.issue = arg;
+        } else switch (opts.sub) {
+            // The only verb with a second positional.
+            .state => |*sub| {
+                if (sub.name != null) return error.TooManyArguments;
+                sub.name = arg;
+            },
+            else => return error.TooManyArguments,
+        }
+    }
+    if (opts.issue == null) return error.MissingIssueIdentifier;
+    switch (opts.sub) {
+        .show => {},
+        .state => |sub| if (sub.name == null) return error.MissingStateName,
+        .comment => |sub| {
+            if (sub.body != null and sub.file != null) return error.ConflictingCommentSource;
+            if (sub.body == null and sub.file == null) return error.MissingCommentBody;
+        },
+        .project => |sub| {
+            if (sub.assign != null and sub.resolve) return error.ConflictingProjectAction;
+            if (sub.assign == null and !sub.resolve) return error.MissingProjectAction;
+        },
+    }
+
+    // stdout belongs to the payload in machine mode, same as `start --json`.
+    var machine = app;
+    machine.ui.divert = opts.json;
+    return issue_cmd.run(machine, opts);
 }
 
 fn authCommand(app: app_mod.App, args: []const []const u8) !void {
@@ -304,12 +416,15 @@ test {
     _ = @import("mcp.zig");
     _ = @import("oauth.zig");
     _ = @import("prompt.zig");
+    _ = @import("release.zig");
     _ = @import("remote_cache.zig");
     _ = @import("repos.zig");
+    _ = @import("semver.zig");
     _ = @import("ui.zig");
     _ = @import("usage.zig");
     _ = @import("usage_cache.zig");
     _ = @import("xcode.zig");
+    _ = @import("commands/issue.zig");
     _ = @import("commands/list.zig");
     _ = @import("commands/remove.zig");
     _ = @import("commands/setup.zig");
@@ -327,6 +442,13 @@ fn describe(err: anyerror) []const u8 {
         error.UnknownOption => "Unknown option. Run `lcc --help`.",
         error.MissingOptionValue => "Missing value for option. Run `lcc --help`.",
         error.MissingClientId => "auth setup requires --client-id <id>.",
+        error.MissingIssueSubcommand => "issue needs a subcommand: show, state, comment, project.",
+        error.MissingProjectAction => "`lcc issue project` needs --assign <vX.Y.Z> or --resolve.",
+        error.ConflictingProjectAction => "`lcc issue project` takes --assign or --resolve, not both.",
+        error.MissingIssueIdentifier => "issue needs an identifier, e.g. `lcc issue show PE-42`.",
+        error.MissingStateName => "`lcc issue state` needs a state name, e.g. `lcc issue state PE-42 \"In Progress\"`.",
+        error.ConflictingCommentSource => "`lcc issue comment` takes -m or -f, not both.",
+        error.MissingCommentBody => "`lcc issue comment` needs -m <text> or -f <file>.",
         error.InvalidConfig => "Configuration is invalid. Fix ~/.config/lcc/config.json.",
         error.TooManyArguments => "Too many arguments. Run `lcc --help`.",
         error.NoHomeDirectory => "HOME is not set.",

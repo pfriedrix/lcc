@@ -28,7 +28,7 @@ const linear = @import("linear.zig");
 
 /// Bumped when the stored shape changes. An older file is dropped rather than
 /// migrated: rebuilding costs one slow run.
-const version: u32 = 2;
+const version: u32 = 3;
 
 /// A ceiling, so a corrupt or hostile file cannot be read into memory unbounded.
 const file_limit = 8 * 1024 * 1024;
@@ -44,6 +44,10 @@ pub const ttl_seconds: i64 = 300;
 const StoredPr = struct {
     number: u32 = 0,
     branch: []const u8 = "",
+    /// What the pull request merges into. Absent from a version-2 file, which is
+    /// why the schema version moved: without it a cached row silently has no base
+    /// and the release resolver's pull-request path disappears for a whole TTL.
+    base: []const u8 = "",
     state: []const u8 = "open",
     draft: bool = false,
 };
@@ -163,6 +167,7 @@ pub const Cache = struct {
             list[i] = .{
                 .number = stored.number,
                 .branch = stored.branch,
+                .base = stored.base,
                 .state = parseState(stored.state),
                 .draft = stored.draft,
             };
@@ -190,6 +195,7 @@ pub const Cache = struct {
             stored[i] = .{
                 .number = pr.number,
                 .branch = self.gpa.dupe(u8, pr.branch) catch return,
+                .base = self.gpa.dupe(u8, pr.base) catch return,
                 .state = @tagName(pr.state),
                 .draft = pr.draft,
             };
