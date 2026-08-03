@@ -17,7 +17,7 @@ pub fn run(app: app_mod.App) !void {
     const start_task_command = try prompt.input(
         app.gpa,
         app.io,
-        "Start-task command (placeholders: {identifier}, {branch}, {url}; empty = disabled):",
+        "Start-task command (placeholders: {identifier}, {branch}, {url}, {plan}; empty = disabled):",
         cfg.startTaskCommand,
     ) orelse std.process.exit(app_mod.cancelled_exit_code);
 

@@ -44,12 +44,26 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     // worktree as its cwd, so a relative path would be read against the wrong
     // directory. A plan that is not there costs a lookup to find out here, and a
     // created worktree to find out later.
-    const plan_path: ?[]const u8 = if (opts.plan) |raw|
-        Io.Dir.cwd().realPathFileAlloc(app.io, raw, app.gpa) catch {
-            bail(app, opts.json, "plan_not_found", "No plan file at {s}.", .{raw});
+    //
+    // `realPathFileAlloc` resolves any path that exists, directories included, and
+    // an absent file is only one of the ways this fails — so "not found" is a claim
+    // to make once it is true, not a catch-all. Told a plan is missing when it is
+    // sitting there unreadable, you go looking for the wrong thing.
+    const plan_path: ?[]const u8 = if (opts.plan) |raw| blk: {
+        const resolved = Io.Dir.cwd().realPathFileAlloc(app.io, raw, app.gpa) catch |err| switch (err) {
+            error.FileNotFound => bail(app, opts.json, "plan_not_found", "No plan file at {s}.", .{raw}),
+            else => bail(app, opts.json, "plan_unreadable", "Cannot read plan at {s}: {s}", .{ raw, @errorName(err) }),
+        };
+        const info = Io.Dir.cwd().statFile(app.io, resolved, .{}) catch |err|
+            bail(app, opts.json, "plan_unreadable", "Cannot read plan at {s}: {s}", .{ raw, @errorName(err) });
+        if (info.kind != .file) {
+            bail(app, opts.json, "plan_not_found", "{s} is a {s}, not a plan file.", .{ raw, @tagName(info.kind) });
         }
-    else
-        null;
+        break :blk resolved;
+    } else null;
+    // Either the work is planned here or a plan was brought to it. One name, so the
+    // banner and the launch cannot come to different conclusions about which.
+    const plan_mode = plan_path == null;
     // Said before the read, not after: the Keychain grants access to a binary by its
     // code signature, so a freshly built lcc can block here on a system dialog for
     // the login password. Announced, that is a wait with a reason; unannounced, it
@@ -103,17 +117,34 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     // Expanded once, above the split: `--json` reports the very string a launch
     // would send, and cannot drift from it by being built twice.
     const trimmed_command = std.mem.trim(u8, cfg.startTaskCommand, " \t");
-    const initial_prompt = if (trimmed_command.len > 0)
+    const expanded = if (trimmed_command.len > 0)
         try expandCommand(app.gpa, cfg.startTaskCommand, selected, wt.branch, plan_path)
     else
         null;
+
+    // `{plan}` is the only thing that carries a plan to the agent, and
+    // `startTaskCommand` is empty by default — so without the placeholder, `--plan`
+    // has one remaining effect: switching plan mode off. That leaves the session
+    // neither planning here nor holding a plan from elsewhere, which is the one
+    // state this design says cannot exist. Refuse it rather than launch it and
+    // print a `Plan:` line asserting a handover that did not happen.
+    if (plan_path != null and (expanded == null or !expanded.?.used_plan)) {
+        bail(
+            app,
+            opts.json,
+            "usage",
+            "--plan needs {{plan}} in startTaskCommand — nothing else carries it to the agent. Add it with `lcc setup`.",
+            .{},
+        );
+    }
+    const initial_prompt: ?[]const u8 = if (expanded) |e| e.text else null;
 
     if (opts.json) {
         try report(app, repo, selected, suggested, wt, carried, initial_prompt);
         return;
     }
 
-    const launch_label = if (plan_path == null)
+    const launch_label = if (plan_mode)
         "Launching Claude Code in plan mode"
     else
         "Launching Claude Code";
@@ -137,13 +168,11 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     app.ui.info("", .{});
     app.ui.flush();
 
-    // Either the work is planned now or a plan was brought to it; there is no
-    // third state where neither happened, so `--plan` is what opts out.
     const args = try launchArgs(
         app.gpa,
         if (claude_carried) |c| c.path else null,
         initial_prompt,
-        plan_path == null,
+        plan_mode,
     );
     const code = try claude.launch(app.gpa, app.io, wt.path, args);
     std.process.exit(code);
@@ -1048,6 +1077,14 @@ fn launchArgs(
     return out.toOwnedSlice(gpa);
 }
 
+const Expanded = struct {
+    text: []u8,
+    /// Whether `{plan}` was in the template at all. `--plan` has no other channel to
+    /// the agent, so a false here means the path reached nobody — which the caller
+    /// refuses rather than launches.
+    used_plan: bool,
+};
+
 /// `{plan}` is the absolute path to a plan file, never its contents: the result
 /// becomes one `argv` element and, in `--json`, one field of a payload a caller
 /// parses. A 20KB plan inlined there would bloat both for bytes the agent can
@@ -1058,8 +1095,9 @@ fn expandCommand(
     issue: linear.Issue,
     branch: []const u8,
     plan_path: ?[]const u8,
-) ![]u8 {
+) !Expanded {
     var out: std.ArrayList(u8) = .empty;
+    var used_plan = false;
     var i: usize = 0;
     while (i < template.len) {
         if (template[i] == '{') {
@@ -1068,6 +1106,7 @@ fn expandCommand(
                 const value: ?[]const u8 =
                     if (std.mem.eql(u8, key, "identifier")) issue.identifier else if (std.mem.eql(u8, key, "branch")) branch else if (std.mem.eql(u8, key, "url")) issue.url else if (std.mem.eql(u8, key, "plan")) (plan_path orelse "") else null;
                 if (value) |v| {
+                    if (std.mem.eql(u8, key, "plan")) used_plan = true;
                     try out.appendSlice(gpa, v);
                     i = close + 1;
                     continue;
@@ -1077,7 +1116,7 @@ fn expandCommand(
         try out.append(gpa, template[i]);
         i += 1;
     }
-    return out.toOwnedSlice(gpa);
+    return .{ .text = try out.toOwnedSlice(gpa), .used_plan = used_plan };
 }
 
 test "expandCommand fills the placeholders and leaves anything else alone" {
@@ -1100,6 +1139,8 @@ test "expandCommand fills the placeholders and leaves anything else alone" {
         template: []const u8,
         plan: ?[]const u8,
         want: []const u8,
+        /// `--plan` is refused when this comes back false, so it is asserted, not incidental.
+        want_used_plan: bool = false,
     }{
         .{ .template = "/start-task {identifier}", .plan = null, .want = "/start-task PE-250" },
         .{ .template = "{branch} {url}", .plan = null, .want = "feature/pe-250-actual https://linear.app/x/issue/PE-250/fix" },
@@ -1109,9 +1150,18 @@ test "expandCommand fills the placeholders and leaves anything else alone" {
             .template = "/start-task {identifier} --plan {plan}",
             .plan = "/Users/me/.claude/plans/x.md",
             .want = "/start-task PE-250 --plan /Users/me/.claude/plans/x.md",
+            .want_used_plan = true,
         },
-        // Without --plan the key disappears rather than expanding to a literal.
-        .{ .template = "read {plan} then go", .plan = null, .want = "read  then go" },
+        // Without --plan the key disappears rather than expanding to a literal — but
+        // the template still owns a channel, so `used_plan` is true.
+        .{ .template = "read {plan} then go", .plan = null, .want = "read  then go", .want_used_plan = true },
+        // The case the bug was: a template with no `{plan}` at all silently drops it.
+        .{
+            .template = "/start-task {identifier}",
+            .plan = "/Users/me/.claude/plans/x.md",
+            .want = "/start-task PE-250",
+            .want_used_plan = false,
+        },
         // Unknown keys and an unclosed brace are template text, not an error.
         .{ .template = "{nope} {identifier}", .plan = null, .want = "{nope} PE-250" },
         .{ .template = "{unclosed", .plan = null, .want = "{unclosed" },
@@ -1119,8 +1169,9 @@ test "expandCommand fills the placeholders and leaves anything else alone" {
 
     for (cases) |case| {
         const got = try expandCommand(gpa, case.template, issue, "feature/pe-250-actual", case.plan);
-        defer gpa.free(got);
-        try std.testing.expectEqualStrings(case.want, got);
+        defer gpa.free(got.text);
+        try std.testing.expectEqualStrings(case.want, got.text);
+        try std.testing.expectEqual(case.want_used_plan, got.used_plan);
     }
 }
 
@@ -1178,12 +1229,6 @@ test "launchArgs opens in plan mode, and the mode stays ahead of the separator" 
     try std.testing.expectEqualStrings("plan", with_mcp[1]);
     try std.testing.expectEqualStrings("--mcp-config", with_mcp[2]);
     try std.testing.expectEqualStrings("--", with_mcp[4]);
-
-    // A plan was supplied, so planning already happened somewhere else.
-    const brought = try launchArgs(gpa, null, "/start-task PE-250 --plan /p.md", false);
-    defer gpa.free(brought);
-    try std.testing.expectEqual(@as(usize, 2), brought.len);
-    try std.testing.expectEqualStrings("--", brought[0]);
 
     // No prompt is no reason to skip the mode: an empty startTaskCommand still
     // opens a session, and it should still open it planning.
