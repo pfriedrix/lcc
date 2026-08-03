@@ -113,9 +113,14 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         return;
     }
 
+    const launch_label = if (plan_path == null)
+        "Launching Claude Code in plan mode"
+    else
+        "Launching Claude Code";
     app.ui.info("", .{});
-    app.ui.info("{f} in {f}", .{ ui.bold("Launching Claude Code"), ui.dim(wt.path) });
+    app.ui.info("{f} in {f}", .{ ui.bold(launch_label), ui.dim(wt.path) });
     app.ui.hint("Linear: {s}", .{selected.url});
+    if (plan_path) |path| app.ui.hint("Plan: {s}", .{path});
     // Only says anything when this issue has been worked on before — picking up
     // a task should show what it has already cost.
     const spent = usage.forWorktree(app.gpa, app.io, app.environ, wt.path);
@@ -132,10 +137,13 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     app.ui.info("", .{});
     app.ui.flush();
 
+    // Either the work is planned now or a plan was brought to it; there is no
+    // third state where neither happened, so `--plan` is what opts out.
     const args = try launchArgs(
         app.gpa,
         if (claude_carried) |c| c.path else null,
         initial_prompt,
+        plan_path == null,
     );
     const code = try claude.launch(app.gpa, app.io, wt.path, args);
     std.process.exit(code);
@@ -1015,6 +1023,11 @@ test "a created worktree reports no match and its base" {
 
 /// What `claude` is launched with, in order.
 ///
+/// `plan_mode` opens the session in Claude Code's own plan mode, which is where a
+/// task should start: recon and questions before edits, and an explicit approval
+/// before any of it becomes code. Taking a worktree is the moment that decision is
+/// cheapest, so it is the default rather than something to remember.
+///
 /// The `--` is load-bearing and unconditional. The prompt is a positional, and one
 /// that opens with `-` — a markdown bullet, `---` front matter — is read as an
 /// option without it. It used to be appended only alongside `--mcp-config`, which
@@ -1023,8 +1036,10 @@ fn launchArgs(
     gpa: std.mem.Allocator,
     mcp_config: ?[]const u8,
     initial_prompt: ?[]const u8,
+    plan_mode: bool,
 ) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
+    if (plan_mode) try out.appendSlice(gpa, &.{ "--permission-mode", "plan" });
     if (mcp_config) |path| try out.appendSlice(gpa, &.{ "--mcp-config", path });
     if (initial_prompt) |value| {
         try out.append(gpa, "--");
@@ -1116,7 +1131,7 @@ test "launchArgs always separates the prompt from the options with --" {
     // this is the common case, not the exotic one.
     const opens_with_dash = "--- \n- step one";
 
-    const carried = try launchArgs(gpa, "/cfg/mcp.json", opens_with_dash);
+    const carried = try launchArgs(gpa, "/cfg/mcp.json", opens_with_dash, false);
     defer gpa.free(carried);
     try std.testing.expectEqual(@as(usize, 4), carried.len);
     try std.testing.expectEqualStrings("--mcp-config", carried[0]);
@@ -1126,18 +1141,55 @@ test "launchArgs always separates the prompt from the options with --" {
 
     // The regression: with no MCP config to carry there was no `--` either, and
     // the prompt reached `claude` as an option.
-    const bare = try launchArgs(gpa, null, opens_with_dash);
+    const bare = try launchArgs(gpa, null, opens_with_dash, false);
     defer gpa.free(bare);
     try std.testing.expectEqual(@as(usize, 2), bare.len);
     try std.testing.expectEqualStrings("--", bare[0]);
     try std.testing.expectEqualStrings(opens_with_dash, bare[1]);
 
     // Nothing to say, nothing to separate.
-    const empty = try launchArgs(gpa, null, null);
+    const empty = try launchArgs(gpa, null, null, false);
     defer gpa.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 
-    const only_mcp = try launchArgs(gpa, "/cfg/mcp.json", null);
+    const only_mcp = try launchArgs(gpa, "/cfg/mcp.json", null, false);
     defer gpa.free(only_mcp);
     try std.testing.expectEqual(@as(usize, 2), only_mcp.len);
+}
+
+test "launchArgs opens in plan mode, and the mode stays ahead of the separator" {
+    const gpa = std.testing.allocator;
+
+    // The default: nothing was brought, so the session starts by planning.
+    const planning = try launchArgs(gpa, null, "/start-task PE-250", true);
+    defer gpa.free(planning);
+    try std.testing.expectEqual(@as(usize, 4), planning.len);
+    try std.testing.expectEqualStrings("--permission-mode", planning[0]);
+    try std.testing.expectEqualStrings("plan", planning[1]);
+    try std.testing.expectEqualStrings("--", planning[2]);
+    try std.testing.expectEqualStrings("/start-task PE-250", planning[3]);
+
+    // Everything the mode adds is an option, so it has to land before the `--`
+    // or it becomes part of the prompt.
+    const with_mcp = try launchArgs(gpa, "/cfg/mcp.json", "/start-task PE-250", true);
+    defer gpa.free(with_mcp);
+    try std.testing.expectEqual(@as(usize, 6), with_mcp.len);
+    try std.testing.expectEqualStrings("--permission-mode", with_mcp[0]);
+    try std.testing.expectEqualStrings("plan", with_mcp[1]);
+    try std.testing.expectEqualStrings("--mcp-config", with_mcp[2]);
+    try std.testing.expectEqualStrings("--", with_mcp[4]);
+
+    // A plan was supplied, so planning already happened somewhere else.
+    const brought = try launchArgs(gpa, null, "/start-task PE-250 --plan /p.md", false);
+    defer gpa.free(brought);
+    try std.testing.expectEqual(@as(usize, 2), brought.len);
+    try std.testing.expectEqualStrings("--", brought[0]);
+
+    // No prompt is no reason to skip the mode: an empty startTaskCommand still
+    // opens a session, and it should still open it planning.
+    const no_prompt = try launchArgs(gpa, null, null, true);
+    defer gpa.free(no_prompt);
+    try std.testing.expectEqual(@as(usize, 2), no_prompt.len);
+    try std.testing.expectEqualStrings("--permission-mode", no_prompt[0]);
+    try std.testing.expectEqualStrings("plan", no_prompt[1]);
 }
