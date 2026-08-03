@@ -21,7 +21,7 @@ test "AC6 repo-local Codex config reaches a new worktree independently of linkPa
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
     const source_root = try std.fs.path.join(allocator, &.{ root, "source-repo" });
     defer allocator.free(source_root);
@@ -38,9 +38,9 @@ test "AC6 repo-local Codex config reaches a new worktree independently of linkPa
     );
     defer allocator.free(expected_target);
 
-    try tmp.dir.makePath("source-repo/.codex");
-    try tmp.dir.makePath("new-worktree");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.testing.io, "source-repo/.codex");
+    try tmp.dir.createDirPath(std.testing.io, "new-worktree");
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "source-repo/.codex/config.toml",
         .data = project_config,
     });
@@ -54,15 +54,17 @@ test "AC6 repo-local Codex config reaches a new worktree independently of linkPa
     defer operation.deinit();
 
     const source_after = try tmp.dir.readFileAlloc(
-        allocator,
+        std.testing.io,
         "source-repo/.codex/config.toml",
-        16 * 1024,
+        allocator,
+        .limited(16 * 1024),
     );
     defer allocator.free(source_after);
     const target_bytes = try tmp.dir.readFileAlloc(
-        allocator,
+        std.testing.io,
         "new-worktree/.codex/config.toml",
-        16 * 1024,
+        allocator,
+        .limited(16 * 1024),
     );
     defer allocator.free(target_bytes);
 
@@ -79,7 +81,7 @@ test "AC7 Codex MCP report includes only repo-local names and is null only when 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
     const repo_root = try std.fs.path.join(allocator, &.{ root, "repo" });
     defer allocator.free(repo_root);
@@ -95,15 +97,15 @@ test "AC7 Codex MCP report includes only repo-local names and is null only when 
     );
     defer allocator.free(expected_path);
 
-    try tmp.dir.makePath("repo/.codex");
-    try tmp.dir.makePath("empty-repo/.codex");
-    try tmp.dir.makePath("absent-repo");
-    try tmp.dir.makePath("user-home/.codex");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.testing.io, "repo/.codex");
+    try tmp.dir.createDirPath(std.testing.io, "empty-repo/.codex");
+    try tmp.dir.createDirPath(std.testing.io, "absent-repo");
+    try tmp.dir.createDirPath(std.testing.io, "user-home/.codex");
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "repo/.codex/config.toml",
         .data = project_config,
     });
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "empty-repo/.codex/config.toml",
         .data =
         \\model = "gpt-5.4"
@@ -111,7 +113,7 @@ test "AC7 Codex MCP report includes only repo-local names and is null only when 
         \\
         ,
     });
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "user-home/.codex/config.toml",
         .data =
         \\[mcp_servers.global_only]
@@ -143,9 +145,10 @@ test "AC7 Codex MCP report includes only repo-local names and is null only when 
     );
 
     const source_after = try tmp.dir.readFileAlloc(
-        allocator,
+        std.testing.io,
         "repo/.codex/config.toml",
-        16 * 1024,
+        allocator,
+        .limited(16 * 1024),
     );
     defer allocator.free(source_after);
 

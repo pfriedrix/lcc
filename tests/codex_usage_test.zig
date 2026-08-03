@@ -4,13 +4,15 @@ const sessions = @import("sessions");
 const Counts = sessions.Counts;
 const Session = sessions.Session;
 const Usage = sessions.Usage;
+const ModelUsage = std.meta.Elem(@FieldType(Usage, "models"));
+const Stamp = std.meta.Elem(@FieldType(Usage, "stamps"));
 
 test "AC1 Codex rollout is attributed to its worktree with delta-based model usage" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
     const worktree = try std.fs.path.join(allocator, &.{ root, "wanted-worktree" });
     defer allocator.free(worktree);
@@ -19,13 +21,13 @@ test "AC1 Codex rollout is attributed to its worktree with delta-based model usa
     const codex_home = try std.fs.path.join(allocator, &.{ root, "codex-home" });
     defer allocator.free(codex_home);
 
-    try tmp.dir.makePath("wanted-worktree");
-    try tmp.dir.makePath("other-worktree");
-    try tmp.dir.makePath("codex-home/sessions/2026/08/03");
+    try tmp.dir.createDirPath(std.testing.io, "wanted-worktree");
+    try tmp.dir.createDirPath(std.testing.io, "other-worktree");
+    try tmp.dir.createDirPath(std.testing.io, "codex-home/sessions/2026/08/03");
 
     const rollout = try rolloutWithReset(allocator, worktree);
     defer allocator.free(rollout);
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "codex-home/sessions/2026/08/03/rollout-2026-08-03T10-00-00-session-a.jsonl",
         .data = rollout,
     });
@@ -83,7 +85,10 @@ test "AC1 Codex rollout is attributed to its worktree with delta-based model usa
 test "AC2 worktree usage combines provider-qualified Claude and Codex sessions" {
     const allocator = std.testing.allocator;
     const worktree = "/repo/shared-worktree";
-
+    var claude_models: [1]ModelUsage = undefined;
+    var claude_stamps: [1]Stamp = undefined;
+    var codex_models: [1]ModelUsage = undefined;
+    var codex_stamps: [1]Stamp = undefined;
     const claude = Session{ .claude = .{
         .session_id = "same-raw-id",
         .path = "/claude/projects/shared/same-raw-id.jsonl",
@@ -101,6 +106,8 @@ test "AC2 worktree usage combines provider-qualified Claude and Codex sessions" 
             },
             "claude-sonnet-4-5",
             "2026-08-03T09:00:00Z",
+            &claude_models,
+            &claude_stamps,
         ),
     } };
     const codex = Session{ .codex = .{
@@ -118,6 +125,8 @@ test "AC2 worktree usage combines provider-qualified Claude and Codex sessions" 
             },
             "gpt-5.4",
             "2026-08-03T10:00:00Z",
+            &codex_models,
+            &codex_stamps,
         ),
     } };
 
@@ -149,22 +158,22 @@ test "AC3 cached scan invalidates a changed Codex rollout and equals a cold comb
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
     const worktree = try std.fs.path.join(allocator, &.{ root, "shared-worktree" });
     defer allocator.free(worktree);
     const codex_home = try std.fs.path.join(allocator, &.{ root, "codex-home" });
     defer allocator.free(codex_home);
 
-    try tmp.dir.makePath("shared-worktree");
-    try tmp.dir.makePath("codex-home/sessions/2026/08/03");
+    try tmp.dir.createDirPath(std.testing.io, "shared-worktree");
+    try tmp.dir.createDirPath(std.testing.io, "codex-home/sessions/2026/08/03");
 
     const initial = try rolloutBeforeChange(allocator, worktree);
     defer allocator.free(initial);
     const changed = try rolloutAfterChange(allocator, worktree);
     defer allocator.free(changed);
     const rollout_path = "codex-home/sessions/2026/08/03/rollout-2026-08-03T10-00-00-session-cache.jsonl";
-    try tmp.dir.writeFile(.{ .sub_path = rollout_path, .data = initial });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = rollout_path, .data = initial });
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
@@ -176,7 +185,7 @@ test "AC3 cached scan invalidates a changed Codex rollout and equals a cold comb
     var priming = try cached_scanner.scan(.cold);
     priming.deinit();
 
-    try tmp.dir.writeFile(.{ .sub_path = rollout_path, .data = changed });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = rollout_path, .data = changed });
 
     var cached_codex = try cached_scanner.scan(.cached);
     defer cached_codex.deinit();
@@ -185,6 +194,8 @@ test "AC3 cached scan invalidates a changed Codex rollout and equals a cold comb
     var cold_codex = try cold_scanner.scan(.cold);
     defer cold_codex.deinit();
 
+    var claude_models: [1]ModelUsage = undefined;
+    var claude_stamps: [1]Stamp = undefined;
     const claude = Session{ .claude = .{
         .session_id = "claude-cache-peer",
         .path = "/claude/projects/shared/claude-cache-peer.jsonl",
@@ -202,6 +213,8 @@ test "AC3 cached scan invalidates a changed Codex rollout and equals a cold comb
             },
             "claude-sonnet-4-5",
             "2026-08-03T09:30:00Z",
+            &claude_models,
+            &claude_stamps,
         ),
     } };
 
@@ -236,13 +249,21 @@ test "AC3 cached scan invalidates a changed Codex rollout and equals a cold comb
     try std.testing.expectEqualStrings(cold_sessions[1].identity(), cached_sessions[1].identity());
 }
 
-fn usage(counts: Counts, model: []const u8, last: []const u8) Usage {
+fn usage(
+    counts: Counts,
+    model: []const u8,
+    last: []const u8,
+    model_storage: *[1]ModelUsage,
+    stamp_storage: *[1]Stamp,
+) Usage {
+    model_storage.* = .{.{ .name = model, .counts = counts }};
+    stamp_storage.* = .{last};
     return .{
         .counts = counts,
         .sessions = 1,
         .last = last,
-        .models = &.{.{ .name = model, .counts = counts }},
-        .stamps = &.{last},
+        .models = model_storage,
+        .stamps = stamp_storage,
     };
 }
 

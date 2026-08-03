@@ -6,7 +6,7 @@ test "AC4 Codex sessions are retained by default and removal stays inside the ow
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
     const codex_home = try std.fs.path.join(allocator, &.{ root, "codex-home" });
     defer allocator.free(codex_home);
@@ -15,8 +15,8 @@ test "AC4 Codex sessions are retained by default and removal stays inside the ow
     const outside_path = try std.fs.path.join(allocator, &.{ root, "outside-sentinel.jsonl" });
     defer allocator.free(outside_path);
 
-    try tmp.dir.makePath("worktree");
-    try tmp.dir.makePath("codex-home/sessions/2026/08/03/nested");
+    try tmp.dir.createDirPath(std.testing.io, "worktree");
+    try tmp.dir.createDirPath(std.testing.io, "codex-home/sessions/2026/08/03/nested");
     try writeRollout(
         allocator,
         tmp.dir,
@@ -24,7 +24,7 @@ test "AC4 Codex sessions are retained by default and removal stays inside the ow
         "inside-session",
         worktree,
     );
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "outside-sentinel.jsonl",
         .data = "must survive rejected removal\n",
     });
@@ -44,6 +44,7 @@ test "AC4 Codex sessions are retained by default and removal stays inside the ow
     try std.testing.expectEqualStrings(worktree, entry.cwd);
     try std.testing.expect(!entry.archived);
     try tmp.dir.access(
+        std.testing.io,
         "codex-home/sessions/2026/08/03/nested/inside-session.jsonl",
         .{},
     );
@@ -52,17 +53,18 @@ test "AC4 Codex sessions are retained by default and removal stays inside the ow
         error.PathOutsideSessionRoot,
         codex_projects.removeRollout(entry.session_root, outside_path),
     );
-    try tmp.dir.access("outside-sentinel.jsonl", .{});
+    try tmp.dir.access(std.testing.io, "outside-sentinel.jsonl", .{});
 
     try entry.remove();
     try std.testing.expectError(
         error.FileNotFound,
         tmp.dir.access(
+            std.testing.io,
             "codex-home/sessions/2026/08/03/nested/inside-session.jsonl",
             .{},
         ),
     );
-    try tmp.dir.access("outside-sentinel.jsonl", .{});
+    try tmp.dir.access(std.testing.io, "outside-sentinel.jsonl", .{});
 }
 
 test "AC5 orphan discovery distinguishes live and missing cwd across active and archived roots" {
@@ -70,7 +72,7 @@ test "AC5 orphan discovery distinguishes live and missing cwd across active and 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
     const codex_home = try std.fs.path.join(allocator, &.{ root, "codex-home" });
     defer allocator.free(codex_home);
@@ -83,10 +85,10 @@ test "AC5 orphan discovery distinguishes live and missing cwd across active and 
     const archived_missing_cwd = try std.fs.path.join(allocator, &.{ root, "archived-missing" });
     defer allocator.free(archived_missing_cwd);
 
-    try tmp.dir.makePath("active-live");
-    try tmp.dir.makePath("archived-live");
-    try tmp.dir.makePath("codex-home/sessions/deep/active");
-    try tmp.dir.makePath("codex-home/archived_sessions/deep/archived");
+    try tmp.dir.createDirPath(std.testing.io, "active-live");
+    try tmp.dir.createDirPath(std.testing.io, "archived-live");
+    try tmp.dir.createDirPath(std.testing.io, "codex-home/sessions/deep/active");
+    try tmp.dir.createDirPath(std.testing.io, "codex-home/archived_sessions/deep/archived");
     try writeRollout(
         allocator,
         tmp.dir,
@@ -143,7 +145,7 @@ test "AC5 orphan discovery distinguishes live and missing cwd across active and 
 
 fn writeRollout(
     allocator: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: std.Io.Dir,
     sub_path: []const u8,
     session_id: []const u8,
     cwd: []const u8,
@@ -153,7 +155,7 @@ fn writeRollout(
         \\{{"timestamp":"2026-08-03T10:00:01Z","type":"turn_context","payload":{{"model":"gpt-5.4"}}}}
     , .{ session_id, cwd });
     defer allocator.free(data);
-    try dir.writeFile(.{ .sub_path = sub_path, .data = data });
+    try dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = data });
 }
 
 fn containsIdentity(entries: anytype, expected: []const u8) bool {
