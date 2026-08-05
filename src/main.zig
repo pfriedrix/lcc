@@ -416,9 +416,11 @@ test {
     _ = @import("mcp.zig");
     _ = @import("oauth.zig");
     _ = @import("prompt.zig");
+    _ = @import("pty.zig");
     _ = @import("release.zig");
     _ = @import("remote_cache.zig");
     _ = @import("repos.zig");
+    _ = @import("ring.zig");
     _ = @import("semver.zig");
     _ = @import("term.zig");
     _ = @import("ui.zig");
