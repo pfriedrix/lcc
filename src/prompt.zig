@@ -7,12 +7,13 @@
 const std = @import("std");
 const Io = std.Io;
 const fold = @import("fold.zig");
+const term_mod = @import("term.zig");
 const ui = @import("ui.zig");
 
-extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
-extern "c" fn isatty(fd: c_int) c_int;
-
-pub const Error = error{NotATerminal} || std.mem.Allocator.Error;
+/// Named here as well as in `term.zig` because it is what `main.zig`'s
+/// `describe` maps and what every caller catches. The terminal mechanics moved;
+/// the error a caller sees did not.
+pub const Error = term_mod.Error || std.mem.Allocator.Error;
 
 pub const Item = struct {
     /// Rendered as-is. Must be plain text: the prompt pads and truncates it,
@@ -25,132 +26,17 @@ pub const Item = struct {
     description: []const u8 = "",
 };
 
-const csi = "\x1b[";
+const csi = term_mod.csi;
+const Terminal = term_mod.Terminal;
+const readKey = term_mod.readKey;
+const truncate = term_mod.truncate;
 
-const Terminal = struct {
-    fd: std.posix.fd_t,
-    saved: std.posix.termios,
-
-    fn enterRaw() Error!Terminal {
-        const fd = std.posix.STDIN_FILENO;
-        // Ask first: tcgetattr on a pipe reports ENOTTY through std's
-        // "unexpected errno" path, which dumps a stack trace in debug builds.
-        if (isatty(fd) == 0) return Error.NotATerminal;
-        const saved = std.posix.tcgetattr(fd) catch return Error.NotATerminal;
-        var raw = saved;
-        // Char-at-a-time, no echo, and no signal generation — Ctrl-C arrives as
-        // a byte so the terminal can be restored before exiting.
-        raw.lflag.ICANON = false;
-        raw.lflag.ECHO = false;
-        raw.lflag.ISIG = false;
-        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-        // NOW, not FLUSH: anything typed while the issues were still loading is
-        // real input the user meant, and FLUSH would silently discard it.
-        std.posix.tcsetattr(fd, .NOW, raw) catch return Error.NotATerminal;
-        return .{ .fd = fd, .saved = saved };
-    }
-
-    fn restore(self: Terminal) void {
-        // FLUSH on the way out, so keys pressed after the answer do not spill
-        // into the shell that gets the terminal back.
-        std.posix.tcsetattr(self.fd, .FLUSH, self.saved) catch {};
-    }
-
-    /// Reads whatever is already buffered, without blocking. Used to tell a
-    /// bare Esc from the start of an arrow-key sequence.
-    fn readPending(self: Terminal, buf: []u8) usize {
-        var poll_mode = self.saved;
-        poll_mode.lflag.ICANON = false;
-        poll_mode.lflag.ECHO = false;
-        poll_mode.lflag.ISIG = false;
-        poll_mode.cc[@intFromEnum(std.posix.V.MIN)] = 0;
-        poll_mode.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-        std.posix.tcsetattr(self.fd, .NOW, poll_mode) catch return 0;
-        defer {
-            var blocking = poll_mode;
-            blocking.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-            std.posix.tcsetattr(self.fd, .NOW, blocking) catch {};
-        }
-        return std.posix.read(self.fd, buf) catch 0;
-    }
-
-    fn size(self: Terminal) struct { rows: u16, cols: u16 } {
-        var ws: std.posix.winsize = undefined;
-        if (ioctl(self.fd, std.c.T.IOCGWINSZ, &ws) == 0 and ws.row > 0) {
-            return .{ .rows = ws.row, .cols = ws.col };
-        }
-        return .{ .rows = 24, .cols = 80 };
-    }
-
-    fn pageSize(self: Terminal) usize {
-        const rows = self.size().rows;
-        return @max(@as(usize, 5), @min(@as(usize, 30), rows -| 4));
-    }
-};
-
-const Key = union(enum) {
-    up,
-    down,
-    page_up,
-    page_down,
-    enter,
-    backspace,
-    space,
-    cancel,
-    text: []const u8,
-    ignored,
-};
-
-fn readKey(term: Terminal, buf: []u8) Key {
-    const n = std.posix.read(term.fd, buf[0..1]) catch return .cancel;
-    if (n == 0) return .cancel;
-    const b = buf[0];
-    switch (b) {
-        0x03, 0x04 => return .cancel, // Ctrl-C, Ctrl-D
-        0x0d, 0x0a => return .enter,
-        0x7f, 0x08 => return .backspace,
-        ' ' => return .space,
-        0x1b => {
-            var seq: [8]u8 = undefined;
-            const got = term.readPending(&seq);
-            if (got == 0) return .cancel; // bare Esc
-            if (got >= 2 and seq[0] == '[') {
-                switch (seq[1]) {
-                    'A' => return .up,
-                    'B' => return .down,
-                    '5' => return .page_up,
-                    '6' => return .page_down,
-                    else => return .ignored,
-                }
-            }
-            return .ignored;
-        },
-        else => {
-            if (b < 0x20) return .ignored;
-            // UTF-8 continuation bytes arrive in the same read burst.
-            const seq_len = std.unicode.utf8ByteSequenceLength(b) catch 1;
-            if (seq_len > 1) {
-                const extra = std.posix.read(term.fd, buf[1..seq_len]) catch 0;
-                return .{ .text = buf[0 .. 1 + extra] };
-            }
-            return .{ .text = buf[0..1] };
-        },
-    }
-}
-
-/// Truncates on a codepoint boundary so a narrow terminal cannot wrap a row
-/// and desynchronise the redraw's line count.
-fn truncate(s: []const u8, max_cols: usize) []const u8 {
-    var cols: usize = 0;
-    var i: usize = 0;
-    while (i < s.len) {
-        if (cols >= max_cols) return s[0..i];
-        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-        i += @min(len, s.len - i);
-        cols += 1;
-    }
-    return s;
+/// How many rows of choices a picker shows. Stays here rather than moving to
+/// `term.zig` with the rest: `rows - 4` is this widget's chrome budget — the
+/// prompt line, the description and the footer — not a fact about the terminal.
+fn pageSize(term: Terminal) usize {
+    const rows = term.size().rows;
+    return @max(@as(usize, 5), @min(@as(usize, 30), rows -| 4));
 }
 
 /// Every whitespace-separated token must appear, as in the TypeScript version.
@@ -244,20 +130,7 @@ fn popCodepoint(buf: *std.ArrayList(u8)) void {
     buf.shrinkRetainingCapacity(i);
 }
 
-/// Owns the terminal for the lifetime of one prompt: raw mode, hidden cursor,
-/// and in-place redraw of a known number of lines.
-const Screen = struct {
-    term: Terminal,
-    out: *Io.Writer,
-    lines: usize = 0,
-
-    fn eraseFrame(self: *Screen) void {
-        if (self.lines == 0) return;
-        self.out.writeAll("\r") catch {};
-        for (0..self.lines) |_| self.out.writeAll(csi ++ "1A" ++ csi ++ "2K") catch {};
-        self.lines = 0;
-    }
-};
+const Screen = term_mod.Screen;
 
 pub fn search(
     gpa: std.mem.Allocator,
@@ -274,7 +147,7 @@ pub fn search(
 
     var out_buffer: [32 * 1024]u8 = undefined;
     var out_writer: Io.File.Writer = .init(.stdout(), io, &out_buffer);
-    var screen: Screen = .{ .term = term, .out = &out_writer.interface };
+    var screen: Screen = .{ .out = &out_writer.interface };
     const out = screen.out;
 
     out.writeAll(csi ++ "?25l") catch {};
@@ -294,7 +167,7 @@ pub fn search(
 
     while (true) {
         const dims = term.size();
-        const page = term.pageSize();
+        const page = pageSize(term);
         const width: usize = @max(@as(usize, 20), dims.cols);
 
         if (cursor >= filtered.items.len) cursor = filtered.items.len -| 1;
@@ -408,7 +281,7 @@ pub fn confirm(
 
     var out_buffer: [8 * 1024]u8 = undefined;
     var out_writer: Io.File.Writer = .init(.stdout(), io, &out_buffer);
-    var screen: Screen = .{ .term = term, .out = &out_writer.interface };
+    var screen: Screen = .{ .out = &out_writer.interface };
     const out = screen.out;
 
     out.writeAll(csi ++ "?25l") catch {};
@@ -496,7 +369,7 @@ pub fn checkbox(
 
     var out_buffer: [32 * 1024]u8 = undefined;
     var out_writer: Io.File.Writer = .init(.stdout(), io, &out_buffer);
-    var screen: Screen = .{ .term = term, .out = &out_writer.interface };
+    var screen: Screen = .{ .out = &out_writer.interface };
     const out = screen.out;
 
     out.writeAll(csi ++ "?25l") catch {};
@@ -514,7 +387,7 @@ pub fn checkbox(
 
     while (true) {
         const dims = term.size();
-        const page = term.pageSize();
+        const page = pageSize(term);
         const width: usize = @max(@as(usize, 20), dims.cols);
 
         if (cursor < offset) offset = cursor;
