@@ -427,7 +427,9 @@ test {
     _ = @import("ui.zig");
     _ = @import("usage.zig");
     _ = @import("usage_cache.zig");
+    _ = @import("watch_hooks.zig");
     _ = @import("watch_paths.zig");
+    _ = @import("watch_status.zig");
     _ = @import("wire.zig");
     _ = @import("xcode.zig");
     _ = @import("commands/issue.zig");
