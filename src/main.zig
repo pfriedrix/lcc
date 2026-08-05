@@ -404,6 +404,7 @@ test {
     _ = @import("claude.zig");
     _ = @import("claude_projects.zig");
     _ = @import("config.zig");
+    _ = @import("daemon.zig");
     _ = @import("derived_data.zig");
     _ = @import("disk.zig");
     _ = @import("exec.zig");
