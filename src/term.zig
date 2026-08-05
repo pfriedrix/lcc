@@ -182,6 +182,13 @@ pub const Screen = struct {
 ///
 /// The alternate screen goes first so everything after it lands on the screen
 /// the user is being given back.
+///
+/// The keyboard-protocol resets at the end are not speculative padding: a
+/// capture of Claude Code's own startup emits `CSI ?1004h`, `CSI ?2031h`,
+/// `CSI > 1 u` and `CSI > 4;2 m` within the first eighty bytes. Left set, the
+/// first two spray `\x1b[I` / `\x1b[O` at the shell on every window focus
+/// change, and the second two hand it a different encoding for ordinary
+/// keypresses. Those are the strange-shell symptoms nobody traces back.
 pub fn sanitize(w: *Io.Writer) void {
     w.writeAll(csi ++ "?1049l" ++ // leave the alternate screen
         csi ++ "?1000l" ++ // mouse: click tracking
@@ -189,6 +196,10 @@ pub fn sanitize(w: *Io.Writer) void {
         csi ++ "?1003l" ++ // mouse: any-motion tracking
         csi ++ "?1006l" ++ // mouse: SGR extended coordinates
         csi ++ "?2004l" ++ // bracketed paste
+        csi ++ "?1004l" ++ // focus in/out reporting
+        csi ++ "?2031l" ++ // colour-scheme change notifications
+        csi ++ "<u" ++ // pop the kitty keyboard flags pushed with `CSI > 1 u`
+        csi ++ ">4;0m" ++ // modifyOtherKeys back to the default encoding
         csi ++ "r" ++ // scroll region: the whole screen
         csi ++ "?7h" ++ // autowrap back on
         csi ++ "?25h" ++ // cursor visible
@@ -258,12 +269,18 @@ test "sanitize leaves the alternate screen before anything else" {
     // the user is getting back, not on the one being torn down.
     try std.testing.expect(std.mem.startsWith(u8, out, csi ++ "?1049l"));
 
-    // The four that actually break a shell if they survive a detach.
+    // The ones that actually break a shell if they survive a detach. The last
+    // four were not guessed: they undo modes observed in a capture of Claude
+    // Code's own first eighty bytes.
     for ([_][]const u8{
         csi ++ "?1003l", // any-motion mouse: turns every cursor move into input
         csi ++ "?2004l", // bracketed paste: wraps pasted text in escapes
         csi ++ "?25h", // a shell with an invisible cursor
         csi ++ "0m", // a shell rendered in Claude Code's last colour
+        csi ++ "?1004l", // focus reporting: \x1b[I on every window focus change
+        csi ++ "?2031l", // colour-scheme notifications
+        csi ++ "<u", // kitty keyboard flags Claude Code pushes at startup
+        csi ++ ">4;0m", // modifyOtherKeys: re-encodes ordinary keypresses
     }) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, out, needle) != null);
     }
