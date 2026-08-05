@@ -422,10 +422,13 @@ test {
     _ = @import("repos.zig");
     _ = @import("ring.zig");
     _ = @import("semver.zig");
+    _ = @import("sessions.zig");
     _ = @import("term.zig");
     _ = @import("ui.zig");
     _ = @import("usage.zig");
     _ = @import("usage_cache.zig");
+    _ = @import("watch_paths.zig");
+    _ = @import("wire.zig");
     _ = @import("xcode.zig");
     _ = @import("commands/issue.zig");
     _ = @import("commands/list.zig");
