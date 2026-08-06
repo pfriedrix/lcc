@@ -8,12 +8,14 @@
 const std = @import("std");
 const Io = std.Io;
 const app_mod = @import("../app.zig");
+const config = @import("../config.zig");
 const sessions = @import("../sessions.zig");
 const ui = @import("../ui.zig");
 const watch_client = @import("../watch_client.zig");
 const term = @import("../term.zig");
 const watch_attach = @import("../watch_attach.zig");
 const watch_hooks = @import("../watch_hooks.zig");
+const start_cmd = @import("start.zig");
 const watch_table = @import("../watch_table.zig");
 
 pub const Opts = struct {
@@ -44,7 +46,12 @@ const Row = struct {
     stale: bool,
 };
 
-pub fn run(app: app_mod.App, opts: Opts) !void {
+/// The error set is written out rather than inferred, which it cannot be:
+/// `start` opens this dashboard, and the dashboard's `n` starts an issue
+/// through `start`. Inference chases that in a circle. Both are command entry
+/// points whose errors go straight to `describe`, so nothing downstream reads
+/// the set anyway.
+pub fn run(app: app_mod.App, opts: Opts) anyerror!void {
     // `--json` is a one-shot that never enters raw mode. That is both the
     // tool-callable path CLAUDE.md requires and the resolution of a real
     // conflict: a full-screen TUI cannot write its frames through `app.ui`,
@@ -248,6 +255,7 @@ fn dashboard(app: app_mod.App, opts: Opts) !void {
                 }
                 switch (t[0]) {
                     'q' => return,
+                    'n' => try newSession(app, &screen, terminal),
                     'j' => cursor_id = copyId(&cursor_buf, step(rows, cursor_id, 1)),
                     'k' => cursor_id = copyId(&cursor_buf, step(rows, cursor_id, -1)),
                     // Two keys, inline, rather than a nested raw-mode widget —
@@ -300,6 +308,34 @@ fn attachTo(
     screen.reset();
 }
 
+/// Pick another issue and start it, without leaving the dashboard.
+///
+/// Runs the ordinary `lcc start` with the daemon path forced on and the
+/// dashboard suppressed — otherwise it would open a second one on top of this.
+/// Everything else about it is unchanged, including the picker, so there is one
+/// way a session comes into being rather than two that can drift.
+fn newSession(app: app_mod.App, screen: *term.Screen, terminal: term.Terminal) !void {
+    // `start` owns the terminal for its picker and its progress lines, the same
+    // handover an attach performs.
+    screen.eraseFrame();
+    screen.out.writeAll(term.csi ++ "?25h") catch {};
+    screen.out.flush() catch {};
+    terminal.restore();
+
+    const cfg = try config.load(app.gpa, app.io, app.environ);
+    start_cmd.run(app, .{
+        .watch = true,
+        .no_attach = true,
+        .all = cfg.allIssues,
+        .plan_mode = cfg.planMode,
+        .cancel_returns = true,
+    }) catch {};
+
+    _ = try term.Terminal.enterRaw();
+    screen.out.writeAll(term.csi ++ "?25l") catch {};
+    screen.reset();
+}
+
 fn footer(
     out: *Io.Writer,
     cols: usize,
@@ -322,7 +358,7 @@ fn footer(
     }
     out.print("  {s}{s}{s}\n", .{
         p.dim,
-        term.truncate("↑↓ move · enter attach · x kill · q quit (sessions keep running)", cols -| 2),
+        term.truncate("↑↓ move · enter attach · n new · x kill · q quit", cols -| 2),
         p.reset,
     }) catch {};
     return 1;

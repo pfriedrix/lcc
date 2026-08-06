@@ -43,6 +43,7 @@ const usage =
     \\    --watch                hand it to the daemon even when that is off
     \\    --no-attach            print the session id instead of opening the dashboard
     \\  watch                    What the daemon is running — live when on a terminal
+    \\                           n starts another issue without leaving it
     \\    --json                 one-shot snapshot instead of the dashboard
     \\    --no-status-bar        give an attached session the whole terminal
     \\  daemon                   Run or control the session daemon

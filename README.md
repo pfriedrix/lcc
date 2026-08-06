@@ -107,8 +107,12 @@ What you see is the dashboard, one row per session:
   PE-270  ◐ active   feature/pe-270-crash-in-mapview     12s  ~/…/worktrees/pe-270
   PE-9    ○ idle     feature/pe-9-unrelated              18m  ~/…/worktrees/pe-9
 
-  ↑↓ move · enter attach · x kill · q quit (sessions keep running)
+  ↑↓ move · enter attach · n new · x kill · q quit
 ```
+
+`n` picks another issue and starts it without leaving the dashboard — the same
+picker and the same bootstrap as `lcc start`, just without having to quit first.
+Changing your mind puts you back in the list rather than quitting lcc.
 
 `● waiting` is the one that wants you: the agent is blocked on a permission
 prompt or a question. `◐ active` is a turn in flight, `○ idle` is finished.

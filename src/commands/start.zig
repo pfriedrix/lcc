@@ -46,7 +46,20 @@ pub const Opts = struct {
     /// With `--watch`, print the session id and return instead of showing the
     /// dashboard. What a slash command or a script uses.
     no_attach: bool = false,
+    /// Cancelling a picker returns instead of exiting 130.
+    ///
+    /// Set only when this runs *inside* something else — the dashboard's `n`.
+    /// There, changing your mind about which issue to take should put you back
+    /// where you were, not quit lcc out from under the sessions you were
+    /// watching. Standalone, 130 is the conventional answer and stays.
+    cancel_returns: bool = false,
 };
+
+/// What a cancelled picker does, which depends on who is asking.
+fn cancel(opts: Opts) error{Cancelled} {
+    if (opts.cancel_returns) return error.Cancelled;
+    std.process.exit(app_mod.cancelled_exit_code);
+}
 
 pub fn run(app: app_mod.App, opts: Opts) !void {
     if (opts.json and opts.issue == null) {
@@ -314,7 +327,7 @@ fn pickFromActive(
     }
 
     return try pickIssue(app, result.matched) orelse
-        std.process.exit(app_mod.cancelled_exit_code);
+        return cancel(opts);
 }
 
 const MatchedBy = enum { branch, issue };
@@ -565,10 +578,10 @@ fn resolveRepo(app: app_mod.App, opts: Opts, identifier: []const u8) !git.Repo {
     // shortlist is worth more than the full list.
     const offer = if (started.len > 1) started else known;
     if (offer.len == 0) return error.NotAGitRepository;
-    return app.repoAt(try pickRepo(app, identifier, offer));
+    return app.repoAt(try pickRepo(app, opts, identifier, offer));
 }
 
-fn pickRepo(app: app_mod.App, identifier: []const u8, roots: []const []const u8) ![]const u8 {
+fn pickRepo(app: app_mod.App, opts: Opts, identifier: []const u8, roots: []const []const u8) ![]const u8 {
     const items = try app.gpa.alloc(prompt.Item, roots.len);
     for (roots, 0..) |root, i| {
         items[i] = .{
@@ -588,7 +601,7 @@ fn pickRepo(app: app_mod.App, identifier: []const u8, roots: []const []const u8)
         .{identifier},
     );
     const index = try prompt.search(app.gpa, app.io, message, items) orelse
-        std.process.exit(app_mod.cancelled_exit_code);
+        return cancel(opts);
     return roots[index];
 }
 
@@ -611,11 +624,11 @@ fn resolveBase(app: app_mod.App, opts: Opts, repo: git.Repo, branch: []const u8)
     app.ui.flush();
     const message = try std.fmt.allocPrint(app.gpa, "Base new branch on current '{s}'?", .{cur.?});
     const use_current = try prompt.confirm(app.gpa, app.io, message, true) orelse
-        std.process.exit(app_mod.cancelled_exit_code);
+        return cancel(opts);
     if (use_current) return cur.?;
 
     return try pickBaseBranch(app, repo) orelse
-        std.process.exit(app_mod.cancelled_exit_code);
+        return cancel(opts);
 }
 
 /// What `--json` promises: where the issue lives, and the git facts a caller would
