@@ -44,6 +44,9 @@ pub const Opts = struct {
 /// The `lcc watch-hook` side. Deliberately a separate entry point: it is not a
 /// user-facing command, it is what a Claude Code hook execs.
 pub const HookOpts = struct {
+    /// The daemon's socket, as the daemon wrote it into the hook command line.
+    /// Authoritative over anything in the environment — a hook inherits the
+    /// session's, which belongs to whatever shell started it.
     socket: ?[]const u8 = null,
     event: ?[]const u8 = null,
 };
@@ -654,7 +657,10 @@ pub fn hook(app: app_mod.App, opts: HookOpts) !void {
     const payload = watch_hooks.parsePayload(app.gpa, raw) orelse return;
     if (payload.cwd.len == 0) return;
 
-    watch_client.report(app, payload.cwd, payload.session_id, event);
+    // `opts.socket`, not the environment: the daemon baked its own socket into
+    // this command line, and the environment here is the session's — whichever
+    // shell started it. See `watch_client.connectAt`.
+    watch_client.report(app, opts.socket, payload.cwd, payload.session_id, event);
 }
 
 test "the --json keys name sessions, never the process behind them" {

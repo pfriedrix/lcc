@@ -23,6 +23,7 @@ const app_mod = @import("app.zig");
 const exec = @import("exec.zig");
 const pty = @import("pty.zig");
 const sessions_mod = @import("sessions.zig");
+const watch_client = @import("watch_client.zig");
 const watch_hooks = @import("watch_hooks.zig");
 const watch_paths = @import("watch_paths.zig");
 const watch_session = @import("watch_session.zig");
@@ -262,6 +263,10 @@ const Loop = struct {
     app: app_mod.App,
     opts: Options,
     bound: *Bound,
+    /// Prepended to every session's argv as `--settings <path>`. Held here
+    /// rather than recomputed per register: it is one path for the daemon's
+    /// whole life, and `app.gpa` is the process arena.
+    hooks_path: []const u8,
     list: std.ArrayList(watch_session.Session) = .empty,
     clients: std.ArrayList(Client) = .empty,
     wake_r: std.posix.fd_t,
@@ -391,12 +396,11 @@ pub fn run(app: app_mod.App, opts: Options) !void {
     var bound = (try bind(app, opts)) orelse return;
     defer bound.deinit(app.io);
 
-    try writeHookSettings(app);
-
     var loop: Loop = .{
         .app = app,
         .opts = opts,
         .bound = &bound,
+        .hooks_path = try writeHookSettings(app),
         .wake_r = wake[0],
         .started_at = app_mod.nowSeconds(app.io),
     };
@@ -405,12 +409,19 @@ pub fn run(app: app_mod.App, opts: Options) !void {
 
 /// The `--settings` file every session is launched with. Written once at
 /// startup rather than per session, because its contents do not vary.
-fn writeHookSettings(app: app_mod.App) !void {
+///
+/// Returns the path because writing the file is only half of it: nothing
+/// installs these hooks unless the path also reaches `claude --settings`, and
+/// for a while nothing did. The file was written, the daemon looked healthy,
+/// and every session sat at the status it reached on its first byte of output
+/// because not one hook had been registered in it.
+fn writeHookSettings(app: app_mod.App) ![]const u8 {
     const exe = try exec.selfPath(app.gpa, app.io);
     const socket_path = try watch_paths.socket(app.gpa, app.environ);
     const body = try watch_hooks.settingsJson(app.gpa, exe, socket_path);
     const path = try watch_paths.hooks(app.gpa, app.environ);
     try Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = body });
+    return path;
 }
 
 fn serve(loop: *Loop) !void {
@@ -659,6 +670,16 @@ fn registerSession(loop: *Loop, client: *Client, frame: wire.Frame, at: i64) voi
     const id = std.fmt.allocPrint(gpa, "s-{x:0>8}", .{loop.next_id}) catch return;
     loop.next_id += 1;
 
+    // The hooks go on here, not in whichever client asked for the session.
+    // Every session must report, and there are two register paths — `lcc start
+    // --watch` and the dashboard's `enter` — so a client-side flag is one that
+    // can be added to one of them and forgotten in the other. The daemon owns
+    // the socket these hooks report to and the file that names it; it owns
+    // handing that file over too.
+    var argv: std.ArrayList([]const u8) = .empty;
+    argv.appendSlice(gpa, &.{ "--settings", loop.hooks_path }) catch return;
+    argv.appendSlice(gpa, body.argv) catch return;
+
     const session = watch_session.Session.start(gpa, .{
         .id = id,
         .worktree = body.worktree,
@@ -667,7 +688,7 @@ fn registerSession(loop: *Loop, client: *Client, frame: wire.Frame, at: i64) voi
         .repo_root = body.repo_root,
     }, .{
         .program = body.program,
-        .argv = body.argv,
+        .argv = argv.items,
         .env = body.env,
         .cwd = body.worktree,
         .size = .{ .rows = body.rows, .cols = body.cols },
@@ -1075,6 +1096,26 @@ fn runForTest(app: app_mod.App, opts: Options) void {
     run(app, opts) catch {};
 }
 
+/// A stand-in for `claude`, written into the test's own tmpdir.
+///
+/// `/bin/cat` played this part directly until the daemon started launching
+/// sessions the way real ones are launched — behind `--settings` — at which
+/// point it began exiting with "illegal option" before a test could type a
+/// byte into it. A script ignores what it is handed, which is exactly what a
+/// stand-in for a program with flags has to do.
+fn standIn(arena: std.mem.Allocator, io: Io, base: []const u8, script: []const u8) ![]const u8 {
+    const path = try std.fs.path.join(arena, &.{ base, "claude-stand-in" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = script });
+    // 0o755: `writeFile` leaves it 0o644, and the daemon execs this.
+    if (chmod(try arena.dupeZ(u8, path), 0o755) != 0) return error.Unexpected;
+    return path;
+}
+
+/// Echoes on a pty and ends on Ctrl-D, the way `cat` does — `exec`, so the
+/// session's pid is the one doing the echoing and nothing about the process
+/// tree changes.
+const stand_in_cat = "#!/bin/sh\nexec cat\n";
+
 test "a registered session runs, echoes, and its output survives a reconnect" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -1141,7 +1182,7 @@ test "a registered session runs, echoes, and its output survives a reconnect" {
             .branch = "feature/pe-1-test",
             .issue = "PE-1",
             .repo_root = base,
-            .program = "/bin/cat",
+            .program = try standIn(arena, io, base, stand_in_cat),
             .argv = &.{},
             .env = &.{"TERM=dumb"},
             .cols = 80,
@@ -1255,6 +1296,204 @@ test "a registered session runs, echoes, and its output survives a reconnect" {
     }
 }
 
+test "a hook reports to the socket it was handed, not to the one its environment names" {
+    // The bug this pins: `--socket` was parsed into `HookOpts` and then never
+    // read, so every report went to whatever `watch_paths.socket` derived from
+    // the environment. Those two agree on a default install, which is why it
+    // survived — a daemon under `LCC_WATCH_DIR` got no reports at all, silently,
+    // and every session it held sat at the status it registered with.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("LCC_WATCH_DIR", base);
+    const socket_path = watch_paths.socket(arena, &environ) catch |err| switch (err) {
+        error.SocketPathTooLong => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var daemon_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer daemon_arena.deinit();
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_w: Io.Writer = .fixed(&out_buf);
+    var err_w: Io.Writer = .fixed(&err_buf);
+    const daemon_app: app_mod.App = .{
+        .gpa = daemon_arena.allocator(),
+        .io = io,
+        .environ = &environ,
+        .ui = .{ .io = io, .out = &out_w, .err = &err_w },
+    };
+
+    const thread = try std.Thread.spawn(.{}, runForTest, .{ daemon_app, Options{
+        .foreground = true,
+        .idle_exit_seconds = 3600,
+    } });
+    defer thread.join();
+
+    var budget: i32 = 15_000;
+    while (budget > 0) : (budget -= 50) {
+        if (Io.Dir.cwd().statFile(io, socket_path, .{})) |_| break else |_| {}
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+
+    var conn = try TestConn.open(arena, io, socket_path);
+    defer conn.close();
+    var b: i32 = 15_000;
+    try conn.hello(arena, &b);
+    // Deferred rather than written at the end: `thread.join()` above waits for
+    // the loop to leave, and only `.stop` makes it. Without this a failed
+    // assertion below would hang the run instead of reporting — which is the
+    // failure mode `TestConn.recv`'s budget exists to avoid in the first place.
+    defer conn.send(arena, .stop, wire.Stop{ .force = true }) catch {};
+
+    try conn.send(arena, .register, wire.Register{
+        .worktree = base,
+        .branch = "feature/pe-2-hooks",
+        .issue = "PE-2",
+        .repo_root = base,
+        .program = try standIn(arena, io, base, stand_in_cat),
+        .argv = &.{},
+        .env = &.{"TERM=dumb"},
+        .cols = 80,
+        .rows = 24,
+    });
+    const body = try wire.parse(wire.Registered, arena, try conn.recv(.registered, &b));
+    try testing.expectEqualStrings("starting", body.status);
+
+    // A hook's environment is the *session's* — whichever shell started it — so
+    // this stands in for one that names a directory holding no daemon.
+    var elsewhere: std.process.Environ.Map = .init(arena);
+    try elsewhere.put("LCC_WATCH_DIR", try std.fs.path.join(arena, &.{ base, "no-daemon-here" }));
+    var hook_out: Io.Writer = .fixed(&out_buf);
+    var hook_err: Io.Writer = .fixed(&err_buf);
+    const hook_app: app_mod.App = .{
+        .gpa = arena,
+        .io = io,
+        .environ = &elsewhere,
+        .ui = .{ .io = io, .out = &hook_out, .err = &hook_err },
+    };
+
+    const statusNow = struct {
+        fn get(c: *TestConn, a: std.mem.Allocator, budget_ms: *i32) ![]const u8 {
+            try c.send(a, .list, .{});
+            const view = try wire.parse(wire.Snapshot, a, try c.recv(.snapshot, budget_ms));
+            return if (view.sessions.len == 1) view.sessions[0].status else "<none>";
+        }
+    }.get;
+
+    // Without a socket there is nothing to fall back to but that environment,
+    // and the report is lost. Asserted so the fallback stays a fallback: if this
+    // ever starts landing, the test above it has stopped proving anything.
+    watch_client.report(hook_app, null, base, "s", "waiting");
+    io.sleep(.fromMilliseconds(300), .awake) catch {};
+    try testing.expectEqualStrings("starting", try statusNow(&conn, arena, &b));
+
+    // Handed the daemon's own socket, exactly as `watch_hooks.settingsJson`
+    // writes it, the same report lands.
+    watch_client.report(hook_app, socket_path, base, "s", "waiting");
+    var waited: i32 = 5_000;
+    while (waited > 0) : (waited -= 100) {
+        if (std.mem.eql(u8, try statusNow(&conn, arena, &b), "waiting")) break;
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+    try testing.expect(waited > 0);
+}
+
+test "a session is launched with the hook settings, read back off the real process" {
+    // Asserted against the child's actual command line rather than against the
+    // argv this test handed in, because the bug was the gap between the two:
+    // `writeHookSettings` wrote the file and nothing ever passed it to
+    // `claude --settings`. Every unit here passed. The session simply had no
+    // hooks in it, reached `idle` on its first byte of output, and stayed there
+    // through hours of work.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("LCC_WATCH_DIR", base);
+    const socket_path = watch_paths.socket(arena, &environ) catch |err| switch (err) {
+        error.SocketPathTooLong => return error.SkipZigTest,
+        else => return err,
+    };
+    const hooks_path = try watch_paths.hooks(arena, &environ);
+
+    var daemon_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer daemon_arena.deinit();
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_w: Io.Writer = .fixed(&out_buf);
+    var err_w: Io.Writer = .fixed(&err_buf);
+    const daemon_app: app_mod.App = .{
+        .gpa = daemon_arena.allocator(),
+        .io = io,
+        .environ = &environ,
+        .ui = .{ .io = io, .out = &out_w, .err = &err_w },
+    };
+
+    const thread = try std.Thread.spawn(.{}, runForTest, .{ daemon_app, Options{
+        .foreground = true,
+        .idle_exit_seconds = 3600,
+    } });
+    defer thread.join();
+
+    var budget: i32 = 15_000;
+    while (budget > 0) : (budget -= 50) {
+        if (Io.Dir.cwd().statFile(io, socket_path, .{})) |_| break else |_| {}
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+
+    var conn = try TestConn.open(arena, io, socket_path);
+    defer conn.close();
+    var b: i32 = 15_000;
+    try conn.hello(arena, &b);
+    defer conn.send(arena, .stop, wire.Stop{ .force = true }) catch {};
+
+    // No `exec` in this one: the shell has to stay as the session's process so
+    // `ps` can still read the argv it was launched with. An `exec` would
+    // replace the image and take the command line with it.
+    try conn.send(arena, .register, wire.Register{
+        .worktree = base,
+        .branch = "feature/pe-3-settings",
+        .issue = "PE-3",
+        .repo_root = base,
+        .program = try standIn(arena, io, base, "#!/bin/sh\nsleep 30\n"),
+        .argv = &.{ "--mcp-config", "/tmp/carried.json", "--resume" },
+        .env = &.{"TERM=dumb"},
+        .cols = 80,
+        .rows = 24,
+    });
+    const body = try wire.parse(wire.Registered, arena, try conn.recv(.registered, &b));
+
+    const pid = try std.fmt.allocPrint(arena, "{d}", .{body.pid});
+    const line = try exec.capture(arena, io, &.{ "ps", "-p", pid, "-ww", "-o", "command=" }, null);
+
+    // The file the daemon wrote, by the path the daemon wrote it to. A flag
+    // naming some other file would install no hooks at all.
+    const flag = try std.fmt.allocPrint(arena, "--settings {s}", .{hooks_path});
+    try testing.expect(std.mem.indexOf(u8, line, flag) != null);
+    try Io.Dir.cwd().access(io, hooks_path, .{});
+
+    // The client's own arguments survive, in order and unmangled: carrying the
+    // repo's local MCP servers and resuming a transcript are what `lcc open`
+    // asks for, and dropping either would trade one silent failure for another.
+    try testing.expect(std.mem.indexOf(u8, line, "--mcp-config /tmp/carried.json --resume") != null);
+}
+
 test "a child that exits tells the attached client instead of leaving it on a dead screen" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -1308,7 +1547,7 @@ test "a child that exits tells the attached client instead of leaving it on a de
         .branch = "feature/pe-2-exit",
         .issue = "PE-2",
         .repo_root = base,
-        .program = "/bin/cat",
+        .program = try standIn(arena, io, base, stand_in_cat),
         .argv = &.{},
         .env = &.{"TERM=dumb"},
         .cols = 80,
@@ -1420,8 +1659,8 @@ test "a grandchild still holding the pty cannot hide the child's exit" {
         .branch = "feature/pe-3-grandchild",
         .issue = "PE-3",
         .repo_root = base,
-        .program = "/bin/sh",
-        .argv = &.{ "-c", "sleep 30 & exec cat" },
+        .program = try standIn(arena, io, base, "#!/bin/sh\nsleep 30 &\nexec cat\n"),
+        .argv = &.{},
         .env = &.{"TERM=dumb"},
         .cols = 80,
         .rows = 24,
