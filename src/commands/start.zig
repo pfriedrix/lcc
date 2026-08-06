@@ -220,7 +220,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         })) |started| {
             if (opts.no_attach) {
                 app.ui.success("Session {s} running in the background.", .{started.id});
-                app.ui.hint("It survives this terminal closing — `lcc watch` shows it.", .{});
+                app.ui.hint("It survives this terminal closing — `lcc open` shows it.", .{});
                 return;
             }
             app.ui.flush();
@@ -232,8 +232,12 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
             // be reached must not be able to take `lcc start` down with it. Said
             // out loud, though: a silent fallback would hide a broken daemon
             // until someone noticed their sessions had stopped surviving.
-            app.ui.warn("Could not reach the lcc daemon ({s}) — starting in this terminal instead.", .{@errorName(err)});
-            app.ui.hint("The session will not survive this terminal closing. `lcc daemon --status` says more.", .{});
+            //
+            // The error name is kept and the daemon is not: `{s}` is the part
+            // that tells anyone debugging this what actually went wrong, while
+            // which process failed to answer is not a fact the reader can act on.
+            app.ui.warn("Could not start this in the background ({s}) — running in this terminal instead.", .{@errorName(err)});
+            app.ui.hint("The session will not survive this terminal closing.", .{});
         }
     }
 

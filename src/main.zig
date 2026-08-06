@@ -36,19 +36,12 @@ const usage =
     \\    --plan <file>          start from a plan that already exists instead of
     \\                           opening in plan mode — reaches the agent as {plan}
     \\                           in startTaskCommand, as a path, not inlined
-    \\    --no-watch             run in this terminal instead of handing the session
-    \\                           to the lcc daemon — it then dies with the terminal.
-    \\                           The default is to watch; `lcc config watchByDefault
-    \\                           false` makes --no-watch the default instead
-    \\    --watch                hand it to the daemon even when that is off
+    \\    --no-watch             run in this terminal, so the session dies with it.
+    \\                           The default is to run it in the background;
+    \\                           `lcc config watchByDefault false` makes --no-watch
+    \\                           the default instead
+    \\    --watch                run it in the background even when that is off
     \\    --no-attach            print the session id instead of opening the dashboard
-    \\  watch                    Alias for `open`
-    \\  daemon                   Run or control the session daemon
-    \\    --foreground           stay attached to this terminal
-    \\    --stop                 ask a running daemon to exit
-    \\      --force              kill its sessions rather than letting them finish
-    \\    --status               whether one is running, and how many sessions
-    \\    --json                 with --status, print it instead of a summary
     \\  issue <sub> PE-N         Read or write one Linear issue — no repository needed
     \\    show                   state, project, labels and description — read-only
     \\    state "<name>"         move it, by the team's own workflow-state name
@@ -81,6 +74,8 @@ const usage =
     \\  open | o                 The worktrees, and what is running in them
     \\                           enter opens one · n takes another issue · x kills
     \\    --json                 print the sessions instead of the dashboard
+    \\    --stop-all             end every session running in the background
+    \\      --force              kill them rather than letting them finish
     \\  open xcode               Pick a worktree and open it in Xcode instead
     \\  remove | rm              Select and remove one or more worktrees, branches, and build data
     \\    --merged               bulk: every worktree and branch already merged
@@ -155,12 +150,16 @@ fn dispatch(app: app_mod.App, args: []const []const u8) !void {
     if (eq(first, "config")) return configCommand(app, args[1..]);
     if (eq(first, "list") or eq(first, "ls")) return listCommand(app, args[1..]);
     if (eq(first, "open") or eq(first, "o")) return openCommand(app, args[1..]);
-    if (eq(first, "watch")) return watchCommand(app, args[1..]);
     if (eq(first, "remove") or eq(first, "rm")) return removeCommand(app, args[1..]);
     if (eq(first, "clean")) return cleanCommand(app, args[1..]);
     if (eq(first, "issue")) return issueCommand(app, args[1..]);
     if (eq(first, "start")) return startCommand(app, args[1..]);
     if (eq(first, "stats")) return statsCommand(app, args[1..]);
+    // Neither is in `usage`, and neither is an oversight. `watch-hook` is what a
+    // Claude Code hook execs, and `daemon` is what `watch_client` re-execs to
+    // bring the session host up — plumbing a user of lcc has no reason to type,
+    // and every reason not to have to reason about. Both stay dispatchable so
+    // that plumbing works and so there is something to run when debugging it.
     if (eq(first, "watch-hook")) return watchHookCommand(app, args[1..]);
     if (eq(first, "daemon")) return daemonCommand(app, args[1..]);
     if (std.mem.startsWith(u8, first, "-")) return error.UnknownOption;
@@ -353,14 +352,18 @@ fn authCommand(app: app_mod.App, args: []const []const u8) !void {
 fn openCommand(app: app_mod.App, args: []const []const u8) !void {
     var target_arg: ?[]const u8 = null;
     var resume_opt: ?bool = null;
-    var passthrough: std.ArrayList([]const u8) = .empty;
+    var watch_opts: watch_cmd.Opts = .{};
     for (args) |arg| {
         if (eq(arg, "--no-resume")) {
             resume_opt = false;
         } else if (eq(arg, "--resume")) {
             resume_opt = true;
         } else if (eq(arg, "--json")) {
-            try passthrough.append(app.gpa, arg);
+            watch_opts.json = true;
+        } else if (eq(arg, "--stop-all")) {
+            watch_opts.stop_all = true;
+        } else if (eq(arg, "--force")) {
+            watch_opts.force = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownOption;
         } else if (target_arg == null) {
@@ -377,7 +380,17 @@ fn openCommand(app: app_mod.App, args: []const []const u8) !void {
     // nothing to do with sessions. Claude Code is the dashboard now — a
     // worktree and whether something is running in it are one question, and
     // which half you got used to depend on which of two commands you typed.
-    if (target == .claude) return watchCommand(app, passthrough.items);
+    if (target == .claude) {
+        // stdout belongs to the payload in machine mode, same as `start --json`.
+        var machine = app;
+        machine.ui.divert = watch_opts.json;
+        return watch_cmd.run(machine, watch_opts);
+    }
+
+    // Session flags mean nothing to an editor, and silently ignoring one is how
+    // `lcc open xcode --stop-all` becomes a bug report about sessions that did
+    // not stop.
+    if (watch_opts.json or watch_opts.stop_all or watch_opts.force) return error.UnknownOption;
 
     const cfg = try config.load(app.gpa, app.io, app.environ);
     return open_cmd.run(app, target, !orConfig(resume_opt, cfg.resumeSessions));
@@ -499,20 +512,6 @@ fn configCommand(app: app_mod.App, args: []const []const u8) !void {
     return config_cmd.run(machine, opts);
 }
 
-fn watchCommand(app: app_mod.App, args: []const []const u8) !void {
-    var opts: watch_cmd.Opts = .{};
-    for (args) |arg| {
-        if (eq(arg, "--json")) {
-            opts.json = true;
-        } else return error.UnknownOption;
-    }
-
-    // stdout belongs to the payload in machine mode, same as `start --json`.
-    var machine = app;
-    machine.ui.divert = opts.json;
-    return watch_cmd.run(machine, opts);
-}
-
 fn watchHookCommand(app: app_mod.App, args: []const []const u8) !void {
     var opts: watch_cmd.HookOpts = .{};
     var i: usize = 0;
@@ -538,10 +537,6 @@ fn daemonCommand(app: app_mod.App, args: []const []const u8) !void {
     for (args) |arg| {
         if (eq(arg, "--foreground")) {
             opts.foreground = true;
-        } else if (eq(arg, "--stop")) {
-            opts.stop = true;
-        } else if (eq(arg, "--force")) {
-            opts.force = true;
         } else if (eq(arg, "--status")) {
             opts.status = true;
         } else if (eq(arg, "--json")) {
@@ -566,6 +561,25 @@ fn orConfig(flag: ?bool, configured: bool) bool {
 
 fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+test "the help text offers no daemon and no watch command" {
+    // The help text is the whole surface a new user reads, so it is the one
+    // place the vocabulary can regress without anyone noticing. Both words are
+    // banned for a reason:
+    //
+    // `daemon` — a process they neither started nor can act on. Every fact they
+    // need about it is a fact about their sessions, and is phrased that way.
+    // `lcc daemon` still dispatches; it is just not advertised.
+    //
+    // `watch` — the command is gone, absorbed by `lcc open`. A line here
+    // pointing at it would send someone to `error.UnknownCommand`.
+    try std.testing.expect(std.mem.indexOf(u8, usage, "daemon") == null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "lcc watch") == null);
+    // Not `"watch"` outright: `--watch` and `--no-watch` are still how a session
+    // is put in the background or kept out of it, and `watchByDefault` is the
+    // setting behind them.
+    try std.testing.expect(std.mem.indexOf(u8, usage, "  watch ") == null);
 }
 
 test {
