@@ -190,6 +190,8 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
     var out_buf: [8192]u8 = undefined;
     var bar_writer: Io.File.Writer = .init(.stdout(), app.io, &out_buf);
     var scanner: ansi.Scanner = .{};
+    var replay_filter: ansi.ModeFilter = .{};
+    var filtered: [wire.max_payload + 64]u8 = undefined;
 
     // One row shorter than the terminal: the child lays out against what it is
     // told, so reserving a row means telling it the smaller number.
@@ -292,6 +294,20 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
                 // Straight to the terminal, unexamined. These bytes are Claude
                 // Code's own rendering and anything that reinterpreted them
                 // would corrupt the screen.
+                // Scrollback, not live output. The child's terminal setup is
+                // in there — replaying `CSI > 1 u` pushes a second level onto
+                // the keyboard stack, after which the child and the terminal
+                // disagree about how keys are encoded and its pickers stop
+                // seeing Enter while the mouse keeps working.
+                .replay => {
+                    const kept = replay_filter.filter(frame.payload, &filtered);
+                    note(dump, app.io, "replay", kept);
+                    writeAll(chunk_stdout, kept);
+                    if (opts.status_bar and scanner.scan(kept).any()) {
+                        watch_bar.reserve(&bar_writer.interface, size.rows);
+                        bar_dirty = true;
+                    }
+                },
                 .output => {
                     note(dump, app.io, "out", frame.payload);
                     writeAll(chunk_stdout, frame.payload);

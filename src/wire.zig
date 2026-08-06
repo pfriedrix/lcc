@@ -81,6 +81,11 @@ pub const Type = enum(u8) {
 
     attached = 0x40,
     output = 0x41,
+    /// Scrollback, as opposed to what the child is writing now. Distinct
+    /// because a replay must be filtered before it reaches a terminal — see
+    /// `ansi.ModeFilter` — and the client cannot tell one from the other by
+    /// looking at the bytes.
+    replay = 0x44,
     exited = 0x42,
     input_revoked = 0x43,
 
@@ -107,6 +112,7 @@ pub fn known(t: Type) bool {
         .take_input,
         .attached,
         .output,
+        .replay,
         .exited,
         .input_revoked,
         => true,

@@ -185,6 +185,9 @@ const Client = struct {
     /// indices move when a session is removed.
     attached: ?[]const u8 = null,
     cursor: u64 = 0,
+    /// Where the scrollback that existed at attach time ends. Everything below
+    /// it is a replay and is framed as one.
+    replay_until: u64 = 0,
     size: pty.Size = .{ .rows = 24, .cols = 80 },
     /// A connection that says nothing must not hold an fd forever.
     handshake_deadline: i64,
@@ -694,6 +697,7 @@ fn attachClient(loop: *Loop, client: *Client, frame: wire.Frame) void {
     // Replay from the oldest byte still held, so an attaching client can
     // repaint rather than staring at a blank screen until the agent next prints.
     client.cursor = if (body.replay) session.scrollback.oldest() else session.scrollback.written;
+    client.replay_until = session.scrollback.written;
 
     var attached: u32 = 0;
     for (loop.clients.items) |*c| {
@@ -748,9 +752,16 @@ fn pump(loop: *Loop) void {
         const available = parts[0].len + parts[1].len;
         if (available == 0) continue;
 
-        const take = @min(available, wire.max_payload);
+        // Never span the boundary: a frame is entirely replay or entirely
+        // live, so the client knows which rule to apply to all of it.
+        const room = if (c.cursor < c.replay_until)
+            @min(available, c.replay_until - c.cursor)
+        else
+            available;
+        const take = @min(room, wire.max_payload);
         const first = @min(parts[0].len, take);
-        const header = wire.encodeHeader(.output, @intCast(take));
+        const kind: wire.Type = if (c.cursor < c.replay_until) .replay else .output;
+        const header = wire.encodeHeader(kind, @intCast(take));
         c.out.appendSlice(loop.app.gpa, &header) catch continue;
         c.out.appendSlice(loop.app.gpa, parts[0][0..first]) catch continue;
         if (take > first) c.out.appendSlice(loop.app.gpa, parts[1][0 .. take - first]) catch continue;
