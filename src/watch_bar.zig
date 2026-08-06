@@ -57,12 +57,14 @@ pub fn draw(out: *Io.Writer, rows: u16, text: []const u8) void {
     out.flush() catch {};
 }
 
-/// The keys, which are the reason the row exists.
+/// The key, which is the reason the row exists.
 ///
-/// `^C→agent` is there because the second question after "how do I get out" is
-/// "does Ctrl-C still reach Claude Code" — it does, and saying so is what stops
-/// people being afraid to press it.
-pub const keys = "^\\ dashboard · ^C→agent";
+/// One binding and nothing else. It briefly also said `^C→agent`, meaning
+/// "Ctrl-C still reaches Claude Code" — but on a row of keybindings everything
+/// reads as a key you press, so it looked like a third shortcut whose effect
+/// nobody could guess. A reassurance that has to be decoded is worse than the
+/// doubt it was answering.
+pub const keys = "^\\ dashboard";
 
 /// The glyph for a session on the bar.
 ///
