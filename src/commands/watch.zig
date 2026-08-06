@@ -122,7 +122,7 @@ fn emit(app: app_mod.App, opts: Opts, rows: []const Row, live: bool, now: i64) !
         // An empty dashboard is an answer, not a failure — `stats` treats "this
         // one has cost nothing yet" the same way.
         app.ui.info("No watched sessions.", .{});
-        app.ui.hint("Start one with: lcc start PE-256 --watch", .{});
+        app.ui.hint("Start one with: lcc start PE-256", .{});
         return;
     }
 
@@ -215,7 +215,9 @@ fn dashboard(app: app_mod.App, opts: Opts) !void {
 
         const widths = watch_table.fit(watch_table.measure(rows), dims.cols);
         if (rows.len == 0) {
-            out.print("  {s}No watched sessions. Start one with: lcc start PE-256 --watch{s}\n", .{
+            // Points at the key that is already on screen rather than at a
+            // command to quit and run — the empty dashboard can start one.
+            out.print("  {s}No sessions yet — press n to start one.{s}\n", .{
                 ui.palette().dim, ui.palette().reset,
             }) catch {};
             lines += 1;
