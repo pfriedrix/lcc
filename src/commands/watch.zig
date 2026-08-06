@@ -252,9 +252,12 @@ fn dashboard(app: app_mod.App, opts: Opts) !void {
             .down => cursor_id = copyId(&cursor_buf, step(rows, cursor_id, 1)),
             .enter => {
                 if (findRow(rows, cursor_id)) |row| {
-                    const id = row.session_id orelse blk: {
-                        // Nothing running here yet. Start one, then attach, so
-                        // Enter means the same thing on every row.
+                    // Asked of the row rather than of the id: a dead daemon
+                    // leaves its ids in the projection, and attaching to one of
+                    // those finds nothing listening and returns in silence.
+                    const id = if (row.attachable())
+                        row.session_id.?
+                    else blk: {
                         const started = startForWorktree(app, row) catch |err| {
                             app.ui.fail("Could not start a session: {s}", .{@errorName(err)});
                             continue;
@@ -270,7 +273,7 @@ fn dashboard(app: app_mod.App, opts: Opts) !void {
                     confirming_kill = false;
                     if (t[0] == 'y') {
                         if (findRow(rows, cursor_id)) |row| {
-                            if (row.session_id) |id| kill(app, id);
+                            if (row.attachable()) kill(app, row.session_id.?);
                         }
                     }
                     continue;
@@ -284,14 +287,16 @@ fn dashboard(app: app_mod.App, opts: Opts) !void {
                     // the terminal is already owned and re-entering it for a
                     // yes/no would be a second redraw discipline to keep right.
                     // Only a row with something running has anything to kill.
-                    'x' => confirming_kill = if (findRow(rows, cursor_id)) |row| row.session_id != null else false,
+                    // Only a row with something actually running has anything
+                    // to kill; a dead daemon's leftover id is not a target.
+                    'x' => confirming_kill = if (findRow(rows, cursor_id)) |row| row.attachable() else false,
                     'r' => {},
                     '1'...'9' => {
                         const index = t[0] - '1';
                         if (index < rows.len) {
                             cursor_id = copyId(&cursor_buf, rows[index].key);
-                            if (rows[index].session_id) |id| {
-                                try attachTo(app, &screen, terminal, id, opts);
+                            if (rows[index].attachable()) {
+                                try attachTo(app, &screen, terminal, rows[index].session_id.?, opts);
                             }
                         }
                     },

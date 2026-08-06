@@ -32,6 +32,26 @@ pub const Row = struct {
     exit_code: ?i32,
     /// The daemon is alive but its projection has gone cold.
     stale: bool,
+
+    /// Whether there is a live pty behind this row to attach to.
+    ///
+    /// Having a session *id* is not the same question, and conflating them is
+    /// what made Enter do nothing on a dead daemon's rows: the id is still in
+    /// the projection, so the attach was tried, found nothing listening, and
+    /// returned in silence. `unknown` means the daemon that recorded that id is
+    /// gone, and `exited` means the child is — in both cases the id names
+    /// something that no longer exists, and the honest move is to start again.
+    ///
+    /// `orphan` *is* attachable: the worktree is missing but the agent is still
+    /// running, which is the whole reason that state is shown rather than
+    /// dropped.
+    pub fn attachable(self: Row) bool {
+        if (self.session_id == null) return false;
+        return switch (self.status orelse return false) {
+            .starting, .active, .waiting, .idle, .orphan => true,
+            .exited, .unknown => false,
+        };
+    }
 };
 
 /// One glyph per status, so a column of them reads at a glance.
@@ -396,6 +416,38 @@ test "no rendered line is wider than the terminal, at any width" {
         }
         try testing.expectEqual(lines, counted);
     }
+}
+
+test "a row is attachable only when something is actually behind it" {
+    var row: Row = .{
+        .key = "/w",
+        .session_id = "s-1",
+        .status = .active,
+        .issue = null,
+        .branch = "b",
+        .worktree = "/w",
+        .last_activity_at = 0,
+        .exit_code = null,
+        .stale = false,
+    };
+    try testing.expect(row.attachable());
+
+    // The registry still holds an id after the daemon that made it died. Trying
+    // to attach to it finds nothing listening and returns in silence, which
+    // reads as the key not working.
+    row.status = .unknown;
+    try testing.expect(!row.attachable());
+    // A finished child has no pty either.
+    row.status = .exited;
+    try testing.expect(!row.attachable());
+    // But a missing worktree does not mean a missing agent — that is the whole
+    // reason `orphan` is shown instead of dropped.
+    row.status = .orphan;
+    try testing.expect(row.attachable());
+
+    row.status = null;
+    row.session_id = null;
+    try testing.expect(!row.attachable());
 }
 
 test "a worktree with nothing running shows no age, not one measured from the epoch" {
