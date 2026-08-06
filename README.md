@@ -608,8 +608,20 @@ can use, since `setup` needs a terminal):
 lcc config                       # every setting, its value and what it does
 lcc config watchByDefault        # just the value
 lcc config watchByDefault false  # set it
+lcc config listNetwork local     # a choice, not a boolean
 lcc config activeStates "Todo, In Progress, In Review"   # lists are comma-separated
 ```
+
+Every boolean setting has a flag on both sides, so a stored default is never a
+trap you cannot escape for one run: `--watch` / `--no-watch`, `--tokens` /
+`--no-tokens`, `--resume` / `--no-resume`, `--keep-branch` /
+`--no-keep-branch`, and so on. `lcc list` spells its three-way one as
+`--refresh`, `--cached` and `--local`.
+
+`--yes` and `--force` are deliberately **not** settings. A stored value that
+pre-approves a destructive operation removes the one confirmation standing
+between a mistyped command and a deleted worktree, and it does so invisibly,
+months after anyone typed it.
 
 
 | Key | Default | Meaning |
@@ -619,7 +631,14 @@ lcc config activeStates "Todo, In Progress, In Review"   # lists are comma-separ
 | `startTaskCommand` | `""` | Passed to Claude Code as its initial prompt. Placeholders: `{identifier}`, `{branch}`, `{url}`, `{plan}` (the `--plan` path, empty without it — and required in the template before `--plan` is accepted) |
 | `linkPatterns` | `[".env", ".env.*", "CLAUDE.md", "CLAUDE.local.md", ".claude/settings.local.json"]` | Which files to symlink into each worktree |
 | `linkExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
-| `watchByDefault` | `true` | Hand new sessions to the daemon so they outlive the terminal. `--watch` / `--no-watch` override it for one invocation |
+| `watchByDefault` | `true` | Hand new sessions to the daemon so they outlive the terminal |
+| `statusBar` | `true` | Reserve the bottom row of an attached session for lcc |
+| `planMode` | `true` | Open new sessions in plan mode. `--plan <file>` turns it off regardless |
+| `resumeSessions` | `true` | `lcc open` resumes the worktree's last session |
+| `showTokens` | `true` | The TOKENS column in `lcc list`. Off skips reading transcripts, which is that column's whole cost |
+| `listNetwork` | `cached` | The PR and Linear columns in `lcc list`: `refresh`, `cached` or `local` |
+| `allIssues` | `false` | Offer every assigned issue in the picker, not just `activeStates` |
+| `keepBranch`, `keepDerivedData`, `keepXcode` | `false` | What `lcc remove` leaves behind |
 | `mcpCarry` | absent — all of them | Which local-scope MCP servers to carry into Claude; setup accepts a comma-separated list, `all`, or `none` |
 | `clientId` | built-in | Linear OAuth application. Override with `LCC_CLIENT_ID` or `lcc auth setup --client-id <id>` |
 

@@ -169,11 +169,20 @@ fn dispatch(app: app_mod.App, args: []const []const u8) !void {
 
 fn startCommand(app: app_mod.App, args: []const []const u8) !void {
     var opts: start_cmd.Opts = .{};
+    var all: ?bool = null;
+    var plan_mode: ?bool = null;
+    var watch: ?bool = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (eq(arg, "--all")) {
-            opts.all = true;
+            all = true;
+        } else if (eq(arg, "--no-all")) {
+            all = false;
+        } else if (eq(arg, "--plan-mode")) {
+            plan_mode = true;
+        } else if (eq(arg, "--no-plan-mode")) {
+            plan_mode = false;
         } else if (eq(arg, "--json")) {
             opts.json = true;
         } else if (eq(arg, "--base")) {
@@ -189,9 +198,9 @@ fn startCommand(app: app_mod.App, args: []const []const u8) !void {
             if (i >= args.len) return error.MissingOptionValue;
             opts.plan = args[i];
         } else if (eq(arg, "--watch")) {
-            opts.watch = true;
+            watch = true;
         } else if (eq(arg, "--no-watch")) {
-            opts.watch = false;
+            watch = false;
         } else if (eq(arg, "--no-attach")) {
             opts.no_attach = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
@@ -200,6 +209,11 @@ fn startCommand(app: app_mod.App, args: []const []const u8) !void {
             opts.issue = arg;
         } else return error.TooManyArguments;
     }
+
+    const cfg = try config.load(app.gpa, app.io, app.environ);
+    opts.all = orConfig(all, cfg.allIssues);
+    opts.plan_mode = orConfig(plan_mode, cfg.planMode);
+    opts.watch = orConfig(watch, cfg.watchByDefault);
 
     // stdout belongs to the payload in machine mode; the progress lines still go
     // somewhere a human can see them.
@@ -338,10 +352,12 @@ fn authCommand(app: app_mod.App, args: []const []const u8) !void {
 
 fn openCommand(app: app_mod.App, args: []const []const u8) !void {
     var target_arg: ?[]const u8 = null;
-    var no_resume = false;
+    var resume_opt: ?bool = null;
     for (args) |arg| {
         if (eq(arg, "--no-resume")) {
-            no_resume = true;
+            resume_opt = false;
+        } else if (eq(arg, "--resume")) {
+            resume_opt = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownOption;
         } else if (target_arg == null) {
@@ -353,20 +369,34 @@ fn openCommand(app: app_mod.App, args: []const []const u8) !void {
         app.ui.fail("Unknown open target '{s}'. Use one of: claude, xcode.", .{target_arg.?});
         std.process.exit(1);
     };
-    return open_cmd.run(app, target, no_resume);
+    const cfg = try config.load(app.gpa, app.io, app.environ);
+    return open_cmd.run(app, target, !orConfig(resume_opt, cfg.resumeSessions));
 }
 
 fn listCommand(app: app_mod.App, args: []const []const u8) !void {
     var opts: list_cmd.Opts = .{};
+    var tokens: ?bool = null;
+    var network: ?config.ListNetwork = null;
     for (args) |arg| {
         if (eq(arg, "--local")) {
-            opts.local = true;
-        } else if (eq(arg, "--no-tokens")) {
-            opts.tokens = false;
+            network = .local;
         } else if (eq(arg, "--refresh")) {
-            opts.refresh = true;
+            network = .refresh;
+        } else if (eq(arg, "--cached")) {
+            // The way back from a stored `listNetwork` of local or refresh.
+            network = .cached;
+        } else if (eq(arg, "--no-tokens")) {
+            tokens = false;
+        } else if (eq(arg, "--tokens")) {
+            tokens = true;
         } else return error.UnknownOption;
     }
+
+    const cfg = try config.load(app.gpa, app.io, app.environ);
+    const mode = network orelse cfg.listNetwork;
+    opts.local = mode == .local;
+    opts.refresh = mode == .refresh;
+    opts.tokens = orConfig(tokens, cfg.showTokens);
     return list_cmd.run(app, opts);
 }
 
@@ -388,17 +418,26 @@ fn statsCommand(app: app_mod.App, args: []const []const u8) !void {
 
 fn removeCommand(app: app_mod.App, args: []const []const u8) !void {
     var opts: remove_cmd.Opts = .{};
+    var keep_derived_data: ?bool = null;
+    var keep_branch: ?bool = null;
+    var keep_xcode: ?bool = null;
     for (args) |arg| {
         if (eq(arg, "-f") or eq(arg, "--force")) {
             opts.force = true;
         } else if (eq(arg, "-y") or eq(arg, "--yes")) {
             opts.yes = true;
         } else if (eq(arg, "--keep-derived-data")) {
-            opts.keep_derived_data = true;
+            keep_derived_data = true;
+        } else if (eq(arg, "--no-keep-derived-data")) {
+            keep_derived_data = false;
         } else if (eq(arg, "--keep-branch")) {
-            opts.keep_branch = true;
+            keep_branch = true;
+        } else if (eq(arg, "--no-keep-branch")) {
+            keep_branch = false;
         } else if (eq(arg, "--keep-xcode")) {
-            opts.keep_xcode = true;
+            keep_xcode = true;
+        } else if (eq(arg, "--no-keep-xcode")) {
+            keep_xcode = false;
         } else if (eq(arg, "--sessions")) {
             opts.sessions = true;
         } else if (eq(arg, "--merged")) {
@@ -407,6 +446,11 @@ fn removeCommand(app: app_mod.App, args: []const []const u8) !void {
             opts.local = true;
         } else return error.UnknownOption;
     }
+
+    const cfg = try config.load(app.gpa, app.io, app.environ);
+    opts.keep_derived_data = orConfig(keep_derived_data, cfg.keepDerivedData);
+    opts.keep_branch = orConfig(keep_branch, cfg.keepBranch);
+    opts.keep_xcode = orConfig(keep_xcode, cfg.keepXcode);
     return remove_cmd.run(app, opts);
 }
 
@@ -447,13 +491,19 @@ fn configCommand(app: app_mod.App, args: []const []const u8) !void {
 
 fn watchCommand(app: app_mod.App, args: []const []const u8) !void {
     var opts: watch_cmd.Opts = .{};
+    var status_bar: ?bool = null;
     for (args) |arg| {
         if (eq(arg, "--json")) {
             opts.json = true;
         } else if (eq(arg, "--no-status-bar")) {
-            opts.no_status_bar = true;
+            status_bar = false;
+        } else if (eq(arg, "--status-bar")) {
+            status_bar = true;
         } else return error.UnknownOption;
     }
+
+    const cfg = try config.load(app.gpa, app.io, app.environ);
+    opts.status_bar = orConfig(status_bar, cfg.statusBar);
 
     // stdout belongs to the payload in machine mode, same as `start --json`.
     var machine = app;
@@ -500,6 +550,16 @@ fn daemonCommand(app: app_mod.App, args: []const []const u8) !void {
     var machine = app;
     machine.ui.divert = opts.json;
     return daemon_cmd.run(machine, opts);
+}
+
+/// A flag that may not have been given, resolved against what the file says.
+///
+/// Defaults live here rather than inside each command because this is the only
+/// layer that can tell "not passed" from "passed false" — an `Opts` field is a
+/// plain bool by the time a command sees it, which is what keeps the commands
+/// and their many helpers free of tri-state.
+fn orConfig(flag: ?bool, configured: bool) bool {
+    return flag orelse configured;
 }
 
 fn eq(a: []const u8, b: []const u8) bool {

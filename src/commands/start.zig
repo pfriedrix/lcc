@@ -33,13 +33,16 @@ pub const Opts = struct {
     /// A plan the agent should start from, reachable through `{plan}` in
     /// `startTaskCommand`. Only the path travels — see `expandCommand`.
     plan: ?[]const u8 = null,
+    /// Open in Claude Code's plan mode. A `--plan` file turns it off regardless,
+    /// since the session already has one. Resolved against `planMode` by the
+    /// argv layer.
+    plan_mode: bool = true,
     /// Hand the session to the daemon instead of taking over this terminal, so
     /// it survives the terminal closing. Everything above the launch is
     /// unchanged — this only replaces the last step.
     ///
-    /// Tri-state: null defers to `watchByDefault`, which is on. `--watch` and
-    /// `--no-watch` are the per-invocation overrides in either direction.
-    watch: ?bool = null,
+    /// Resolved against `watchByDefault`, which is on, by the argv layer.
+    watch: bool = true,
     /// With `--watch`, print the session id and return instead of showing the
     /// dashboard. What a slash command or a script uses.
     no_attach: bool = false,
@@ -73,9 +76,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         }
         break :blk resolved;
     } else null;
-    // Either the work is planned here or a plan was brought to it. One name, so the
-    // banner and the launch cannot come to different conclusions about which.
-    const plan_mode = plan_path == null;
     // Said before the read, not after: the Keychain grants access to a binary by its
     // code signature, so a freshly built lcc can block here on a system dialog for
     // the login password. Announced, that is a wait with a reason; unannounced, it
@@ -88,6 +88,10 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     }
 
     const cfg = try config.load(app.gpa, app.io, app.environ);
+
+    // Either the work is planned here or a plan was brought to it. One name, so the
+    // banner and the launch cannot come to different conclusions about which.
+    const plan_mode = plan_path == null and opts.plan_mode;
 
     // `{plan}` is the only thing that carries a plan to the agent, and
     // `startTaskCommand` is empty by default — so without the placeholder, `--plan`
@@ -192,7 +196,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     // The only branch `--watch` adds. Everything above — the token, the issue,
     // the repository, the worktree, the links, the argv — is shared, so the two
     // launch paths cannot come to different conclusions about what to run.
-    if (opts.watch orelse cfg.watchByDefault) {
+    if (opts.watch) {
         if (watch_client.startSession(app, .{
             .worktree = wt.path,
             .branch = wt.branch,

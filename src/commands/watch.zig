@@ -18,9 +18,10 @@ const watch_table = @import("../watch_table.zig");
 
 pub const Opts = struct {
     json: bool = false,
-    /// Give the attached session the whole terminal. Opting out of the only
-    /// place the way back is durably written.
-    no_status_bar: bool = false,
+    /// Reserve the bottom row of an attached session. Off gives the session the
+    /// whole terminal and opts out of the only place the way back is durably
+    /// written. Resolved against `statusBar` by the argv layer.
+    status_bar: bool = true,
 };
 
 /// The `lcc watch-hook` side. Deliberately a separate entry point: it is not a
@@ -290,7 +291,7 @@ fn attachTo(
     const peers = watch_client.snapshot(app) catch null;
     _ = watch_attach.run(app, .{
         .session_id = id,
-        .status_bar = !opts.no_status_bar,
+        .status_bar = opts.status_bar,
         .peers = peers orelse &.{},
     }) catch {};
 

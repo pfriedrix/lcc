@@ -40,6 +40,24 @@ const default_active_states = [_][]const u8{ "Todo", "In Progress" };
 /// the two ways back to a plain foreground launch.
 pub const default_watch_by_default = true;
 
+/// What `lcc list` may do about the PR and Linear columns.
+///
+/// One setting rather than two booleans because the three states are exclusive
+/// and two flags would let someone ask for both "skip the network" and "ignore
+/// the cache", which has no meaning.
+pub const ListNetwork = enum {
+    /// Ask GitHub and Linear again.
+    refresh,
+    /// Reuse a recent answer.
+    cached,
+    /// Skip those columns entirely.
+    local,
+
+    pub fn parse(text: []const u8) ?ListNetwork {
+        return std.meta.stringToEnum(ListNetwork, std.mem.trim(u8, text, " \t"));
+    }
+};
+
 /// What the file may contain. Every field optional: absence means "use the default".
 pub const Stored = struct {
     clientId: ?[]const u8 = null,
@@ -60,6 +78,26 @@ pub const Stored = struct {
     /// over the terminal. On unless turned off — a session that survives its
     /// terminal is what you want by default, and `--no-watch` covers the one-off.
     watchByDefault: ?bool = null,
+    /// Reserve the bottom row of an attached session for lcc's status bar.
+    statusBar: ?bool = null,
+    /// Open new sessions in Claude Code's plan mode. A `--plan` file turns it
+    /// off regardless: the session already has a plan.
+    planMode: ?bool = null,
+    /// `lcc open` resumes the worktree's last session rather than starting fresh.
+    resumeSessions: ?bool = null,
+    /// The TOKENS column in `lcc list`. Off skips reading transcripts, which is
+    /// the whole cost of that column.
+    showTokens: ?bool = null,
+    /// How `lcc list` treats the PR and Linear columns: `refresh`, `cached` or
+    /// `local`. Stored as text — the enum's numbering is an implementation
+    /// detail and must not reach disk.
+    listNetwork: ?[]const u8 = null,
+    /// Offer every assigned issue in the picker, not just `activeStates`.
+    allIssues: ?bool = null,
+    /// What `lcc remove` leaves behind by default.
+    keepBranch: ?bool = null,
+    keepDerivedData: ?bool = null,
+    keepXcode: ?bool = null,
 };
 
 /// How a settings update changes the physical `mcpCarry` key. `all` removes the
@@ -79,6 +117,15 @@ pub const Patch = struct {
     startTaskCommand: ?[]const u8 = null,
     mcpCarry: ?McpCarry = null,
     watchByDefault: ?bool = null,
+    statusBar: ?bool = null,
+    planMode: ?bool = null,
+    resumeSessions: ?bool = null,
+    showTokens: ?bool = null,
+    listNetwork: ?ListNetwork = null,
+    allIssues: ?bool = null,
+    keepBranch: ?bool = null,
+    keepDerivedData: ?bool = null,
+    keepXcode: ?bool = null,
 };
 
 pub const Config = struct {
@@ -90,6 +137,15 @@ pub const Config = struct {
     startTaskCommand: []const u8,
     mcpCarry: ?[]const []const u8,
     watchByDefault: bool,
+    statusBar: bool,
+    planMode: bool,
+    resumeSessions: bool,
+    showTokens: bool,
+    listNetwork: ListNetwork,
+    allIssues: bool,
+    keepBranch: bool,
+    keepDerivedData: bool,
+    keepXcode: bool,
 };
 
 pub fn dir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
@@ -145,6 +201,17 @@ pub fn load(
         .startTaskCommand = stored.startTaskCommand orelse "",
         .mcpCarry = stored.mcpCarry,
         .watchByDefault = stored.watchByDefault orelse default_watch_by_default,
+        .statusBar = stored.statusBar orelse true,
+        .planMode = stored.planMode orelse true,
+        .resumeSessions = stored.resumeSessions orelse true,
+        .showTokens = stored.showTokens orelse true,
+        // An unrecognised value reads as the default rather than failing the
+        // whole file — a hand-edited typo should cost one setting, not the run.
+        .listNetwork = if (stored.listNetwork) |v| (ListNetwork.parse(v) orelse .cached) else .cached,
+        .allIssues = stored.allIssues orelse false,
+        .keepBranch = stored.keepBranch orelse false,
+        .keepDerivedData = stored.keepDerivedData orelse false,
+        .keepXcode = stored.keepXcode orelse false,
     };
 }
 
@@ -171,6 +238,15 @@ pub fn save(
     if (patch.activeStates) |v| merged.activeStates = v;
     if (patch.startTaskCommand) |v| merged.startTaskCommand = v;
     if (patch.watchByDefault) |v| merged.watchByDefault = v;
+    if (patch.statusBar) |v| merged.statusBar = v;
+    if (patch.planMode) |v| merged.planMode = v;
+    if (patch.resumeSessions) |v| merged.resumeSessions = v;
+    if (patch.showTokens) |v| merged.showTokens = v;
+    if (patch.listNetwork) |v| merged.listNetwork = @tagName(v);
+    if (patch.allIssues) |v| merged.allIssues = v;
+    if (patch.keepBranch) |v| merged.keepBranch = v;
+    if (patch.keepDerivedData) |v| merged.keepDerivedData = v;
+    if (patch.keepXcode) |v| merged.keepXcode = v;
     if (patch.mcpCarry) |carry| switch (carry) {
         .all => merged.mcpCarry = null,
         .only => |v| merged.mcpCarry = v,
