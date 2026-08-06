@@ -57,7 +57,6 @@ const Key = struct {
 pub const keys = [_]Key{
     .{ .name = "watchByDefault", .kind = .boolean, .label = "Sessions outlive the terminal" },
     .{ .name = "planMode", .kind = .boolean, .label = "Start in plan mode" },
-    .{ .name = "statusBar", .kind = .boolean, .label = "Status bar while attached" },
     .{ .name = "resumeSessions", .kind = .boolean, .label = "Resume last session on open" },
     .{ .name = "allIssues", .kind = .boolean, .label = "Offer every assigned issue" },
     .{ .name = "showTokens", .kind = .boolean, .label = "Token column in list" },
@@ -104,7 +103,6 @@ fn list(app: app_mod.App, opts: Opts) !void {
     if (opts.json) {
         const body = try std.json.Stringify.valueAlloc(app.gpa, .{
             .watchByDefault = cfg.watchByDefault,
-            .statusBar = cfg.statusBar,
             .planMode = cfg.planMode,
             .resumeSessions = cfg.resumeSessions,
             .showTokens = cfg.showTokens,
@@ -344,7 +342,6 @@ fn change(
 
 fn applyBool(patch: *config.Patch, name: []const u8, on: bool) void {
     if (std.mem.eql(u8, name, "watchByDefault")) patch.watchByDefault = on;
-    if (std.mem.eql(u8, name, "statusBar")) patch.statusBar = on;
     if (std.mem.eql(u8, name, "planMode")) patch.planMode = on;
     if (std.mem.eql(u8, name, "resumeSessions")) patch.resumeSessions = on;
     if (std.mem.eql(u8, name, "showTokens")) patch.showTokens = on;
@@ -391,7 +388,6 @@ fn render(app: app_mod.App, cfg: config.Config, key: Key) ![]const u8 {
     }.of;
 
     if (std.mem.eql(u8, key.name, "watchByDefault")) return yes_no(cfg.watchByDefault);
-    if (std.mem.eql(u8, key.name, "statusBar")) return yes_no(cfg.statusBar);
     if (std.mem.eql(u8, key.name, "planMode")) return yes_no(cfg.planMode);
     if (std.mem.eql(u8, key.name, "resumeSessions")) return yes_no(cfg.resumeSessions);
     if (std.mem.eql(u8, key.name, "showTokens")) return yes_no(cfg.showTokens);

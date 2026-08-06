@@ -58,7 +58,7 @@ pub const Row = struct {
 ///
 /// `waiting` is the only one that means "go here now", and it gets the filled
 /// circle and the warm colour for that reason alone.
-pub fn glyph(status: ?sessions.Status) []const u8 {
+fn glyph(status: ?sessions.Status) []const u8 {
     return switch (status orelse return "·") {
         .waiting => "●",
         .active => "◐",
@@ -70,7 +70,7 @@ pub fn glyph(status: ?sessions.Status) []const u8 {
     };
 }
 
-pub fn paint(status: ?sessions.Status, palette: ui.Palette) []const u8 {
+fn paint(status: ?sessions.Status, palette: ui.Palette) []const u8 {
     return switch (status orelse return palette.dim) {
         .waiting => palette.yellow,
         .active => palette.green,

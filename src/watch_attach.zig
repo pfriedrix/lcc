@@ -12,14 +12,31 @@
 //!
 //! Everything that is not the pump — connecting, the registry, the snapshot —
 //! still goes through `Io` and through `app.ui`.
+//!
+//! **lcc draws nothing while attached, and that is a conclusion rather than an
+//! omission.** A status bar lived here: the child was told the terminal was one
+//! row shorter, a scroll region fenced it out of the last line, and lcc painted
+//! the sessions and `^\` there — the way tmux does it. Against Claude Code it
+//! did not hold. It renders with relative cursor moves many times a second, so
+//! every paint has to borrow the cursor and give it back exactly; it emits a
+//! bare `CSI r` that reclaims the region; and it shares the terminal's single
+//! saved-cursor slot, so a DECSC of its own spanning two bursts collides with
+//! ours. Painting on a timer, only after output, and unconditionally
+//! reasserting the region were each tried, and each still disturbed its
+//! rendering. Doing it correctly needs a model of where the cursor is, which is
+//! a terminal emulator — more than a status bar is worth.
+//!
+//! So the way back out is documented instead of displayed: the dashboard's own
+//! footer names `^\`, and README says it. If this is revisited, the honest
+//! shapes are a real emulator over the ring, or terminal chrome that occupies
+//! no cell (OSC 2) — not another schedule for writing into someone else's
+//! screen.
 
 const std = @import("std");
 const Io = std.Io;
 const ansi = @import("ansi.zig");
 const app_mod = @import("app.zig");
 const term = @import("term.zig");
-const sessions_mod = @import("sessions.zig");
-const watch_bar = @import("watch_bar.zig");
 const watch_client = @import("watch_client.zig");
 const wire = @import("wire.zig");
 
@@ -58,8 +75,7 @@ const backslash_ctrl_code = 0x1c;
 ///
 /// Scanning for the byte alone was enough against `/bin/cat`, which enables
 /// neither, and would have silently failed against the program this exists for
-/// — leaving someone inside a session with no way back and a status bar
-/// claiming otherwise.
+/// — leaving someone inside a session with no way back at all.
 ///
 /// Pure, so the one thing that can strand a user is testable without a terminal.
 pub fn detachAt(bytes: []const u8) ?usize {
@@ -130,11 +146,6 @@ pub const Options = struct {
     /// Replay the scrollback so the screen is repainted on arrival, rather than
     /// staying blank until the agent next prints.
     replay: bool = true,
-    /// Reserve the bottom row for the status bar. The way back out is written
-    /// there, so turning it off is opting out of the only durable reminder.
-    status_bar: bool = true,
-    /// Drawn on the reserved row beside the keys.
-    peers: []const sessions_mod.Session = &.{},
 };
 
 /// Tees every byte in both directions to a file, for diagnosing a terminal that
@@ -179,38 +190,26 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
     defer {
         var exit_buf: [512]u8 = undefined;
         var out_writer: Io.File.Writer = .init(.stdout(), app.io, &exit_buf);
-        watch_bar.release(&out_writer.interface);
         term.sanitize(&out_writer.interface);
         out_writer.interface.flush() catch {};
         terminal.restore();
         conn.close(app.io);
     }
 
-    var bar_buf: [512]u8 = undefined;
-    var out_buf: [8192]u8 = undefined;
-    var bar_writer: Io.File.Writer = .init(.stdout(), app.io, &out_buf);
     var replay_filter: ansi.ModeFilter = .{};
     var filtered: [wire.max_payload + 64]u8 = undefined;
-
-    // One row shorter than the terminal: the child lays out against what it is
-    // told, so reserving a row means telling it the smaller number.
-    const child_rows = childRows(size.rows, opts.status_bar);
-    if (opts.status_bar) {
-        watch_bar.reserve(&bar_writer.interface, size.rows);
-        bar_writer.interface.flush() catch {};
-    }
 
     try conn.sendControl(app.gpa, .attach, wire.Attach{
         .session_id = opts.session_id,
         .cols = size.cols,
-        .rows = child_rows,
+        // The whole terminal: lcc keeps no row of its own. The module header
+        // says why the screen belongs entirely to the child.
+        .rows = size.rows,
         .replay = opts.replay,
     });
 
     const sock = conn.stream.socket.handle;
     var in_buf: [4096]u8 = undefined;
-    var peers = opts.peers;
-    var peers_at: i64 = 0;
 
     while (true) {
         // Re-queried every iteration rather than driven by SIGWINCH, matching
@@ -220,10 +219,9 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
             size = now_size;
             conn.sendControl(app.gpa, .resize, wire.Resize{
                 .cols = size.cols,
-                .rows = childRows(size.rows, opts.status_bar),
+                .rows = size.rows,
             }) catch return .daemon_gone;
         }
-
 
         var fds = [_]std.posix.pollfd{
             .{ .fd = terminal.fd, .events = std.posix.POLL.IN, .revents = 0 },
@@ -266,70 +264,16 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
                     const kept = replay_filter.filter(frame.payload, &filtered);
                     note(dump, app.io, "replay", kept);
                     writeAll(chunk_stdout, kept);
-                    paintBar(app, &bar_writer, &bar_buf, opts, &peers, &peers_at, size);
                 },
                 .output => {
                     note(dump, app.io, "out", frame.payload);
                     writeAll(chunk_stdout, frame.payload);
-                    paintBar(app, &bar_writer, &bar_buf, opts, &peers, &peers_at, size);
                 },
                 .exited => return .ended,
                 else => {},
             };
         }
     }
-}
-
-/// Repaint the reserved row, immediately *after* the caller has written the
-/// child's own output.
-///
-/// The order is the whole of it, and both halves matter.
-///
-/// After, not before: Claude Code moves its cursor relatively — `CSI 4A` and
-/// the like — so it renders from wherever the cursor already is. Painting first
-/// left it on the bar row and every relative move that followed was measured
-/// from the wrong place, which is what a misdrawn UI looks like. Painting last
-/// means the cursor is exactly where the child put it when this runs.
-///
-/// Only alongside output, never on a timer: while the child is silent nothing
-/// has changed and nothing has disturbed the row, so a repaint would move the
-/// cursor for no reason and leave it moved until the child next spoke.
-fn paintBar(
-    app: app_mod.App,
-    writer: *Io.File.Writer,
-    buf: []u8,
-    opts: Options,
-    peers: *[]const sessions_mod.Session,
-    peers_at: *i64,
-    size: term.Size,
-) void {
-    if (!opts.status_bar) return;
-    const at = app_mod.nowSeconds(app.io);
-    // Reasserted unconditionally rather than only when the child was seen to
-    // reclaim it. Claude Code emits a bare `CSI r` early, and anything else it
-    // runs may do the same — six bytes on every burst is cheaper than a scanner
-    // whose only job is to decide whether to send them.
-    watch_bar.reserve(&writer.interface, size.rows);
-    // A snapshot is a socket round trip, so it is refreshed on its own slow
-    // clock rather than on every burst of output.
-    if (at - peers_at.* >= 2) {
-        if (watch_client.snapshot(app) catch null) |fresh| peers.* = fresh;
-        peers_at.* = at;
-    }
-    watch_bar.draw(
-        &writer.interface,
-        size.rows,
-        // One column short: filling the last cell leaves the terminal poised
-        // to wrap, and what happens then is the emulator's decision, not ours.
-        watch_bar.compose(buf, peers.*, opts.session_id, size.cols -| 1),
-    );
-}
-
-/// What the child is told the terminal is. One row is kept back for the bar,
-/// and a terminal too short to spare one keeps all of them.
-fn childRows(rows: u16, status_bar: bool) u16 {
-    if (!status_bar or rows < 3) return rows;
-    return rows - 1;
 }
 
 const chunk_stdout: std.posix.fd_t = 1;
@@ -399,16 +343,6 @@ test "a UTF-8 continuation byte can never be mistaken for the detach key" {
 
     const emoji = "🚀 працює";
     try testing.expect(detachAt(emoji) == null);
-}
-
-test "the child is told one row less, unless there is none to spare" {
-    try testing.expectEqual(@as(u16, 39), childRows(40, true));
-    // Opted out: the child gets the whole screen.
-    try testing.expectEqual(@as(u16, 40), childRows(40, false));
-    // Too short to give a row away — taking one here would leave almost nothing
-    // to render into, which looks like a hang rather than a small window.
-    try testing.expectEqual(@as(u16, 2), childRows(2, true));
-    try testing.expectEqual(@as(u16, 1), childRows(1, true));
 }
 
 test "Ctrl-C is not the detach key" {

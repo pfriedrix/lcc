@@ -81,7 +81,6 @@ const usage =
     \\  open | o                 The worktrees, and what is running in them
     \\                           enter opens one · n takes another issue · x kills
     \\    --json                 print the sessions instead of the dashboard
-    \\    --no-status-bar        give an attached session the whole terminal
     \\  open xcode               Pick a worktree and open it in Xcode instead
     \\  remove | rm              Select and remove one or more worktrees, branches, and build data
     \\    --merged               bulk: every worktree and branch already merged
@@ -360,7 +359,7 @@ fn openCommand(app: app_mod.App, args: []const []const u8) !void {
             resume_opt = false;
         } else if (eq(arg, "--resume")) {
             resume_opt = true;
-        } else if (eq(arg, "--json") or eq(arg, "--status-bar") or eq(arg, "--no-status-bar")) {
+        } else if (eq(arg, "--json")) {
             try passthrough.append(app.gpa, arg);
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownOption;
@@ -502,19 +501,11 @@ fn configCommand(app: app_mod.App, args: []const []const u8) !void {
 
 fn watchCommand(app: app_mod.App, args: []const []const u8) !void {
     var opts: watch_cmd.Opts = .{};
-    var status_bar: ?bool = null;
     for (args) |arg| {
         if (eq(arg, "--json")) {
             opts.json = true;
-        } else if (eq(arg, "--no-status-bar")) {
-            status_bar = false;
-        } else if (eq(arg, "--status-bar")) {
-            status_bar = true;
         } else return error.UnknownOption;
     }
-
-    const cfg = try config.load(app.gpa, app.io, app.environ);
-    opts.status_bar = orConfig(status_bar, cfg.statusBar);
 
     // stdout belongs to the payload in machine mode, same as `start --json`.
     var machine = app;
@@ -610,7 +601,6 @@ test {
     _ = @import("usage.zig");
     _ = @import("usage_cache.zig");
     _ = @import("watch_attach.zig");
-    _ = @import("watch_bar.zig");
     _ = @import("watch_client.zig");
     _ = @import("watch_hooks.zig");
     _ = @import("watch_paths.zig");

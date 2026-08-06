@@ -78,8 +78,6 @@ pub const Stored = struct {
     /// over the terminal. On unless turned off — a session that survives its
     /// terminal is what you want by default, and `--no-watch` covers the one-off.
     watchByDefault: ?bool = null,
-    /// Reserve the bottom row of an attached session for lcc's status bar.
-    statusBar: ?bool = null,
     /// Open new sessions in Claude Code's plan mode. A `--plan` file turns it
     /// off regardless: the session already has a plan.
     planMode: ?bool = null,
@@ -117,7 +115,6 @@ pub const Patch = struct {
     startTaskCommand: ?[]const u8 = null,
     mcpCarry: ?McpCarry = null,
     watchByDefault: ?bool = null,
-    statusBar: ?bool = null,
     planMode: ?bool = null,
     resumeSessions: ?bool = null,
     showTokens: ?bool = null,
@@ -137,7 +134,6 @@ pub const Config = struct {
     startTaskCommand: []const u8,
     mcpCarry: ?[]const []const u8,
     watchByDefault: bool,
-    statusBar: bool,
     planMode: bool,
     resumeSessions: bool,
     showTokens: bool,
@@ -201,7 +197,6 @@ pub fn load(
         .startTaskCommand = stored.startTaskCommand orelse "",
         .mcpCarry = stored.mcpCarry,
         .watchByDefault = stored.watchByDefault orelse default_watch_by_default,
-        .statusBar = stored.statusBar orelse true,
         .planMode = stored.planMode orelse true,
         .resumeSessions = stored.resumeSessions orelse true,
         .showTokens = stored.showTokens orelse true,
@@ -238,7 +233,6 @@ pub fn save(
     if (patch.activeStates) |v| merged.activeStates = v;
     if (patch.startTaskCommand) |v| merged.startTaskCommand = v;
     if (patch.watchByDefault) |v| merged.watchByDefault = v;
-    if (patch.statusBar) |v| merged.statusBar = v;
     if (patch.planMode) |v| merged.planMode = v;
     if (patch.resumeSessions) |v| merged.resumeSessions = v;
     if (patch.showTokens) |v| merged.showTokens = v;

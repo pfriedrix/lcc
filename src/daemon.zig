@@ -314,9 +314,9 @@ const Loop = struct {
     /// Tell everyone watching a session that it is over.
     ///
     /// Without this an attached client waits forever on a pty that will never
-    /// speak again: it keeps its own status bar repainting over a screen that
-    /// has stopped changing, which is indistinguishable from a hang. The frame
-    /// type existed and the client handled it; nothing ever sent it.
+    /// speak again, sitting on a screen that has stopped changing — which is
+    /// indistinguishable from a hang. The frame type existed and the client
+    /// handled it; nothing ever sent it.
     fn announceExit(self: *Loop, session: *watch_session.Session) void {
         for (self.clients.items) |*c| {
             const id = c.attached orelse continue;

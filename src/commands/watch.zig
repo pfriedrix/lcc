@@ -24,10 +24,6 @@ const watch_table = @import("../watch_table.zig");
 
 pub const Opts = struct {
     json: bool = false,
-    /// Reserve the bottom row of an attached session. Off gives the session the
-    /// whole terminal and opts out of the only place the way back is durably
-    /// written. Resolved against `statusBar` by the argv layer.
-    status_bar: bool = true,
 };
 
 /// The `lcc watch-hook` side. Deliberately a separate entry point: it is not a
@@ -61,7 +57,7 @@ pub fn run(app: app_mod.App, opts: Opts) anyerror!void {
     // conflict: a full-screen TUI cannot write its frames through `app.ui`,
     // and `ui.divert` has no meaning for one.
     if (!opts.json and Io.File.stdout().isTty(app.io) catch false) {
-        return dashboard(app, opts);
+        return dashboard(app);
     }
     if (!opts.json and !(Io.File.stdout().isTty(app.io) catch false)) {
         // Checked before connecting, so the suggestion arrives instead of a
@@ -163,7 +159,7 @@ fn emit(app: app_mod.App, opts: Opts, rows: []const Row, live: bool, now: i64) !
 /// Draw at the top, block at the bottom, recount every frame — `prompt.zig`'s
 /// line discipline unchanged. Only the *trigger* for a frame differs: a
 /// keystroke there, a keystroke or a second's tick here.
-fn dashboard(app: app_mod.App, opts: Opts) !void {
+fn dashboard(app: app_mod.App) !void {
     const terminal = try term.Terminal.enterRaw();
     defer terminal.restore();
 
@@ -264,7 +260,7 @@ fn dashboard(app: app_mod.App, opts: Opts) !void {
                         };
                         break :blk started.id;
                     };
-                    try attachTo(app, &screen, terminal, id, opts);
+                    try attachTo(app, &screen, terminal, id);
                 }
             },
             .text => |t| {
@@ -299,7 +295,7 @@ fn dashboard(app: app_mod.App, opts: Opts) !void {
                         if (index < rows.len) {
                             cursor_id = copyId(&cursor_buf, rows[index].key);
                             if (rows[index].attachable()) {
-                                try attachTo(app, &screen, terminal, rows[index].session_id.?, opts);
+                                try attachTo(app, &screen, terminal, rows[index].session_id.?);
                             }
                         }
                     },
@@ -319,22 +315,13 @@ fn attachTo(
     screen: *term.Screen,
     terminal: term.Terminal,
     id: []const u8,
-    opts: Opts,
 ) !void {
     screen.eraseFrame();
     screen.out.writeAll(term.csi ++ "?25h") catch {};
     screen.out.flush() catch {};
     terminal.restore();
 
-    // The peers come from the daemon so the reserved row can show the other
-    // sessions' statuses — which is what makes the row worth a line of screen
-    // rather than only holding a keybinding.
-    const peers = watch_client.snapshot(app) catch null;
-    _ = watch_attach.run(app, .{
-        .session_id = id,
-        .status_bar = opts.status_bar,
-        .peers = peers orelse &.{},
-    }) catch {};
+    _ = watch_attach.run(app, .{ .session_id = id }) catch {};
 
     _ = try term.Terminal.enterRaw();
     screen.out.writeAll(term.csi ++ "?25l") catch {};

@@ -129,16 +129,21 @@ prompt or a question. `◐ active` is a turn in flight, `○ idle` is finished.
 Those come from Claude Code's own hooks rather than from reading its screen, so
 a new Claude Code release cannot quietly make them wrong.
 
-Enter attaches. While attached the bottom row belongs to lcc and says how to
-leave:
+Enter attaches, and from there the terminal is entirely Claude Code's — lcc
+writes nothing of its own over it. **`^\` returns to the dashboard** without
+touching the session. `^C` still reaches the agent, which is the point of not
+using it to detach. `q` quits lcc entirely and the sessions keep running.
 
-```
- *● PE-256  ◐ PE-270                          ^\ dashboard · ^C→agent
-```
-
-`^\` returns to the dashboard without touching the session. `^C` still reaches
-the agent, which is the point of not using it to detach. `q` quits lcc entirely
-and the sessions keep running.
+That one keybinding is the thing worth remembering, because nothing on screen
+repeats it. There was a status bar on the bottom row that did — the child was
+told the terminal was a row shorter and a scroll region kept it out of the last
+line — and against Claude Code it lost. It repaints many times a second using
+cursor moves relative to wherever the cursor already is, so every paint has to
+borrow the cursor and hand it back exactly; it also resets the scroll region and
+uses the terminal's single saved-cursor slot itself. Three different repaint
+schedules each still disturbed its rendering. Doing it properly means emulating
+a terminal, which is more than one line of text is worth, so the row went back
+to the agent.
 
 **Two things worth knowing.** Sessions do not survive the *daemon* dying —
 closing the pty revokes it and the agent gets a hangup, the same property tmux
@@ -621,7 +626,7 @@ change is written as it is made.
 ```
 ❯ Sessions outlive the terminal  on
   Start in plan mode             on
-  Status bar while attached      on
+  Resume last session on open    on
   PR and Linear columns          cached
   Worktree path                  {repoRoot}/.lcc/worktrees/{branchLeaf}
 ```
@@ -657,7 +662,6 @@ months after anyone typed it.
 | `linkPatterns` | `[".env", ".env.*", "CLAUDE.md", "CLAUDE.local.md", ".claude/settings.local.json"]` | Which files to symlink into each worktree |
 | `linkExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
 | `watchByDefault` | `true` | Hand new sessions to the daemon so they outlive the terminal |
-| `statusBar` | `true` | Reserve the bottom row of an attached session for lcc |
 | `planMode` | `true` | Open new sessions in plan mode. `--plan <file>` turns it off regardless |
 | `resumeSessions` | `true` | `lcc open` resumes the worktree's last session |
 | `showTokens` | `true` | The TOKENS column in `lcc list`. Off skips reading transcripts, which is that column's whole cost |

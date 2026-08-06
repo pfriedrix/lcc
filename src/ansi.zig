@@ -3,9 +3,10 @@
 //!
 //! Explicitly **not** a terminal emulator, and the temptation to grow one is
 //! the failure mode here. It once also watched the child's output to decide
-//! when to reassert the scroll region and when the cursor slot was free; both
-//! went away when the status bar stopped repainting on a schedule, and what is
-//! left answers one question — is this sequence configuration or drawing?
+//! when to reassert a scroll region and when the terminal's saved-cursor slot
+//! was free — both for a status bar that no longer exists, because doing that
+//! well *is* emulating a terminal. What is left answers one question: is this
+//! sequence configuration or drawing?
 //!
 //! It has to be an object rather than a function because a sequence can be
 //! split across two reads, at whatever boundary the ring happened to wrap on.
@@ -100,8 +101,10 @@ fn configures(body: []const u8) bool {
         'u' => private,
         // `CSI > 4 ; 2 m` is modifyOtherKeys; a bare `CSI 31 m` is colour.
         'm' => private,
-        // DECSTBM. The child's scroll region is not content, and replaying it
-        // would fight the row reserved for the status bar.
+        // DECSTBM. A scroll region is state, not drawing, and scrollback holds
+        // every one the child ever set — so replaying them lands on whichever
+        // was last in the ring rather than the one actually in force, which
+        // would wedge the live screen into a stale subregion.
         'r' => true,
         else => false,
     };
