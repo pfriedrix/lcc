@@ -14,6 +14,7 @@ const repos = @import("../repos.zig");
 const ui = @import("../ui.zig");
 const usage = @import("../usage.zig");
 const watch_client = @import("../watch_client.zig");
+const watch_cmd = @import("watch.zig");
 
 const priority_label = [_][]const u8{ "   ", "U  ", "H  ", "M  ", "L  " };
 
@@ -35,7 +36,10 @@ pub const Opts = struct {
     /// Hand the session to the daemon instead of taking over this terminal, so
     /// it survives the terminal closing. Everything above the launch is
     /// unchanged — this only replaces the last step.
-    watch: bool = false,
+    ///
+    /// Tri-state: null defers to `watchByDefault`, which is on. `--watch` and
+    /// `--no-watch` are the per-invocation overrides in either direction.
+    watch: ?bool = null,
     /// With `--watch`, print the session id and return instead of showing the
     /// dashboard. What a slash command or a script uses.
     no_attach: bool = false,
@@ -188,19 +192,32 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     // The only branch `--watch` adds. Everything above — the token, the issue,
     // the repository, the worktree, the links, the argv — is shared, so the two
     // launch paths cannot come to different conclusions about what to run.
-    if (opts.watch) {
-        const started = watch_client.startSession(app, .{
+    if (opts.watch orelse cfg.watchByDefault) {
+        if (watch_client.startSession(app, .{
             .worktree = wt.path,
             .branch = wt.branch,
             .issue = selected.identifier,
             .repo_root = repo.root,
             .program = try claude.resolvePath(app.gpa, app.io),
             .argv = args,
-        }) catch |err| bail(app, opts.json, "watch_failed", "Could not hand the session to the daemon: {s}", .{@errorName(err)});
-
-        app.ui.success("Session {s} running in the background.", .{started.id});
-        app.ui.hint("It survives this terminal closing — `lcc watch` shows it.", .{});
-        return;
+        })) |started| {
+            if (opts.no_attach) {
+                app.ui.success("Session {s} running in the background.", .{started.id});
+                app.ui.hint("It survives this terminal closing — `lcc watch` shows it.", .{});
+                return;
+            }
+            app.ui.flush();
+            return watch_cmd.run(app, .{});
+        } else |err| {
+            // Falls through to the foreground launch rather than failing.
+            //
+            // This is the path *every* start takes now, so a daemon that cannot
+            // be reached must not be able to take `lcc start` down with it. Said
+            // out loud, though: a silent fallback would hide a broken daemon
+            // until someone noticed their sessions had stopped surviving.
+            app.ui.warn("Could not reach the lcc daemon ({s}) — starting in this terminal instead.", .{@errorName(err)});
+            app.ui.hint("The session will not survive this terminal closing. `lcc daemon --status` says more.", .{});
+        }
     }
 
     const code = try claude.launch(app.gpa, app.io, wt.path, args);

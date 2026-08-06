@@ -4,6 +4,7 @@ const Io = std.Io;
 const app_mod = @import("app.zig");
 const auth_cmd = @import("commands/auth.zig");
 const clean_cmd = @import("commands/clean.zig");
+const config_cmd = @import("commands/config.zig");
 const daemon_cmd = @import("commands/daemon.zig");
 const issue_cmd = @import("commands/issue.zig");
 const list_cmd = @import("commands/list.zig");
@@ -35,10 +36,12 @@ const usage =
     \\    --plan <file>          start from a plan that already exists instead of
     \\                           opening in plan mode — reaches the agent as {plan}
     \\                           in startTaskCommand, as a path, not inlined
-    \\    --watch                hand the session to the lcc daemon instead of taking
-    \\                           over this terminal — it then survives the terminal
-    \\                           closing, and `lcc watch` shows it
-    \\    --no-attach            with --watch, print the session id and exit
+    \\    --no-watch             run in this terminal instead of handing the session
+    \\                           to the lcc daemon — it then dies with the terminal.
+    \\                           The default is to watch; `lcc config watchByDefault
+    \\                           false` makes --no-watch the default instead
+    \\    --watch                hand it to the daemon even when that is off
+    \\    --no-attach            print the session id instead of opening the dashboard
     \\  watch                    What the daemon is running — live when on a terminal
     \\    --json                 one-shot snapshot instead of the dashboard
     \\    --no-status-bar        give an attached session the whole terminal
@@ -67,6 +70,9 @@ const usage =
     \\  auth setup --client-id <id>
     \\                           Configure OAuth client_id (one-time)
     \\  setup                    Interactively configure lcc
+    \\  config [<setting>] [<value>]
+    \\                           Read or write one setting — no prompt, unlike setup
+    \\    --json                 print the result instead of a human summary
     \\  list | ls                Dashboard of the worktrees in the current repo
     \\    --local                skip the PR and Linear columns (no network)
     \\    --no-tokens            skip the TOKENS column (skips reading transcripts)
@@ -146,6 +152,7 @@ fn dispatch(app: app_mod.App, args: []const []const u8) !void {
     }
     if (eq(first, "auth")) return authCommand(app, args[1..]);
     if (eq(first, "setup")) return setup_cmd.run(app);
+    if (eq(first, "config")) return configCommand(app, args[1..]);
     if (eq(first, "list") or eq(first, "ls")) return listCommand(app, args[1..]);
     if (eq(first, "open") or eq(first, "o")) return openCommand(app, args[1..]);
     if (eq(first, "remove") or eq(first, "rm")) return removeCommand(app, args[1..]);
@@ -183,6 +190,8 @@ fn startCommand(app: app_mod.App, args: []const []const u8) !void {
             opts.plan = args[i];
         } else if (eq(arg, "--watch")) {
             opts.watch = true;
+        } else if (eq(arg, "--no-watch")) {
+            opts.watch = false;
         } else if (eq(arg, "--no-attach")) {
             opts.no_attach = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
@@ -415,6 +424,27 @@ fn cleanCommand(app: app_mod.App, args: []const []const u8) !void {
     return clean_cmd.run(app, opts);
 }
 
+fn configCommand(app: app_mod.App, args: []const []const u8) !void {
+    var opts: config_cmd.Opts = .{};
+    for (args) |arg| {
+        if (eq(arg, "--json")) {
+            opts.json = true;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return error.UnknownOption;
+        } else if (opts.key == null) {
+            opts.key = arg;
+        } else if (opts.value == null) {
+            // Everything after the setting is its value, whitespace and all —
+            // `startTaskCommand` is a sentence, not a token.
+            opts.value = arg;
+        } else return error.TooManyArguments;
+    }
+
+    var machine = app;
+    machine.ui.divert = opts.json;
+    return config_cmd.run(machine, opts);
+}
+
 fn watchCommand(app: app_mod.App, args: []const []const u8) !void {
     var opts: watch_cmd.Opts = .{};
     for (args) |arg| {
@@ -518,6 +548,7 @@ test {
     _ = @import("watch_table.zig");
     _ = @import("wire.zig");
     _ = @import("xcode.zig");
+    _ = @import("commands/config.zig");
     _ = @import("commands/daemon.zig");
     _ = @import("commands/issue.zig");
     _ = @import("commands/list.zig");

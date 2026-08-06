@@ -35,6 +35,10 @@ const default_link_patterns = [_][]const u8{
 };
 const default_link_exclude = [_][]const u8{ ".env.example", ".env.sample", ".env.template" };
 const default_active_states = [_][]const u8{ "Todo", "In Progress" };
+/// On by default. A session that outlives the terminal that started it is the
+/// behaviour worth having without asking for it; `--no-watch` and this key are
+/// the two ways back to a plain foreground launch.
+pub const default_watch_by_default = true;
 
 /// What the file may contain. Every field optional: absence means "use the default".
 pub const Stored = struct {
@@ -52,6 +56,10 @@ pub const Stored = struct {
     /// Absent carries all of them. A server the work never calls still costs every
     /// agent in the session its name and its instructions, on every turn.
     mcpCarry: ?[]const []const u8 = null,
+    /// Whether `lcc start` hands the session to the daemon rather than taking
+    /// over the terminal. On unless turned off — a session that survives its
+    /// terminal is what you want by default, and `--no-watch` covers the one-off.
+    watchByDefault: ?bool = null,
 };
 
 /// How a settings update changes the physical `mcpCarry` key. `all` removes the
@@ -70,6 +78,7 @@ pub const Patch = struct {
     activeStates: ?[]const []const u8 = null,
     startTaskCommand: ?[]const u8 = null,
     mcpCarry: ?McpCarry = null,
+    watchByDefault: ?bool = null,
 };
 
 pub const Config = struct {
@@ -80,6 +89,7 @@ pub const Config = struct {
     activeStates: []const []const u8,
     startTaskCommand: []const u8,
     mcpCarry: ?[]const []const u8,
+    watchByDefault: bool,
 };
 
 pub fn dir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
@@ -134,6 +144,7 @@ pub fn load(
         .activeStates = stored.activeStates orelse &default_active_states,
         .startTaskCommand = stored.startTaskCommand orelse "",
         .mcpCarry = stored.mcpCarry,
+        .watchByDefault = stored.watchByDefault orelse default_watch_by_default,
     };
 }
 
@@ -159,6 +170,7 @@ pub fn save(
     }
     if (patch.activeStates) |v| merged.activeStates = v;
     if (patch.startTaskCommand) |v| merged.startTaskCommand = v;
+    if (patch.watchByDefault) |v| merged.watchByDefault = v;
     if (patch.mcpCarry) |carry| switch (carry) {
         .all => merged.mcpCarry = null,
         .only => |v| merged.mcpCarry = v,
