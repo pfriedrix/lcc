@@ -72,9 +72,9 @@ lcc issue state PE-256 "In Progress"    # move it, by the name on the board
 lcc issue comment PE-256 -m "done"      # add a comment
 lcc issue comment PE-256 -f plan.md     # …or read the body off disk
 lcc issue project PE-256 --assign v2.6.0   # put it in a release project
-lcc setup            # configure worktree behavior, interactively
-lcc config           # the same settings, one at a time and without a prompt
-lcc config watchByDefault false
+lcc config           # every setting, in a list you move through and toggle
+lcc setup            # the same thing, under the name muscle memory reaches for
+lcc config watchByDefault false   # or name one directly, with no prompt
 lcc list             # dashboard of every worktree (--local to skip the network columns)
 lcc stats            # what each worktree has spent in Claude Code
 lcc open             # pick a worktree and open Claude Code in it
@@ -600,9 +600,20 @@ Session transcripts are what `claude --resume` replays — check before deleting
 
 ## Configuration
 
-`~/.config/lcc/config.json`, written by `lcc setup` (interactive) or `lcc config`
-(one setting at a time, no prompt — which is what a script or a slash command
-can use, since `setup` needs a terminal):
+`~/.config/lcc/config.json`. `lcc config` opens it as a list — arrows to move,
+Enter to toggle a switch, cycle a choice, or edit a value, `q` to leave. Every
+change is written as it is made.
+
+```
+❯ Sessions outlive the terminal  on
+  Start in plan mode             on
+  Status bar while attached      on
+  PR and Linear columns          cached
+  Worktree path                  {repoRoot}/.lcc/worktrees/{branchLeaf}
+```
+
+Naming one setting skips the list entirely and never touches raw mode, which is
+the form a script, a slash command or a tool call can use:
 
 ```bash
 lcc config                       # every setting, its value and what it does

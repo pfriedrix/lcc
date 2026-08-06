@@ -1,15 +1,22 @@
-//! `lcc config` — read and write `~/.config/lcc/config.json` without a prompt.
+//! `lcc config` — every setting, browsable, and each one addressable by name.
 //!
-//! `lcc setup` already configures lcc, but it is interactive: it puts the
-//! terminal in raw mode and fails outright with `NotATerminal` when there is no
-//! tty. That makes it unreachable from a script, from a slash command, and from
-//! a tool call — which is exactly where "turn watch off for this machine"
-//! wants to be said. This is the same settings, named and one at a time.
+//! Two shapes for the same table. Bare, it opens a list you move through and
+//! change in place; that is the one to reach for when you do not remember what
+//! a setting is called, which is most of the time. Named — `lcc config <key>
+//! [<value>]` — it reads or writes exactly one and never touches raw mode,
+//! which is the only form a script, a slash command or a tool call can use.
+//!
+//! Both drive the same `keys` table, so a setting cannot exist in one and be
+//! missing from the other. That was the problem with `lcc setup`: a hand-written
+//! walk through five settings in a fixed order, which every later setting was
+//! simply absent from.
 
 const std = @import("std");
 const Io = std.Io;
 const app_mod = @import("../app.zig");
 const config = @import("../config.zig");
+const prompt = @import("../prompt.zig");
+const term = @import("../term.zig");
 const ui = @import("../ui.zig");
 
 pub const Opts = struct {
@@ -24,11 +31,14 @@ pub const Error = error{ UnknownKey, BadValue } || std.mem.Allocator.Error;
 const Kind = enum { text, boolean, list, choice };
 
 const Key = struct {
+    /// What you type: the key as it appears in the JSON file.
     name: []const u8,
     kind: Kind,
-    /// Shown by a bare `lcc config`, so the list is self-explaining rather than
-    /// a set of names you have to look up elsewhere.
-    doc: []const u8,
+    /// What you read. Short enough to sit beside its value in a list and say
+    /// what the setting *does*, so nothing needs a line of explanation under
+    /// it — a settings list that has to describe itself is one whose names are
+    /// wrong.
+    label: []const u8,
     /// For `.choice`, so a wrong value can be answered with the right ones
     /// instead of just "no".
     choices: []const []const u8 = &.{},
@@ -45,27 +55,22 @@ const Key = struct {
 /// months after anyone typed it. `--json` is absent for a duller reason: it is
 /// a property of one invocation, never a preference.
 pub const keys = [_]Key{
-    .{ .name = "watchByDefault", .kind = .boolean, .doc = "hand new sessions to the daemon instead of this terminal" },
-    .{ .name = "statusBar", .kind = .boolean, .doc = "reserve the bottom row of an attached session for lcc" },
-    .{ .name = "planMode", .kind = .boolean, .doc = "open new sessions in plan mode (--plan overrides regardless)" },
-    .{ .name = "resumeSessions", .kind = .boolean, .doc = "`lcc open` resumes the last session rather than starting fresh" },
-    .{ .name = "showTokens", .kind = .boolean, .doc = "the TOKENS column in `lcc list` — off skips reading transcripts" },
-    .{
-        .name = "listNetwork",
-        .kind = .choice,
-        .doc = "the PR and Linear columns in `lcc list`",
-        .choices = &.{ "refresh", "cached", "local" },
-    },
-    .{ .name = "allIssues", .kind = .boolean, .doc = "offer every assigned issue, not just activeStates" },
-    .{ .name = "keepBranch", .kind = .boolean, .doc = "`lcc remove` leaves the git branch in place" },
-    .{ .name = "keepDerivedData", .kind = .boolean, .doc = "`lcc remove` leaves Xcode build data in place" },
-    .{ .name = "keepXcode", .kind = .boolean, .doc = "`lcc remove` does not ask Xcode to close the worktree" },
-    .{ .name = "worktreeTemplate", .kind = .text, .doc = "where worktrees are created" },
-    .{ .name = "startTaskCommand", .kind = .text, .doc = "the prompt a new session opens with" },
-    .{ .name = "activeStates", .kind = .list, .doc = "Linear states the picker offers" },
-    .{ .name = "linkPatterns", .kind = .list, .doc = "files symlinked into every worktree" },
-    .{ .name = "linkExclude", .kind = .list, .doc = "what linkPatterns must not match" },
-    .{ .name = "mcpCarry", .kind = .list, .doc = "local MCP servers worth carrying (empty carries all)" },
+    .{ .name = "watchByDefault", .kind = .boolean, .label = "Sessions outlive the terminal" },
+    .{ .name = "planMode", .kind = .boolean, .label = "Start in plan mode" },
+    .{ .name = "statusBar", .kind = .boolean, .label = "Status bar while attached" },
+    .{ .name = "resumeSessions", .kind = .boolean, .label = "Resume last session on open" },
+    .{ .name = "allIssues", .kind = .boolean, .label = "Offer every assigned issue" },
+    .{ .name = "showTokens", .kind = .boolean, .label = "Token column in list" },
+    .{ .name = "listNetwork", .kind = .choice, .label = "PR and Linear columns", .choices = &.{ "refresh", "cached", "local" } },
+    .{ .name = "keepBranch", .kind = .boolean, .label = "Removing keeps the branch" },
+    .{ .name = "keepDerivedData", .kind = .boolean, .label = "Removing keeps build data" },
+    .{ .name = "keepXcode", .kind = .boolean, .label = "Removing leaves Xcode alone" },
+    .{ .name = "worktreeTemplate", .kind = .text, .label = "Worktree path" },
+    .{ .name = "startTaskCommand", .kind = .text, .label = "Opening prompt" },
+    .{ .name = "activeStates", .kind = .list, .label = "Linear states offered" },
+    .{ .name = "linkPatterns", .kind = .list, .label = "Files linked into a worktree" },
+    .{ .name = "linkExclude", .kind = .list, .label = "Files never linked" },
+    .{ .name = "mcpCarry", .kind = .list, .label = "MCP servers carried" },
 };
 
 fn find(name: []const u8) ?Key {
@@ -76,7 +81,13 @@ fn find(name: []const u8) ?Key {
 }
 
 pub fn run(app: app_mod.App, opts: Opts) !void {
-    const key_name = opts.key orelse return list(app, opts);
+    const key_name = opts.key orelse {
+        // A terminal gets the browser; anything else gets the plain listing,
+        // because a picker reached from a tool call fails with NotATerminal
+        // after doing nothing useful.
+        if (!opts.json and (Io.File.stdout().isTty(app.io) catch false)) return browse(app);
+        return list(app, opts);
+    };
 
     const key = find(key_name) orelse {
         app.ui.fail("Unknown setting '{s}'. `lcc config` lists them.", .{key_name});
@@ -118,15 +129,6 @@ fn list(app: app_mod.App, opts: Opts) !void {
     for (keys) |key| width = @max(width, key.name.len);
     for (keys) |key| {
         app.ui.info("{f}  {s}", .{ ui.pad(key.name, width), try render(app, cfg, key) });
-        if (key.kind == .choice) {
-            app.ui.hint("{f}  {s} — one of: {s}", .{
-                ui.pad("", width),
-                key.doc,
-                try std.mem.join(app.gpa, ", ", key.choices),
-            });
-        } else {
-            app.ui.hint("{f}  {s}", .{ ui.pad("", width), key.doc });
-        }
     }
     app.ui.info("", .{});
     app.ui.hint("Change one with: lcc config <setting> <value>", .{});
@@ -157,15 +159,7 @@ fn set(app: app_mod.App, opts: Opts, key: Key, raw: []const u8) !void {
                 app.ui.fail("'{s}' is not true or false.", .{raw});
                 std.process.exit(1);
             };
-            if (std.mem.eql(u8, key.name, "watchByDefault")) patch.watchByDefault = on;
-            if (std.mem.eql(u8, key.name, "statusBar")) patch.statusBar = on;
-            if (std.mem.eql(u8, key.name, "planMode")) patch.planMode = on;
-            if (std.mem.eql(u8, key.name, "resumeSessions")) patch.resumeSessions = on;
-            if (std.mem.eql(u8, key.name, "showTokens")) patch.showTokens = on;
-            if (std.mem.eql(u8, key.name, "allIssues")) patch.allIssues = on;
-            if (std.mem.eql(u8, key.name, "keepBranch")) patch.keepBranch = on;
-            if (std.mem.eql(u8, key.name, "keepDerivedData")) patch.keepDerivedData = on;
-            if (std.mem.eql(u8, key.name, "keepXcode")) patch.keepXcode = on;
+            applyBool(&patch, key.name, on);
         },
         .choice => {
             const chosen = config.ListNetwork.parse(raw) orelse {
@@ -174,21 +168,8 @@ fn set(app: app_mod.App, opts: Opts, key: Key, raw: []const u8) !void {
             };
             if (std.mem.eql(u8, key.name, "listNetwork")) patch.listNetwork = chosen;
         },
-        .text => {
-            if (std.mem.eql(u8, key.name, "worktreeTemplate")) patch.worktreeTemplate = raw;
-            if (std.mem.eql(u8, key.name, "startTaskCommand")) patch.startTaskCommand = raw;
-        },
-        .list => {
-            const items = try splitList(app.gpa, raw);
-            if (std.mem.eql(u8, key.name, "activeStates")) patch.activeStates = items;
-            if (std.mem.eql(u8, key.name, "linkPatterns")) patch.linkPatterns = items;
-            if (std.mem.eql(u8, key.name, "linkExclude")) patch.linkExclude = items;
-            // Empty means "carry all", which is the absence of the key rather
-            // than an empty array — the distinction `McpCarry` exists to keep.
-            if (std.mem.eql(u8, key.name, "mcpCarry")) {
-                patch.mcpCarry = if (items.len == 0) .all else .{ .only = items };
-            }
-        },
+        .text => applyText(&patch, key.name, raw),
+        .list => applyList(&patch, key.name, try splitList(app.gpa, raw)),
     }
 
     try config.save(app.gpa, app.io, app.environ, patch);
@@ -205,6 +186,200 @@ fn set(app: app_mod.App, opts: Opts, key: Key, raw: []const u8) !void {
         return;
     }
     app.ui.success("{s} = {s}", .{ key.name, text });
+}
+
+/// The interactive form: the whole table, moved through and changed in place.
+///
+/// Every change is written as it is made rather than collected behind a save
+/// step. The file is six lines of JSON and the alternative is a modal state
+/// where what is on screen and what is on disk disagree.
+fn browse(app: app_mod.App) !void {
+    var terminal = try term.Terminal.enterRaw();
+    defer terminal.restore();
+
+    var out_buffer: [32 * 1024]u8 = undefined;
+    var out_writer: Io.File.Writer = .init(.stdout(), app.io, &out_buffer);
+    var screen: term.Screen = .{ .out = &out_writer.interface };
+    const out = screen.out;
+
+    out.writeAll(term.csi ++ "?25l") catch {};
+    defer {
+        screen.eraseFrame();
+        out.writeAll(term.csi ++ "?25h") catch {};
+        out.flush() catch {};
+    }
+
+    const p = ui.palette();
+    var cursor: usize = 0;
+    var key_buf: [8]u8 = undefined;
+    var last_cols: u16 = 0;
+
+    var width: usize = 0;
+    for (keys) |key| width = @max(width, ui.displayWidth(key.label));
+
+    while (true) {
+        const dims = terminal.size();
+        if (dims.cols != last_cols) {
+            screen.reset();
+            last_cols = dims.cols;
+        }
+        const cfg = try config.load(app.gpa, app.io, app.environ);
+
+        screen.eraseFrame();
+        var lines: usize = 0;
+
+        out.print("{s}lcc{s}\n\n", .{ p.bold, p.reset }) catch {};
+        lines += 2;
+
+        for (keys, 0..) |key, i| {
+            const selected = i == cursor;
+            out.print("{s}{s}{f}{s}  {s}{s}{s}\n", .{
+                if (selected) p.cyan else "",
+                if (selected) "❯ " else "  ",
+                ui.pad(key.label, width),
+                p.reset,
+                if (selected) p.bold else p.dim,
+                term.truncate(try display(app, cfg, key), dims.cols -| (width + 6)),
+                p.reset,
+            }) catch {};
+            lines += 1;
+        }
+
+        // Navigation, not explanation. The settings say what they do; this says
+        // what the keys do, and nothing else earns a line here.
+        out.print("\n  {s}↑↓ · enter · q{s}\n", .{ p.dim, p.reset }) catch {};
+        lines += 2;
+
+        screen.lines = lines;
+        out.flush() catch {};
+
+        switch (term.readKey(terminal, &key_buf)) {
+            .cancel => return,
+            .up => cursor = if (cursor == 0) keys.len - 1 else cursor - 1,
+            .down => cursor = if (cursor + 1 >= keys.len) 0 else cursor + 1,
+            .space, .enter => try change(app, &screen, &terminal, keys[cursor], cfg),
+            .text => |t| {
+                if (t.len == 1) switch (t[0]) {
+                    'q' => return,
+                    'j' => cursor = if (cursor + 1 >= keys.len) 0 else cursor + 1,
+                    'k' => cursor = if (cursor == 0) keys.len - 1 else cursor - 1,
+                    else => {},
+                };
+            },
+            else => {},
+        }
+    }
+}
+
+/// The value as a switch reads it. `on`/`off` rather than `true`/`false`,
+/// because this is a list of toggles; the named form keeps the literal the file
+/// holds, since that is what you would type back at it.
+fn display(app: app_mod.App, cfg: config.Config, key: Key) ![]const u8 {
+    const raw = try render(app, cfg, key);
+    if (key.kind != .boolean) return raw;
+    return if (std.mem.eql(u8, raw, "true")) "on" else "off";
+}
+
+/// Apply one change to the highlighted setting.
+///
+/// A boolean toggles and a choice cycles, both in place — an editor for two or
+/// three values would be more machinery than the values are worth. Text and
+/// lists need a real line editor, which means handing the terminal to
+/// `prompt.input` and taking it back afterwards.
+fn change(
+    app: app_mod.App,
+    screen: *term.Screen,
+    terminal: *term.Terminal,
+    key: Key,
+    cfg: config.Config,
+) !void {
+    var patch: config.Patch = .{};
+    switch (key.kind) {
+        .boolean => {
+            const now = std.mem.eql(u8, try render(app, cfg, key), "true");
+            applyBool(&patch, key.name, !now);
+        },
+        .choice => {
+            const current = @tagName(cfg.listNetwork);
+            var at: usize = 0;
+            for (key.choices, 0..) |choice, i| {
+                if (std.mem.eql(u8, choice, current)) at = i;
+            }
+            const next = key.choices[(at + 1) % key.choices.len];
+            if (std.mem.eql(u8, key.name, "listNetwork")) {
+                patch.listNetwork = config.ListNetwork.parse(next).?;
+            }
+        },
+        .text, .list => {
+            // `prompt.input` owns the terminal for its lifetime, so this one is
+            // given back and taken again around it — the same handover
+            // `lcc watch` performs around an attached session.
+            screen.eraseFrame();
+            screen.out.writeAll(term.csi ++ "?25h") catch {};
+            screen.out.flush() catch {};
+            terminal.restore();
+
+            const current = try render(app, cfg, key);
+            const shown = if (std.mem.eql(u8, current, "(none)") or std.mem.eql(u8, current, "(all)"))
+                ""
+            else
+                current;
+            const typed = try prompt.input(app.gpa, app.io, key.name, shown);
+
+            terminal.* = try term.Terminal.enterRaw();
+            screen.out.writeAll(term.csi ++ "?25l") catch {};
+            screen.reset();
+
+            const raw = typed orelse return;
+            if (key.kind == .text) {
+                applyText(&patch, key.name, raw);
+            } else {
+                applyList(&patch, key.name, try splitList(app.gpa, raw));
+            }
+        },
+    }
+    config.save(app.gpa, app.io, app.environ, patch) catch {};
+}
+
+fn applyBool(patch: *config.Patch, name: []const u8, on: bool) void {
+    if (std.mem.eql(u8, name, "watchByDefault")) patch.watchByDefault = on;
+    if (std.mem.eql(u8, name, "statusBar")) patch.statusBar = on;
+    if (std.mem.eql(u8, name, "planMode")) patch.planMode = on;
+    if (std.mem.eql(u8, name, "resumeSessions")) patch.resumeSessions = on;
+    if (std.mem.eql(u8, name, "showTokens")) patch.showTokens = on;
+    if (std.mem.eql(u8, name, "allIssues")) patch.allIssues = on;
+    if (std.mem.eql(u8, name, "keepBranch")) patch.keepBranch = on;
+    if (std.mem.eql(u8, name, "keepDerivedData")) patch.keepDerivedData = on;
+    if (std.mem.eql(u8, name, "keepXcode")) patch.keepXcode = on;
+}
+
+fn applyText(patch: *config.Patch, name: []const u8, raw: []const u8) void {
+    if (std.mem.eql(u8, name, "worktreeTemplate")) patch.worktreeTemplate = raw;
+    if (std.mem.eql(u8, name, "startTaskCommand")) patch.startTaskCommand = raw;
+}
+
+fn applyList(patch: *config.Patch, name: []const u8, items: []const []const u8) void {
+    if (std.mem.eql(u8, name, "activeStates")) patch.activeStates = items;
+    if (std.mem.eql(u8, name, "linkPatterns")) patch.linkPatterns = items;
+    if (std.mem.eql(u8, name, "linkExclude")) patch.linkExclude = items;
+    if (std.mem.eql(u8, name, "mcpCarry")) patch.mcpCarry = mcpCarryFrom(items);
+}
+
+/// `mcpCarry` has three states, not two, and the words for them predate this
+/// command: "all" carries every local server, "none" carries none, a list
+/// carries those. Empty means "all" because the key's absence is what carries
+/// everything — the distinction `config.McpCarry` exists to keep.
+///
+/// Taken literally, a typed "none" would otherwise become a list holding one
+/// server called `none`, and the session would silently get no MCP servers for
+/// a reason nobody could see.
+pub fn mcpCarryFrom(items: []const []const u8) config.McpCarry {
+    if (items.len == 0) return .all;
+    if (items.len == 1) {
+        if (std.ascii.eqlIgnoreCase(items[0], "all")) return .all;
+        if (std.ascii.eqlIgnoreCase(items[0], "none")) return .{ .only = &.{} };
+    }
+    return .{ .only = items };
 }
 
 fn render(app: app_mod.App, cfg: config.Config, key: Key) ![]const u8 {
@@ -269,11 +444,13 @@ pub fn splitList(gpa: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
 
 const testing = std.testing;
 
-test "every key is unique and documented" {
-    // A bare `lcc config` is the only place these names are discoverable, so an
-    // undocumented one is a setting nobody will find.
+test "every key is unique and carries a label short enough to sit in a list" {
     for (keys, 0..) |key, i| {
-        try testing.expect(key.doc.len > 0);
+        try testing.expect(key.label.len > 0);
+        // Short enough to sit beside its value rather than wrap. There is no
+        // second line and no description under it to fall back on — the name
+        // is the whole explanation.
+        try testing.expect(ui.displayWidth(key.label) <= 32);
         for (keys[i + 1 ..]) |other| {
             try testing.expect(!std.mem.eql(u8, key.name, other.name));
         }
@@ -296,6 +473,23 @@ test "the destructive flags are deliberately not settings" {
     try testing.expect(find("yes") == null);
     try testing.expect(find("force") == null);
     try testing.expect(find("json") == null);
+}
+
+test "mcpCarry keeps the three states its words describe" {
+    const gpa = testing.allocator;
+    try testing.expect(mcpCarryFrom(&.{}) == .all);
+    try testing.expect(mcpCarryFrom(&.{"all"}) == .all);
+    try testing.expect(mcpCarryFrom(&.{"ALL"}) == .all);
+    // "none" is empty, not a server called none — which is what a literal
+    // reading would produce, and it would fail silently.
+    try testing.expectEqual(@as(usize, 0), mcpCarryFrom(&.{"none"}).only.len);
+
+    const named = mcpCarryFrom(&.{ "linear-server", "xcode" });
+    try testing.expectEqual(@as(usize, 2), named.only.len);
+    try testing.expectEqualStrings("linear-server", named.only[0]);
+    // A server genuinely called "all" alongside others is still a list.
+    try testing.expectEqual(@as(usize, 2), mcpCarryFrom(&.{ "all", "xcode" }).only.len);
+    _ = gpa;
 }
 
 test "listNetwork parses its three states and nothing else" {
