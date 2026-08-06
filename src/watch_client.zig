@@ -91,7 +91,24 @@ fn writeAll(fd: std.posix.fd_t, bytes: []const u8) !void {
 /// build. `prompt.zig` documents the same shape for `tcgetattr` on a pipe —
 /// ask first, do not make std report it.
 pub fn connectExisting(app: app_mod.App, role: wire.Role) Error!?Conn {
-    const socket_path = try watch_paths.socket(app.gpa, app.environ);
+    return connectAt(app, role, try watch_paths.socket(app.gpa, app.environ));
+}
+
+/// The same, against a socket the caller names rather than one derived from the
+/// environment.
+///
+/// Exists for the hook handler, which is told its socket on the command line.
+/// That path is the daemon's own, resolved when the daemon started, and it is
+/// the only thing a hook can trust: a hook runs with the *session's*
+/// environment, which is the environment of whichever shell started the
+/// session, and an `LCC_WATCH_DIR` in there would point the report at a daemon
+/// that does not exist. Same reasoning as the absolute `exe` beside it in
+/// `watch_hooks.settingsJson`.
+pub fn connectAt(app: app_mod.App, role: wire.Role, socket_path: []const u8) Error!?Conn {
+    // std will not do this, and the path came off a command line rather than
+    // out of `watch_paths.socket` — so this is the last place it can be an
+    // error instead of a write past `sockaddr_un.path`.
+    try watch_paths.checkSocketPath(socket_path);
     const info = Io.Dir.cwd().statFile(app.io, socket_path, .{}) catch return null;
     _ = info;
 
@@ -218,8 +235,22 @@ pub fn snapshot(app: app_mod.App) Error!?[]const sessions_mod.Session {
 /// Never starts a daemon. A hook fires on every turn of every session lcc
 /// launched, and one that could spawn a process would turn a stopped daemon
 /// into a spawn storm.
-pub fn report(app: app_mod.App, cwd: []const u8, session_id: []const u8, event: []const u8) void {
-    var conn = (connectExisting(app, .control) catch return) orelse return;
+///
+/// `socket` is the path the daemon baked into the hook's command line. Null
+/// falls back to the environment, which is what a hand-run `lcc watch-hook`
+/// with no `--socket` gets.
+pub fn report(
+    app: app_mod.App,
+    socket: ?[]const u8,
+    cwd: []const u8,
+    session_id: []const u8,
+    event: []const u8,
+) void {
+    const opened = if (socket) |path|
+        connectAt(app, .control, path)
+    else
+        connectExisting(app, .control);
+    var conn = (opened catch return) orelse return;
     defer conn.close(app.io);
     conn.sendControl(app.gpa, .hook, wire.Hook{
         .cwd = cwd,
