@@ -259,7 +259,8 @@ fn browse(app: app_mod.App) !void {
             .down => cursor = if (cursor + 1 >= keys.len) 0 else cursor + 1,
             .space, .enter => try change(app, &screen, &terminal, keys[cursor], cfg),
             .text => |t| {
-                if (t.len == 1) switch (t[0]) {
+                // By key position, so a Cyrillic layout still navigates.
+                if (term.layoutKey(t)) |key| switch (key) {
                     'q' => return,
                     'j' => cursor = if (cursor + 1 >= keys.len) 0 else cursor + 1,
                     'k' => cursor = if (cursor == 0) keys.len - 1 else cursor - 1,

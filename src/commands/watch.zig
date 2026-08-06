@@ -268,17 +268,20 @@ fn dashboard(app: app_mod.App, opts: Opts) !void {
                 }
             },
             .text => |t| {
-                if (t.len != 1) continue;
+                // The key's position, not the character it printed: on a
+                // Cyrillic layout `n` prints `т`, and reading the character
+                // means every shortcut stops working on a layout switch.
+                const key = term.layoutKey(t) orelse continue;
                 if (confirming_kill) {
                     confirming_kill = false;
-                    if (t[0] == 'y') {
+                    if (key == 'y') {
                         if (findRow(rows, cursor_id)) |row| {
                             if (row.attachable()) kill(app, row.session_id.?);
                         }
                     }
                     continue;
                 }
-                switch (t[0]) {
+                switch (key) {
                     'q' => return,
                     'n' => try newSession(app, &screen, terminal),
                     'j' => cursor_id = copyId(&cursor_buf, step(rows, cursor_id, 1)),
@@ -292,7 +295,7 @@ fn dashboard(app: app_mod.App, opts: Opts) !void {
                     'x' => confirming_kill = if (findRow(rows, cursor_id)) |row| row.attachable() else false,
                     'r' => {},
                     '1'...'9' => {
-                        const index = t[0] - '1';
+                        const index = key - '1';
                         if (index < rows.len) {
                             cursor_id = copyId(&cursor_buf, rows[index].key);
                             if (rows[index].attachable()) {

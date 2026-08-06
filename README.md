@@ -111,6 +111,11 @@ already there, starting one if not. `lcc watch` is an alias.
   ↑↓ move · enter opens · n new issue · x kill · q quit
 ```
 
+Shortcuts are key *positions*, not characters, so they work on any keyboard
+layout — on Ukrainian ЙЦУКЕН the key labelled `n` prints `т` and still means
+new. The same goes for the `y`/`n` confirmation `lcc remove` puts in front of a
+deletion, which a Cyrillic layout previously had no way to answer at all.
+
 `n` picks another issue and starts it without leaving the dashboard — the same
 picker and the same bootstrap as `lcc start`, just without having to quit first.
 Changing your mind puts you back in the list rather than quitting lcc.

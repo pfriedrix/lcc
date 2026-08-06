@@ -79,6 +79,18 @@ const Ranked = struct {
     }
 };
 
+test "a confirmation answers to the key, not to the letter it printed" {
+    // `lcc remove` gates a deletion behind this. On a Ukrainian layout `y` and
+    // `n` print `н` and `т`, so reading the character left no way to answer at
+    // all — not yes, not no.
+    try std.testing.expectEqual(@as(u8, 'y'), term_mod.layoutKey(firstCodepoint("н")).?);
+    try std.testing.expectEqual(@as(u8, 'n'), term_mod.layoutKey(firstCodepoint("т")).?);
+    try std.testing.expectEqual(@as(u8, 'y'), term_mod.layoutKey(firstCodepoint("y")).?);
+    try std.testing.expectEqual(@as(u8, 'n'), term_mod.layoutKey(firstCodepoint("N")).?);
+    // And something that is neither is still neither.
+    try std.testing.expect(term_mod.layoutKey(firstCodepoint("ю")) != 'y');
+}
+
 test "every token must match" {
     const hay = "PE-247 Fix EXC_BAD_ACCESS data race feature/pe-247 Todo";
     try std.testing.expect(score(hay, "fix race") != null);
@@ -323,9 +335,12 @@ pub fn confirm(
             .enter => {
                 if (typed.items.len == 0) {
                     answer = default_yes;
-                } else switch (typed.items[0]) {
-                    'y', 'Y' => answer = true,
-                    'n', 'N' => answer = false,
+                } else switch (term_mod.layoutKey(firstCodepoint(typed.items)) orelse 0) {
+                    // By key position: `y` and `n` print `н` and `т` on a
+                    // Cyrillic layout, which left no way at all to answer the
+                    // confirmation `lcc remove` puts in front of a deletion.
+                    'y' => answer = true,
+                    'n' => answer = false,
                     // Anything else is not an answer: clear and ask again.
                     else => typed.clearRetainingCapacity(),
                 }
@@ -345,6 +360,14 @@ pub fn confirm(
             return value;
         }
     }
+}
+
+/// The first whole codepoint, so a two-byte Cyrillic letter is matched as one
+/// character rather than by its leading byte.
+fn firstCodepoint(text: []const u8) []const u8 {
+    if (text.len == 0) return text;
+    const len = std.unicode.utf8ByteSequenceLength(text[0]) catch 1;
+    return text[0..@min(len, text.len)];
 }
 
 fn firstLine(message: []const u8) []const u8 {
