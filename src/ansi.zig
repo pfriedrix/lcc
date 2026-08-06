@@ -50,6 +50,14 @@ pub const Scanner = struct {
     state: State = .text,
     params: [max_params]u8 = undefined,
     len: usize = 0,
+    /// The child has issued `ESC 7` and not yet its `ESC 8`.
+    ///
+    /// A terminal has exactly one saved-cursor slot. Anything else that saves
+    /// and restores while the child is holding it destroys the position the
+    /// child will later restore to — and the child then puts its cursor
+    /// somewhere it never was. Watching for the pair is the only way to know
+    /// when it is safe to borrow the cursor.
+    cursor_saved: bool = false,
 
     pub fn scan(self: *Scanner, chunk: []const u8) Seen {
         var seen: Seen = .{};
@@ -63,8 +71,10 @@ pub const Scanner = struct {
                         self.state = .csi;
                         self.len = 0;
                     } else {
-                        // Two-byte escapes (`ESC 7`, `ESC 8`) and charset
-                        // selection carry nothing this cares about.
+                        // DECSC and DECRC: the pair whose slot must not be
+                        // borrowed while it is open.
+                        if (byte == '7') self.cursor_saved = true;
+                        if (byte == '8') self.cursor_saved = false;
                         self.state = .text;
                     }
                 },
@@ -253,6 +263,26 @@ test "ordinary output and unrelated sequences change nothing" {
     }) |chunk| {
         try testing.expect(!s.scan(chunk).any());
     }
+}
+
+test "the scanner knows when the child is holding the cursor slot" {
+    var s: Scanner = .{};
+    try testing.expect(!s.cursor_saved);
+
+    // Claude Code opens with exactly this pair.
+    _ = s.scan("\x1b7");
+    try testing.expect(s.cursor_saved);
+    _ = s.scan("\x1b[r");
+    // Still held: a sequence in between does not close it.
+    try testing.expect(s.cursor_saved);
+    _ = s.scan("\x1b8");
+    try testing.expect(!s.cursor_saved);
+
+    // Split across reads, like everything else here.
+    _ = s.scan("text\x1b");
+    try testing.expect(!s.cursor_saved);
+    _ = s.scan("7");
+    try testing.expect(s.cursor_saved);
 }
 
 test "a replay keeps what draws and drops what configures" {

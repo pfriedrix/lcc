@@ -241,7 +241,16 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
             // means the row cannot be lost permanently by a cause nobody
             // anticipated — which, for the line that tells you how to get out,
             // is the property that matters.
-            if (bar_dirty or at != bar_drawn_at) {
+            // Never while the child is holding the terminal's one saved-cursor
+            // slot: borrowing it there destroys the position the child will
+            // restore to, and its cursor then lands somewhere it never was.
+            //
+            // Bounded, because a child that saves and forgets would otherwise
+            // cost the bar entirely — after a few seconds it is more honest to
+            // take the slot and be briefly wrong than to leave the way out
+            // unwritten.
+            const child_holds = scanner.cursor_saved and at - bar_drawn_at < 3;
+            if (!child_holds and (bar_dirty or at != bar_drawn_at)) {
                 // The peers go stale otherwise: they were a snapshot taken when
                 // this attach began, and a bar claiming a session is `waiting`
                 // ten minutes after it stopped is worse than one that says
@@ -255,7 +264,10 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
                 watch_bar.draw(
                     &bar_writer.interface,
                     size.rows,
-                    watch_bar.compose(&bar_buf, peers, opts.session_id, size.cols),
+                    // One column short of the width. Filling the last cell
+                    // leaves the terminal poised to wrap, and what happens
+                    // next is up to the emulator rather than up to us.
+                    watch_bar.compose(&bar_buf, peers, opts.session_id, size.cols -| 1),
                 );
                 bar_dirty = false;
                 bar_drawn_at = at;

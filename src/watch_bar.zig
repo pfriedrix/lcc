@@ -49,9 +49,12 @@ pub fn draw(out: *Io.Writer, rows: u16, text: []const u8) void {
     // line of output that happens to be at the bottom. `CSI K` after the text
     // extends the inverted background to the edge without padding with spaces,
     // which would have to be counted against the width.
+    // `CSI 2K` with reverse video already on paints the whole row, so the
+    // background reaches the edge without the text having to. Nothing is
+    // written after it — a second erase once the cursor sits in the last
+    // column is where the trailing characters were going.
     out.print("\x1b7" ++ term.csi ++ "{d};1H" ++ term.csi ++ "7m" ++ term.csi ++ "2K", .{rows}) catch {};
     out.writeAll(text) catch {};
-    out.writeAll(term.csi ++ "K") catch {};
     out.writeAll(p.reset) catch {};
     out.writeAll("\x1b8") catch {};
     out.flush() catch {};
