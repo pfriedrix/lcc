@@ -57,7 +57,14 @@ const Command = struct {
 };
 
 const Entry = struct {
-    matcher: ?[]const u8 = null,
+    /// Empty string, never null, for "every notification of this event".
+    ///
+    /// Measured, not assumed: a `"matcher": null` parses as valid JSON and is
+    /// accepted without complaint, and then the whole entry is silently
+    /// dropped — Claude Code registers no hook and reports no error. An empty
+    /// string registers. Nothing in lcc's own schema test could catch that,
+    /// because the schema was lcc's.
+    matcher: []const u8 = "",
     hooks: []const Command,
 };
 
@@ -167,23 +174,23 @@ test "the settings name every event and bake the state into each command" {
     const Schema = struct {
         hooks: struct {
             Notification: []struct {
-                matcher: ?[]const u8,
+                matcher: []const u8,
                 hooks: []struct { type: []const u8, command: []const u8, timeout: u32, @"async": bool },
             },
             UserPromptSubmit: []struct {
-                matcher: ?[]const u8,
+                matcher: []const u8,
                 hooks: []struct { type: []const u8, command: []const u8, timeout: u32, @"async": bool },
             },
             PreToolUse: []struct {
-                matcher: ?[]const u8,
+                matcher: []const u8,
                 hooks: []struct { type: []const u8, command: []const u8, timeout: u32, @"async": bool },
             },
             Stop: []struct {
-                matcher: ?[]const u8,
+                matcher: []const u8,
                 hooks: []struct { type: []const u8, command: []const u8, timeout: u32, @"async": bool },
             },
             SessionEnd: []struct {
-                matcher: ?[]const u8,
+                matcher: []const u8,
                 hooks: []struct { type: []const u8, command: []const u8, timeout: u32, @"async": bool },
             },
         },
@@ -193,13 +200,19 @@ test "the settings name every event and bake the state into each command" {
     // One entry per blocking matcher, each carrying `--event waiting`.
     try testing.expectEqual(blocking_matchers.len, parsed.hooks.Notification.len);
     for (parsed.hooks.Notification, blocking_matchers) |entry, matcher| {
-        try testing.expectEqualStrings(matcher, entry.matcher.?);
+        try testing.expectEqualStrings(matcher, entry.matcher);
         try testing.expect(std.mem.endsWith(u8, entry.hooks[0].command, "--event waiting"));
     }
     try testing.expect(std.mem.endsWith(u8, parsed.hooks.Stop[0].hooks[0].command, "--event idle"));
     try testing.expect(std.mem.endsWith(u8, parsed.hooks.UserPromptSubmit[0].hooks[0].command, "--event active"));
     try testing.expect(std.mem.endsWith(u8, parsed.hooks.PreToolUse[0].hooks[0].command, "--event active"));
     try testing.expect(std.mem.endsWith(u8, parsed.hooks.SessionEnd[0].hooks[0].command, "--event ended"));
+
+    // An unmatched entry carries an empty matcher, not null: null is accepted
+    // as JSON and then silently registers nothing. Asserted on the wire rather
+    // than trusted from the struct, since the struct is what got it wrong.
+    try testing.expect(std.mem.indexOf(u8, body, "\"matcher\": null") == null);
+    try testing.expectEqualStrings("", parsed.hooks.Stop[0].matcher);
 
     // Never block a turn, and never wait long. A hook that stalls a session is
     // worse than a status that never arrives.

@@ -1138,6 +1138,39 @@ test "a registered session runs, echoes, and its output survives a reconnect" {
             if (std.mem.indexOf(u8, seen.items, "hello-from-lcc") != null) break;
         }
         try testing.expect(std.mem.indexOf(u8, seen.items, "hello-from-lcc") != null);
+
+        // A hook report, keyed by worktree exactly as `lcc watch-hook` sends
+        // it. This is the last link in the status path and the only one neither
+        // side's unit tests can reach: `watch_status` proves the transition and
+        // `watch_hooks` proves the payload, but nothing else proves the daemon
+        // finds the right session from a cwd and applies it.
+        try conn.send(arena, .hook, wire.Hook{
+            .cwd = base,
+            .session_id = "irrelevant",
+            .event = "waiting",
+        });
+        var waited: i32 = 5_000;
+        while (waited > 0) : (waited -= 100) {
+            try conn.send(arena, .list, .{});
+            const snap = try conn.recv(.snapshot, &b);
+            const view = try wire.parse(wire.Snapshot, arena, snap);
+            if (view.sessions.len == 1 and std.mem.eql(u8, view.sessions[0].status, "waiting")) break;
+            io.sleep(.fromMilliseconds(100), .awake) catch {};
+        }
+        try testing.expect(waited > 0);
+
+        // A cwd the daemon has never heard of is ignored, not an error: the
+        // hook fires for anything launched with these settings, and a stale one
+        // must not be able to make the daemon fail.
+        try conn.send(arena, .hook, wire.Hook{
+            .cwd = "/nowhere-at-all",
+            .session_id = "x",
+            .event = "active",
+        });
+        try conn.send(arena, .list, .{});
+        const after = try conn.recv(.snapshot, &b);
+        const after_view = try wire.parse(wire.Snapshot, arena, after);
+        try testing.expectEqualStrings("waiting", after_view.sessions[0].status);
     }
 
     // Everything above is gone — both connections closed, as if the terminal
