@@ -42,6 +42,13 @@ pub const Session = struct {
     started_at: i64,
     /// When the last hook event arrived — what the time-based decay measures.
     last_event_at: i64,
+    /// Claude Code's plan mode, as last reported.
+    ///
+    /// Held rather than read per event, because half the events lcc registers
+    /// carry no `permission_mode` at all: without this a `Notification` would
+    /// look like leaving plan mode, when a permission prompt is the one moment
+    /// the mode certainly has not changed.
+    plan: bool = false,
     exit: ?pty.Exit = null,
 
     input: [input_capacity]u8 = undefined,
@@ -98,9 +105,36 @@ pub const Session = struct {
         self.master_open = false;
     }
 
+    /// The status a reader is shown: the lifecycle status and plan mode
+    /// together.
+    ///
+    /// Everything that leaves the daemon goes through this. `status` on its own
+    /// is the lifecycle — what the transition function and the decay operate on
+    /// — and reporting it raw is what would leave a row saying `active` for a
+    /// session that has not been allowed near a file yet.
+    pub fn shown(self: Session) sessions.Status {
+        return watch_status.present(self.status, self.plan);
+    }
+
+    /// Both setters key `status_at` and `dirty` off `shown`, not off the field
+    /// they write. Two things fall out of that. The old "the same status again
+    /// is not a change" guard still holds — writing an unchanged field cannot
+    /// change what it composes to. And a change no reader can see costs no
+    /// write: an `active` session in plan mode decaying to `idle` still reads
+    /// `plan`, and rewriting the registry for it would be a file write per
+    /// session per quarter hour to record nothing.
     fn setStatus(self: *Session, status: sessions.Status, now: i64) void {
-        if (self.status == status) return;
+        const before = self.shown();
         self.status = status;
+        if (self.shown() == before) return;
+        self.status_at = now;
+        self.dirty = true;
+    }
+
+    fn setPlan(self: *Session, plan: bool, now: i64) void {
+        const before = self.shown();
+        self.plan = plan;
+        if (self.shown() == before) return;
         self.status_at = now;
         self.dirty = true;
     }
@@ -166,19 +200,25 @@ pub const Session = struct {
     }
 
     /// A hook event. Returns true when the registry needs rewriting.
-    pub fn note(self: *Session, event: watch_hooks.Event, now: i64) bool {
-        const before = self.status;
+    ///
+    /// An empty `permission_mode` leaves plan mode alone rather than clearing
+    /// it — most of the events lcc registers carry no mode, and treating their
+    /// silence as "no longer planning" would flip the row back on the first
+    /// `Notification` of every plan.
+    pub fn note(self: *Session, event: watch_hooks.Event, permission_mode: []const u8, now: i64) bool {
+        const before = self.shown();
         self.last_event_at = now;
+        if (permission_mode.len > 0) self.setPlan(watch_hooks.isPlan(permission_mode), now);
         self.setStatus(watch_status.apply(self.status, event), now);
-        return before != self.status;
+        return before != self.shown();
     }
 
     /// Time-based decay, run on the coarse tick. Separate from `note` so a
     /// status only ages when nothing has been reported.
     pub fn tick(self: *Session, now: i64) bool {
-        const before = self.status;
+        const before = self.shown();
         self.setStatus(watch_status.resolve(self.status, self.last_event_at, now), now);
-        return before != self.status;
+        return before != self.shown();
     }
 
     /// `waitpid(WNOHANG)`. Returns true once the child has been reaped.
@@ -219,7 +259,7 @@ pub const Session = struct {
             .issue = self.issue,
             .repo_root = self.repo_root,
             .pid = @intCast(self.pid),
-            .status = @tagName(self.status),
+            .status = @tagName(self.shown()),
             .status_at = self.status_at,
             .started_at = self.started_at,
             .last_activity_at = self.last_event_at,
@@ -339,7 +379,7 @@ test "a status change marks the registry dirty; repeating one does not" {
     var s = stubSession(&scratch);
     s.dirty = false;
 
-    try testing.expect(s.note(.waiting, 1010));
+    try testing.expect(s.note(.waiting, "", 1010));
     try testing.expectEqual(sessions.Status.waiting, s.status);
     try testing.expectEqual(@as(i64, 1010), s.status_at);
     try testing.expect(s.dirty);
@@ -347,7 +387,7 @@ test "a status change marks the registry dirty; repeating one does not" {
     // The same status again is not a change. Without this, PreToolUse on every
     // tool call would rewrite the registry file continuously through a long turn.
     s.dirty = false;
-    try testing.expect(!s.note(.waiting, 1020));
+    try testing.expect(!s.note(.waiting, "", 1020));
     try testing.expect(!s.dirty);
     // But the event still counts as activity, or the decay would fire mid-turn.
     try testing.expectEqual(@as(i64, 1020), s.last_event_at);
@@ -374,7 +414,7 @@ test "the registry entry carries the status as text" {
     var scratch = try ring.Ring.init(gpa, 64);
     defer scratch.deinit(gpa);
     var s = stubSession(&scratch);
-    _ = s.note(.active, 1010);
+    _ = s.note(.active, "", 1010);
 
     const row = s.entry();
     try testing.expectEqualStrings("active", row.status);
@@ -390,7 +430,7 @@ test "a decayed session goes idle, and a waiting one never does" {
     defer scratch.deinit(gpa);
     var s = stubSession(&scratch);
 
-    _ = s.note(.active, 1000);
+    _ = s.note(.active, "", 1000);
     try testing.expect(!s.tick(1000 + watch_status.active_decay_seconds));
     try testing.expect(s.tick(1000 + watch_status.active_decay_seconds + 1));
     try testing.expectEqual(sessions.Status.idle, s.status);
@@ -398,7 +438,78 @@ test "a decayed session goes idle, and a waiting one never does" {
     // An unanswered permission prompt is still unanswered a day later, and
     // ageing it into `idle` would hide it exactly when the user has been away
     // longest.
-    _ = s.note(.waiting, 2000);
+    _ = s.note(.waiting, "", 2000);
     try testing.expect(!s.tick(2000 + watch_status.active_decay_seconds * 100));
     try testing.expectEqual(sessions.Status.waiting, s.status);
+}
+
+test "a session reports plan mode, and keeps reporting it through events that omit it" {
+    const gpa = testing.allocator;
+    var scratch = try ring.Ring.init(gpa, 64);
+    defer scratch.deinit(gpa);
+    var s = stubSession(&scratch);
+
+    // PreToolUse carries the mode, so the very first tool call in a planning
+    // turn is enough — nothing has to wait for the user to type anything.
+    try testing.expect(s.note(.active, "plan", 1010));
+    try testing.expectEqualStrings("plan", s.entry().status);
+    // The lifecycle underneath is untouched: `plan` is what the row shows, not
+    // a state the transition function or the decay ever has to reason about.
+    try testing.expectEqual(sessions.Status.active, s.status);
+
+    // SubagentStart carries no `permission_mode` at all. Reading its silence as
+    // "no longer planning" would drop the row back to `active` every time the
+    // agent handed work to a subagent — which during a plan is constantly.
+    try testing.expect(!s.note(.active, "", 1020));
+    try testing.expectEqualStrings("plan", s.entry().status);
+
+    // Neither does Notification, and a permission prompt is the one moment the
+    // mode certainly has not changed. `waiting` outranks plan mode here: it is
+    // the only status that means "go here now", and the prompt at the end of a
+    // plan is exactly when that must not be painted over.
+    try testing.expect(s.note(.waiting, "", 1030));
+    try testing.expectEqualStrings("waiting", s.entry().status);
+    try testing.expect(s.plan);
+
+    // Approving the plan is not an event of its own — the next hook that
+    // carries a mode simply reports a different one, and that is what ends it.
+    try testing.expect(s.note(.active, "default", 1040));
+    try testing.expectEqualStrings("active", s.entry().status);
+    try testing.expect(!s.plan);
+}
+
+test "a mode this build has never heard of is not plan mode" {
+    const gpa = testing.allocator;
+    var scratch = try ring.Ring.init(gpa, 64);
+    defer scratch.deinit(gpa);
+    var s = stubSession(&scratch);
+
+    // Claude Code has six modes today and may have seven tomorrow. An unknown
+    // one reads as "not planning", which is the safe direction: the row loses a
+    // marker rather than claiming an agent cannot touch files when it can.
+    _ = s.note(.active, "plan", 1000);
+    _ = s.note(.active, "some-mode-from-2027", 1010);
+    try testing.expectEqualStrings("active", s.entry().status);
+}
+
+test "a change no reader can see costs no registry write" {
+    const gpa = testing.allocator;
+    var scratch = try ring.Ring.init(gpa, 64);
+    defer scratch.deinit(gpa);
+    var s = stubSession(&scratch);
+
+    _ = s.note(.active, "plan", 1000);
+    s.dirty = false;
+
+    // The lifecycle decays `active` to `idle` underneath, but both compose to
+    // `plan`, so the row is unchanged. Reporting this as dirty would be a file
+    // write per session per quarter hour to record nothing.
+    try testing.expect(!s.tick(1000 + watch_status.active_decay_seconds + 1));
+    try testing.expect(!s.dirty);
+    try testing.expectEqual(sessions.Status.idle, s.status);
+    try testing.expectEqualStrings("plan", s.entry().status);
+
+    // And leaving plan mode then shows the decay that already happened.
+    try testing.expect(s.note(.idle, "acceptEdits", 2000));
+    try testing.expectEqualStrings("idle", s.entry().status);
 }

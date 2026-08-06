@@ -343,6 +343,12 @@ pub const Hook = struct {
     cwd: []const u8,
     session_id: []const u8,
     event: []const u8,
+    /// Claude Code's permission mode, when the event that fired carried one.
+    ///
+    /// Defaulted rather than required, so this stayed additive: an empty value
+    /// means "nothing reported", which the daemon already has to handle for the
+    /// events that never carry a mode at all.
+    permission_mode: []const u8 = "",
 };
 pub const Kill = struct { session_id: []const u8, signal: []const u8 };
 pub const Stop = struct { force: bool };
