@@ -15,6 +15,10 @@ const watch_client = @import("../watch_client.zig");
 const term = @import("../term.zig");
 const watch_attach = @import("../watch_attach.zig");
 const watch_hooks = @import("../watch_hooks.zig");
+const claude = @import("../claude.zig");
+const claude_projects = @import("../claude_projects.zig");
+const linear = @import("../linear.zig");
+const mcp = @import("../mcp.zig");
 const start_cmd = @import("start.zig");
 const watch_table = @import("../watch_table.zig");
 
@@ -185,7 +189,10 @@ fn dashboard(app: app_mod.App, opts: Opts) !void {
     // Held as an id, not an index: snapshots re-sort as statuses change, and an
     // index would move the selection under the user's finger.
     var cursor_id: []const u8 = "";
-    var cursor_buf: [64]u8 = undefined;
+    // A path, not a session id. Sixty-four bytes held an `s-00000001` with room
+    // to spare and silently truncated the first real worktree path, after which
+    // the copy never matched the row it came from and the cursor lived nowhere.
+    var cursor_buf: [std.fs.max_path_bytes]u8 = undefined;
     var confirming_kill = false;
     var key_buf: [8]u8 = undefined;
     // Tracked here rather than in a module variable: this repo has no globals,
@@ -207,7 +214,7 @@ fn dashboard(app: app_mod.App, opts: Opts) !void {
 
         const rows = try collect(app, arena, now);
         if (rows.len > 0 and findRow(rows, cursor_id) == null) {
-            cursor_id = copyId(&cursor_buf, rows[0].id);
+            cursor_id = copyId(&cursor_buf, rows[0].key);
         }
 
         screen.eraseFrame();
@@ -245,14 +252,27 @@ fn dashboard(app: app_mod.App, opts: Opts) !void {
             .down => cursor_id = copyId(&cursor_buf, step(rows, cursor_id, 1)),
             .enter => {
                 if (findRow(rows, cursor_id)) |row| {
-                    try attachTo(app, &screen, terminal, row.id, opts);
+                    const id = row.session_id orelse blk: {
+                        // Nothing running here yet. Start one, then attach, so
+                        // Enter means the same thing on every row.
+                        const started = startForWorktree(app, row) catch |err| {
+                            app.ui.fail("Could not start a session: {s}", .{@errorName(err)});
+                            continue;
+                        };
+                        break :blk started.id;
+                    };
+                    try attachTo(app, &screen, terminal, id, opts);
                 }
             },
             .text => |t| {
                 if (t.len != 1) continue;
                 if (confirming_kill) {
                     confirming_kill = false;
-                    if (t[0] == 'y') kill(app, cursor_id);
+                    if (t[0] == 'y') {
+                        if (findRow(rows, cursor_id)) |row| {
+                            if (row.session_id) |id| kill(app, id);
+                        }
+                    }
                     continue;
                 }
                 switch (t[0]) {
@@ -263,13 +283,16 @@ fn dashboard(app: app_mod.App, opts: Opts) !void {
                     // Two keys, inline, rather than a nested raw-mode widget —
                     // the terminal is already owned and re-entering it for a
                     // yes/no would be a second redraw discipline to keep right.
-                    'x' => confirming_kill = findRow(rows, cursor_id) != null,
+                    // Only a row with something running has anything to kill.
+                    'x' => confirming_kill = if (findRow(rows, cursor_id)) |row| row.session_id != null else false,
                     'r' => {},
                     '1'...'9' => {
                         const index = t[0] - '1';
                         if (index < rows.len) {
-                            cursor_id = copyId(&cursor_buf, rows[index].id);
-                            try attachTo(app, &screen, terminal, rows[index].id, opts);
+                            cursor_id = copyId(&cursor_buf, rows[index].key);
+                            if (rows[index].session_id) |id| {
+                                try attachTo(app, &screen, terminal, id, opts);
+                            }
                         }
                     },
                     else => {},
@@ -358,45 +381,136 @@ fn footer(
         }) catch {};
         return 1;
     }
+    // "enter opens" rather than "enter attaches": on a row with no session yet
+    // it starts one first, and promising only the second half would make the
+    // first look like a surprise.
     out.print("  {s}{s}{s}\n", .{
         p.dim,
-        term.truncate("↑↓ move · enter attach · n new · x kill · q quit", cols -| 2),
+        term.truncate("↑↓ move · enter opens · n new issue · x kill · q quit", cols -| 2),
         p.reset,
     }) catch {};
     return 1;
 }
 
+/// Every worktree of the repo you are standing in, plus every session the
+/// daemon is running — merged on the worktree path.
+///
+/// One screen rather than two. `lcc open` used to list worktrees and know
+/// nothing about sessions; the dashboard listed sessions and knew nothing about
+/// worktrees. Each saw half of the same question — "where do I get back into
+/// Claude Code" — and the half it saw depended on which command you happened to
+/// type.
+///
+/// Sessions outside the current repo are kept rather than filtered: an agent
+/// running somewhere else is exactly the thing you must not lose sight of, and
+/// this may be run from no repository at all.
 fn collect(app: app_mod.App, arena: std.mem.Allocator, now: i64) ![]watch_table.Row {
-    const live = watch_client.snapshot(app) catch null;
-    if (live) |list| {
-        const rows = try arena.alloc(watch_table.Row, list.len);
-        for (list, 0..) |s, i| rows[i] = .{
-            .id = s.id,
+    var rows: std.ArrayList(watch_table.Row) = .empty;
+
+    // The daemon when it is up, its projection when it is not — so a dead
+    // daemon shows `unknown` rather than an empty screen that reads as "nothing
+    // was ever running here".
+    var live: []const sessions.Session = &.{};
+    var stale = false;
+    if (watch_client.snapshot(app) catch null) |list| {
+        live = list;
+    } else {
+        const state = sessions.load(arena, app.io, app.environ);
+        const resolved = try sessions.resolved(arena, app.io, state, now);
+        const carried = try arena.alloc(sessions.Session, resolved.len);
+        for (resolved, 0..) |r, i| {
+            carried[i] = r.session;
+            carried[i].status = @tagName(r.status);
+            if (r.stale) stale = true;
+        }
+        live = carried;
+    }
+
+    // Worktrees first, so the order is the repo's rather than the daemon's
+    // registration order, which changes as sessions come and go.
+    if (app.repo()) |repo| {
+        for (try app_mod.worktreeChoices(app, repo)) |choice| {
+            const branch = choice.entry.branch orelse app_mod.shortHead(choice.entry.head);
+            const match = findSession(live, choice.entry.path);
+            try rows.append(arena, .{
+                .key = choice.entry.path,
+                .session_id = if (match) |m| m.id else null,
+                .status = if (match) |m| m.parsedStatus() else null,
+                .issue = if (match) |m| m.issue else issueOf(arena, branch),
+                .branch = branch,
+                .worktree = choice.entry.path,
+                .last_activity_at = if (match) |m| m.last_activity_at else 0,
+                .exit_code = if (match) |m| m.exit_code else null,
+                .stale = stale and match != null,
+            });
+        }
+    } else |_| {}
+
+    for (live) |s| {
+        var already = false;
+        for (rows.items) |row| {
+            if (std.mem.eql(u8, row.worktree, s.worktree)) already = true;
+        }
+        if (already) continue;
+        try rows.append(arena, .{
+            .key = s.worktree,
+            .session_id = s.id,
+            .status = s.parsedStatus(),
             .issue = s.issue,
             .branch = s.branch,
             .worktree = s.worktree,
-            .status = s.parsedStatus(),
             .last_activity_at = s.last_activity_at,
             .exit_code = s.exit_code,
-            .stale = false,
-        };
-        return rows;
+            .stale = stale,
+        });
     }
 
-    const state = sessions.load(arena, app.io, app.environ);
-    const resolved = try sessions.resolved(arena, app.io, state, now);
-    const rows = try arena.alloc(watch_table.Row, resolved.len);
-    for (resolved, 0..) |r, i| rows[i] = .{
-        .id = r.session.id,
-        .issue = r.session.issue,
-        .branch = r.session.branch,
-        .worktree = r.session.worktree,
-        .status = r.status,
-        .last_activity_at = r.session.last_activity_at,
-        .exit_code = r.session.exit_code,
-        .stale = r.stale,
-    };
-    return rows;
+    return rows.toOwnedSlice(arena);
+}
+
+fn findSession(list: []const sessions.Session, worktree: []const u8) ?sessions.Session {
+    for (list) |s| {
+        if (std.mem.eql(u8, s.worktree, worktree)) return s;
+    }
+    return null;
+}
+
+/// `PE-288` out of `feature/pe-288-…`, for a worktree the daemon has never seen.
+///
+/// Upper-cased from the branch rather than asked of Linear: the dashboard
+/// redraws once a second and this is a label, not a lookup.
+fn issueOf(gpa: std.mem.Allocator, branch: []const u8) ?[]const u8 {
+    const ref = linear.refFromBranch(branch) orelse return null;
+    const team = std.ascii.allocUpperString(gpa, ref.team) catch return null;
+    return std.fmt.allocPrint(gpa, "{s}-{d}", .{ team, ref.number }) catch null;
+}
+
+/// Hand an existing worktree to the daemon and return its session id.
+///
+/// What `lcc open` did in the foreground, done through the daemon instead: the
+/// same `--resume` when a transcript exists, the same MCP servers carried from
+/// the main checkout. Asking to resume in a directory Claude Code has never run
+/// in opens a picker with nothing in it, so it is only asked for once there is
+/// something to resume.
+fn startForWorktree(app: app_mod.App, row: watch_table.Row) !watch_client.Started {
+    var argv: std.ArrayList([]const u8) = .empty;
+    if (app.repo()) |repo| {
+        if (try mcp.carry(app.gpa, app.io, app.environ, repo.root)) |carried| {
+            try argv.appendSlice(app.gpa, &.{ "--mcp-config", carried.path });
+        }
+    } else |_| {}
+    if (claude_projects.hasSessionsFor(app.gpa, app.io, app.environ, row.worktree)) {
+        try argv.append(app.gpa, "--resume");
+    }
+
+    return watch_client.startSession(app, .{
+        .worktree = row.worktree,
+        .branch = row.branch,
+        .issue = row.issue,
+        .repo_root = if (app.repo()) |r| r.root else |_| row.worktree,
+        .program = try claude.resolvePath(app.gpa, app.io),
+        .argv = argv.items,
+    });
 }
 
 fn kill(app: app_mod.App, id: []const u8) void {
@@ -405,25 +519,25 @@ fn kill(app: app_mod.App, id: []const u8) void {
     conn.sendControl(app.gpa, .kill, .{ .session_id = id, .signal = "TERM" }) catch {};
 }
 
-fn findRow(rows: []const watch_table.Row, id: []const u8) ?watch_table.Row {
+fn findRow(rows: []const watch_table.Row, key: []const u8) ?watch_table.Row {
     for (rows) |row| {
-        if (std.mem.eql(u8, row.id, id)) return row;
+        if (std.mem.eql(u8, row.key, key)) return row;
     }
     return null;
 }
 
 /// The neighbouring session's id, wrapping. Pure, so the wrap is testable.
-pub fn step(rows: []const watch_table.Row, id: []const u8, delta: i2) []const u8 {
+pub fn step(rows: []const watch_table.Row, key: []const u8, delta: i2) []const u8 {
     if (rows.len == 0) return "";
     var at: usize = 0;
     for (rows, 0..) |row, i| {
-        if (std.mem.eql(u8, row.id, id)) at = i;
+        if (std.mem.eql(u8, row.key, key)) at = i;
     }
     const next = if (delta < 0)
         (if (at == 0) rows.len - 1 else at - 1)
     else
         (if (at + 1 >= rows.len) 0 else at + 1);
-    return rows[next].id;
+    return rows[next].key;
 }
 
 /// The cursor outlives the arena its row came from, so its id is copied into a

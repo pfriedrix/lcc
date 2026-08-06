@@ -42,10 +42,7 @@ const usage =
     \\                           false` makes --no-watch the default instead
     \\    --watch                hand it to the daemon even when that is off
     \\    --no-attach            print the session id instead of opening the dashboard
-    \\  watch                    What the daemon is running — live when on a terminal
-    \\                           n starts another issue without leaving it
-    \\    --json                 one-shot snapshot instead of the dashboard
-    \\    --no-status-bar        give an attached session the whole terminal
+    \\  watch                    Alias for `open`
     \\  daemon                   Run or control the session daemon
     \\    --foreground           stay attached to this terminal
     \\    --stop                 ask a running daemon to exit
@@ -81,8 +78,11 @@ const usage =
     \\  stats                    What each worktree has spent in Claude Code
     \\    --models               break every worktree down by model
     \\    --json                 print the numbers instead of a table
-    \\  open | o [claude|xcode]  Open a worktree in Claude Code, or in Xcode
-    \\    --no-resume            start Claude Code fresh
+    \\  open | o                 The worktrees, and what is running in them
+    \\                           enter opens one · n takes another issue · x kills
+    \\    --json                 print the sessions instead of the dashboard
+    \\    --no-status-bar        give an attached session the whole terminal
+    \\  open xcode               Pick a worktree and open it in Xcode instead
     \\  remove | rm              Select and remove one or more worktrees, branches, and build data
     \\    --merged               bulk: every worktree and branch already merged
     \\    --local                decide from local refs only — no fetch, no asking
@@ -156,12 +156,12 @@ fn dispatch(app: app_mod.App, args: []const []const u8) !void {
     if (eq(first, "config")) return configCommand(app, args[1..]);
     if (eq(first, "list") or eq(first, "ls")) return listCommand(app, args[1..]);
     if (eq(first, "open") or eq(first, "o")) return openCommand(app, args[1..]);
+    if (eq(first, "watch")) return watchCommand(app, args[1..]);
     if (eq(first, "remove") or eq(first, "rm")) return removeCommand(app, args[1..]);
     if (eq(first, "clean")) return cleanCommand(app, args[1..]);
     if (eq(first, "issue")) return issueCommand(app, args[1..]);
     if (eq(first, "start")) return startCommand(app, args[1..]);
     if (eq(first, "stats")) return statsCommand(app, args[1..]);
-    if (eq(first, "watch")) return watchCommand(app, args[1..]);
     if (eq(first, "watch-hook")) return watchHookCommand(app, args[1..]);
     if (eq(first, "daemon")) return daemonCommand(app, args[1..]);
     if (std.mem.startsWith(u8, first, "-")) return error.UnknownOption;
@@ -354,11 +354,14 @@ fn authCommand(app: app_mod.App, args: []const []const u8) !void {
 fn openCommand(app: app_mod.App, args: []const []const u8) !void {
     var target_arg: ?[]const u8 = null;
     var resume_opt: ?bool = null;
+    var passthrough: std.ArrayList([]const u8) = .empty;
     for (args) |arg| {
         if (eq(arg, "--no-resume")) {
             resume_opt = false;
         } else if (eq(arg, "--resume")) {
             resume_opt = true;
+        } else if (eq(arg, "--json") or eq(arg, "--status-bar") or eq(arg, "--no-status-bar")) {
+            try passthrough.append(app.gpa, arg);
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownOption;
         } else if (target_arg == null) {
@@ -370,6 +373,13 @@ fn openCommand(app: app_mod.App, args: []const []const u8) !void {
         app.ui.fail("Unknown open target '{s}'. Use one of: claude, xcode.", .{target_arg.?});
         std.process.exit(1);
     };
+
+    // Xcode keeps the old picker: it opens a worktree in an editor and has
+    // nothing to do with sessions. Claude Code is the dashboard now — a
+    // worktree and whether something is running in it are one question, and
+    // which half you got used to depend on which of two commands you typed.
+    if (target == .claude) return watchCommand(app, passthrough.items);
+
     const cfg = try config.load(app.gpa, app.io, app.environ);
     return open_cmd.run(app, target, !orConfig(resume_opt, cfg.resumeSessions));
 }

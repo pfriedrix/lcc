@@ -77,8 +77,7 @@ lcc setup            # the same thing, under the name muscle memory reaches for
 lcc config watchByDefault false   # or name one directly, with no prompt
 lcc list             # dashboard of every worktree (--local to skip the network columns)
 lcc stats            # what each worktree has spent in Claude Code
-lcc open             # pick a worktree and open Claude Code in it
-lcc open claude      # the same, named explicitly
+lcc open             # the worktrees, and what is running in them
 lcc open xcode       # pick a worktree and open it in Xcode instead
 lcc remove           # select worktrees, remove them + their branches + Xcode build data
 lcc remove --merged  # bulk: every worktree and branch whose work already landed
@@ -99,20 +98,26 @@ taking over the terminal itself. Closing the window, losing an ssh link or
 rebooting the terminal emulator no longer kills the agent — the work carries on
 and `lcc watch` shows it.
 
-What you see is the dashboard, one row per session:
+`lcc open` is the dashboard: every worktree of the repo you are in, and
+whatever is running in each. Enter opens one — attaching if a session is
+already there, starting one if not. `lcc watch` is an alias.
 
 ```
-  ISSUE   STATUS     BRANCH                              AGE  WORKTREE
-❯ PE-256  ● waiting  feature/pe-256-app-hangs-on-launch  4s   ~/…/worktrees/pe-256
-  PE-270  ◐ active   feature/pe-270-crash-in-mapview     12s  ~/…/worktrees/pe-270
-  PE-9    ○ idle     feature/pe-9-unrelated              18m  ~/…/worktrees/pe-9
+  ISSUE   STATUS        BRANCH                              AGE
+❯ PE-256  ● waiting     feature/pe-256-app-hangs-on-launch  4s
+  PE-270  ◐ active      feature/pe-270-crash-in-mapview     12s
+  PE-9    · no session  feature/pe-9-unrelated              —
 
-  ↑↓ move · enter attach · n new · x kill · q quit
+  ↑↓ move · enter opens · n new issue · x kill · q quit
 ```
 
 `n` picks another issue and starts it without leaving the dashboard — the same
 picker and the same bootstrap as `lcc start`, just without having to quit first.
 Changing your mind puts you back in the list rather than quitting lcc.
+
+A session running in another repository still appears, because an agent working
+somewhere you are not looking is the one you most need to see. `lcc open xcode`
+is unchanged and still opens a worktree in Xcode.
 
 `● waiting` is the one that wants you: the agent is blocked on a permission
 prompt or a question. `◐ active` is a turn in flight, `○ idle` is finished.

@@ -16,11 +16,18 @@ const term = @import("term.zig");
 const ui = @import("ui.zig");
 
 pub const Row = struct {
-    id: []const u8,
+    /// The worktree path, and the cursor's identity.
+    ///
+    /// Not the session id: a row exists whether or not a session does, and the
+    /// worktree is the thing that persists across one starting and stopping.
+    key: []const u8,
+    /// Null when nothing is running here — an ordinary state, not an error.
+    session_id: ?[]const u8,
+    /// Null for the same reason.
+    status: ?sessions.Status,
     issue: ?[]const u8,
     branch: []const u8,
     worktree: []const u8,
-    status: sessions.Status,
     last_activity_at: i64,
     exit_code: ?i32,
     /// The daemon is alive but its projection has gone cold.
@@ -31,8 +38,8 @@ pub const Row = struct {
 ///
 /// `waiting` is the only one that means "go here now", and it gets the filled
 /// circle and the warm colour for that reason alone.
-pub fn glyph(status: sessions.Status) []const u8 {
-    return switch (status) {
+pub fn glyph(status: ?sessions.Status) []const u8 {
+    return switch (status orelse return "·") {
         .waiting => "●",
         .active => "◐",
         .idle => "○",
@@ -43,8 +50,8 @@ pub fn glyph(status: sessions.Status) []const u8 {
     };
 }
 
-pub fn paint(status: sessions.Status, palette: ui.Palette) []const u8 {
-    return switch (status) {
+pub fn paint(status: ?sessions.Status, palette: ui.Palette) []const u8 {
+    return switch (status orelse return palette.dim) {
         .waiting => palette.yellow,
         .active => palette.green,
         .orphan => palette.yellow,
@@ -93,7 +100,7 @@ pub fn measure(rows: []const Row) Widths {
     };
     for (rows) |row| {
         w.issue = @max(w.issue, ui.displayWidth(row.issue orelse "—"));
-        w.status = @max(w.status, ui.displayWidth(@tagName(row.status)) + 2);
+        w.status = @max(w.status, ui.displayWidth(statusText(row.status)) + 2);
         w.branch = @max(w.branch, ui.displayWidth(row.branch));
         w.worktree = @max(w.worktree, ui.displayWidth(row.worktree));
     }
@@ -153,9 +160,15 @@ pub fn render(
 
     var age_buf: [16]u8 = undefined;
     for (rows) |row| {
-        const selected = std.mem.eql(u8, row.id, cursor_id);
+        const selected = std.mem.eql(u8, row.key, cursor_id);
         const gutter = if (selected) "❯ " else "  ";
-        const age = std.fmt.bufPrint(&age_buf, "{f}", .{ui.age(now - row.last_activity_at)}) catch "—";
+        // A worktree nothing has ever run in has no activity to age. Measuring
+        // from zero dates it to the epoch and prints "56y", which reads as data
+        // rather than as its absence.
+        const age = if (row.last_activity_at == 0)
+            "—"
+        else
+            std.fmt.bufPrint(&age_buf, "{f}", .{ui.age(now - row.last_activity_at)}) catch "—";
 
         var cells: [5]Cell = .{
             .{ .text = row.issue orelse "—", .width = widths.issue, .colour = "" },
@@ -167,15 +180,21 @@ pub fn render(
         var status_buf: [64]u8 = undefined;
         cells[1].text = std.fmt.bufPrint(&status_buf, "{s} {s}{s}", .{
             glyph(row.status),
-            @tagName(row.status),
+            statusText(row.status),
             // A cold projection is marked rather than silently believed.
             if (row.stale) "~" else "",
-        }) catch @tagName(row.status);
+        }) catch statusText(row.status);
 
         writeRow(out, cols, gutter, "", &cells, p.reset);
         lines += 1;
     }
     return lines;
+}
+
+/// A worktree with nothing running in it says so, rather than leaving the
+/// column blank — blank reads as missing data, and this is a state.
+pub fn statusText(status: ?sessions.Status) []const u8 {
+    return if (status) |s| @tagName(s) else "no session";
 }
 
 const Cell = struct { text: []const u8, width: usize, colour: []const u8 };
@@ -236,7 +255,7 @@ fn renderNarrow(out: *Io.Writer, rows: []const Row, cols: usize, cursor_id: []co
     var lines: usize = 0;
     var buf: [256]u8 = undefined;
     for (rows) |row| {
-        const gutter = if (std.mem.eql(u8, row.id, cursor_id)) "❯ " else "  ";
+        const gutter = if (std.mem.eql(u8, row.key, cursor_id)) "❯ " else "  ";
         const text = std.fmt.bufPrint(&buf, "{s} {s}", .{
             glyph(row.status),
             row.issue orelse row.branch,
@@ -258,24 +277,26 @@ fn testRows() []const Row {
     const S = struct {
         const rows = [_]Row{
             .{
-                .id = "s-1",
+                .key = "/r/.lcc/worktrees/pe-256",
+                .session_id = "s-1",
                 .issue = "PE-256",
                 .branch = "feature/pe-256-app-hangs-on-launch",
                 .worktree = "/r/.lcc/worktrees/pe-256",
                 .status = .waiting,
                 .last_activity_at = 900,
                 .exit_code = null,
-                .stale = false,
+                .stale = true,
             },
             .{
-                .id = "s-2",
+                .key = "/r/.lcc/worktrees/other",
+                .session_id = null,
                 .issue = null,
                 .branch = "feature/no-issue-here",
                 .worktree = "/r/.lcc/worktrees/other",
-                .status = .active,
+                .status = null,
                 .last_activity_at = 600,
                 .exit_code = null,
-                .stale = true,
+                .stale = false,
             },
         };
     };
@@ -287,8 +308,9 @@ test "measure sizes every column to its widest cell, headers included" {
     try testing.expectEqual(ui.displayWidth("feature/pe-256-app-hangs-on-launch"), w.branch);
     // The widest cell wins when it beats the header — `PE-256` is six columns.
     try testing.expectEqual(ui.displayWidth("PE-256"), w.issue);
-    // Status carries a glyph and a space on top of its label.
-    try testing.expectEqual(ui.displayWidth("waiting") + 2, w.status);
+    // Status carries a glyph and a space on top of its widest label, and
+    // "no session" is wider than any status a running one reports.
+    try testing.expectEqual(ui.displayWidth("no session") + 2, w.status);
 
     // And the header wins when nothing beats it: `AGE` has no cell measured
     // against it at all, so seeding from the labels is what keeps the column
@@ -335,7 +357,7 @@ test "render returns exactly the number of lines it drew" {
 
     const rows = testRows();
     const widths = fit(measure(rows), 120);
-    const lines = render(&w, rows, widths, 120, "s-1", 1000);
+    const lines = render(&w, rows, widths, 120, "/r/.lcc/worktrees/pe-256", 1000);
 
     // The redraw walks back up exactly this far. A count that disagrees with
     // the output corrupts every frame after it — which is why this is asserted
@@ -357,7 +379,7 @@ test "no rendered line is wider than the terminal, at any width" {
     for ([_]usize{ 200, 120, 80, 60, 46, 30, 20, 10 }) |cols| {
         var buf: [8192]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);
-        const lines = render(&w, rows, fit(full, cols), cols, "s-1", 1000);
+        const lines = render(&w, rows, fit(full, cols), cols, "/r/.lcc/worktrees/pe-256", 1000);
 
         var it = std.mem.splitScalar(u8, w.buffered(), '\n');
         var counted: usize = 0;
@@ -376,15 +398,29 @@ test "no rendered line is wider than the terminal, at any width" {
     }
 }
 
+test "a worktree with nothing running shows no age, not one measured from the epoch" {
+    var buf: [4096]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    ui.setColor(false);
+    const rows = testRows();
+    _ = render(&w, rows, fit(measure(rows), 120), 120, rows[0].key, 1_800_000_000);
+    // The second row has never run. Aging from zero would print something like
+    // "56y", which looks like a fact rather than the absence of one.
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "56y") == null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "—") != null);
+}
+
 test "a stale row is marked rather than silently believed" {
     var buf: [4096]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     ui.setColor(false);
     const rows = testRows();
-    _ = render(&w, rows, fit(measure(rows), 120), 120, "s-1", 1000);
-    // The second row is stale; a debounced writer can promise nothing more than
+    _ = render(&w, rows, fit(measure(rows), 120), 120, "/r/.lcc/worktrees/pe-256", 1000);
+    // The second row has no session at all — a state, not missing data.
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "no session") != null);
+    // And the first is stale: a debounced writer can promise nothing more than
     // "this was true a moment ago", and the reader should be able to see that.
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "active~") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "waiting~") != null);
 }
 
 test "the selected row is the one whose id matches, not a row index" {
@@ -392,7 +428,7 @@ test "the selected row is the one whose id matches, not a row index" {
     var w: Io.Writer = .fixed(&buf);
     ui.setColor(false);
     const rows = testRows();
-    _ = render(&w, rows, fit(measure(rows), 120), 120, "s-2", 1000);
+    _ = render(&w, rows, fit(measure(rows), 120), 120, "/r/.lcc/worktrees/other", 1000);
 
     // Snapshots re-sort as statuses change. A cursor held as an index would
     // jump under the user's finger; held as an id it stays on the session they
