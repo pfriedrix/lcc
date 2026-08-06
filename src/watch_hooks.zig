@@ -10,6 +10,8 @@
 //!   Notification/permission_prompt → blocked on a decision   → waiting
 //!   Notification/agent_needs_input → blocked on a decision   → waiting
 //!   UserPromptSubmit, PreToolUse   → a turn is in flight     → active
+//!   SubagentStart                  → so is work it handed
+//!                                    to a subagent           → active
 //!   Stop                           → the turn finished       → idle
 //!   SessionEnd                     → the session is over     → exited
 //!
@@ -70,6 +72,23 @@ const Entry = struct {
 
 const Events = struct {
     Notification: []const Entry,
+    /// Claude Code fires this for every agent a workflow or a `Task` spawns,
+    /// and its matcher is the agent type — so an empty one is all of them.
+    ///
+    /// It is here because of what a session looks like without it. The main
+    /// agent hands work to subagents and its own turn ends, so `Stop` fires and
+    /// the row reads `idle` — "finished, come back whenever" — while a dynamic
+    /// workflow grinds away underneath it for twenty minutes. The one thing the
+    /// dashboard exists to answer is "where is the work", and `idle` was the
+    /// wrong answer to it.
+    ///
+    /// `active`, not `waiting`, and the distinction is the whole point of the
+    /// colour. `waiting` has to keep meaning "a person is blocking this one";
+    /// a session whose subagents are busy is blocking on nobody, and painting
+    /// it the same yellow would put two states that call for opposite
+    /// responses under one signal. The same reasoning keeps `idle_prompt` out
+    /// of `blocking_matchers` below.
+    SubagentStart: []const Entry,
     UserPromptSubmit: []const Entry,
     PreToolUse: []const Entry,
     Stop: []const Entry,
@@ -126,6 +145,7 @@ pub fn settingsJson(
 
     return std.json.Stringify.valueAlloc(gpa, Settings{ .hooks = .{
         .Notification = blocking.items,
+        .SubagentStart = &.{.{ .hooks = &.{.{ .command = active }} }},
         .UserPromptSubmit = &.{.{ .hooks = &.{.{ .command = active }} }},
         .PreToolUse = &.{.{ .hooks = &.{.{ .command = active }} }},
         .Stop = &.{.{ .hooks = &.{.{ .command = idle }} }},
@@ -177,6 +197,10 @@ test "the settings name every event and bake the state into each command" {
                 matcher: []const u8,
                 hooks: []struct { type: []const u8, command: []const u8, timeout: u32, @"async": bool },
             },
+            SubagentStart: []struct {
+                matcher: []const u8,
+                hooks: []struct { type: []const u8, command: []const u8, timeout: u32, @"async": bool },
+            },
             UserPromptSubmit: []struct {
                 matcher: []const u8,
                 hooks: []struct { type: []const u8, command: []const u8, timeout: u32, @"async": bool },
@@ -203,6 +227,14 @@ test "the settings name every event and bake the state into each command" {
         try testing.expectEqualStrings(matcher, entry.matcher);
         try testing.expect(std.mem.endsWith(u8, entry.hooks[0].command, "--event waiting"));
     }
+    // A subagent starting is the session working, so `active` — never
+    // `waiting`, which has to go on meaning that a person is blocking it. An
+    // empty matcher, so it counts for every agent type rather than for
+    // whichever ones were named the day this was written.
+    try testing.expectEqual(@as(usize, 1), parsed.hooks.SubagentStart.len);
+    try testing.expectEqualStrings("", parsed.hooks.SubagentStart[0].matcher);
+    try testing.expect(std.mem.endsWith(u8, parsed.hooks.SubagentStart[0].hooks[0].command, "--event active"));
+
     try testing.expect(std.mem.endsWith(u8, parsed.hooks.Stop[0].hooks[0].command, "--event idle"));
     try testing.expect(std.mem.endsWith(u8, parsed.hooks.UserPromptSubmit[0].hooks[0].command, "--event active"));
     try testing.expect(std.mem.endsWith(u8, parsed.hooks.PreToolUse[0].hooks[0].command, "--event active"));
