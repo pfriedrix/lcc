@@ -39,8 +39,9 @@ const usage =
     \\                           over this terminal — it then survives the terminal
     \\                           closing, and `lcc watch` shows it
     \\    --no-attach            with --watch, print the session id and exit
-    \\  watch                    What the daemon is running
-    \\    --json                 print the sessions instead of a table
+    \\  watch                    What the daemon is running — live when on a terminal
+    \\    --json                 one-shot snapshot instead of the dashboard
+    \\    --no-status-bar        give an attached session the whole terminal
     \\  daemon                   Run or control the session daemon
     \\    --foreground           stay attached to this terminal
     \\    --stop                 ask a running daemon to exit
@@ -419,6 +420,8 @@ fn watchCommand(app: app_mod.App, args: []const []const u8) !void {
     for (args) |arg| {
         if (eq(arg, "--json")) {
             opts.json = true;
+        } else if (eq(arg, "--no-status-bar")) {
+            opts.no_status_bar = true;
         } else return error.UnknownOption;
     }
 
@@ -476,6 +479,7 @@ fn eq(a: []const u8, b: []const u8) bool {
 test {
     // Zig only collects tests from files the root references during test
     // analysis, so name every module here or `zig build test` runs nothing.
+    _ = @import("ansi.zig");
     _ = @import("app.zig");
     _ = @import("claude.zig");
     _ = @import("claude_projects.zig");
@@ -505,6 +509,7 @@ test {
     _ = @import("usage.zig");
     _ = @import("usage_cache.zig");
     _ = @import("watch_attach.zig");
+    _ = @import("watch_bar.zig");
     _ = @import("watch_client.zig");
     _ = @import("watch_hooks.zig");
     _ = @import("watch_paths.zig");

@@ -1,0 +1,202 @@
+//! The one row an attached session cannot reach: what it says, and the scroll
+//! region that reserves it.
+//!
+//! Not an overlay drawn on top of the child's rows. That approach loses: Claude
+//! Code repaints its bottom UI many times a second while streaming and would
+//! clobber anything drawn there within a frame or two. Instead the child is
+//! told the terminal is one row shorter and a scroll region keeps its output
+//! inside those rows, so the last line is somewhere it physically cannot write.
+//! That is how tmux does it, and it is why there is no flicker to manage.
+//!
+//! The row exists mainly to answer a question the attach path cannot otherwise
+//! answer: **how do I get back?** `^\` is undiscoverable, and a hint printed
+//! before passthrough scrolls away within seconds — after which the user is
+//! inside Claude Code with no visible way out and no reason to think there is
+//! one. A line the child cannot overwrite is the only place that stays put.
+
+const std = @import("std");
+const Io = std.Io;
+const sessions = @import("sessions.zig");
+const term = @import("term.zig");
+const ui = @import("ui.zig");
+const watch_table = @import("watch_table.zig");
+
+/// Reserve every row but the last for the child.
+///
+/// Must be re-issued whenever `ansi.Scanner` reports a scroll region going
+/// past: Claude Code emits a bare `CSI r` as its second command, and a bar that
+/// set this once at attach would lose the row immediately.
+pub fn reserve(out: *Io.Writer, rows: u16) void {
+    if (rows < 2) return;
+    out.print(term.csi ++ "1;{d}r", .{rows - 1}) catch {};
+}
+
+/// Hand the whole screen back. `term.sanitize` also emits this, so a detach
+/// that skips the bar entirely still cannot strand a scroll region.
+pub fn release(out: *Io.Writer) void {
+    out.writeAll(term.csi ++ "r") catch {};
+}
+
+/// Paint the reserved row without disturbing where the child left its cursor.
+///
+/// Save, jump outside the scroll region, draw, restore. The child's cursor
+/// position is part of its rendering state — moving it and not putting it back
+/// would corrupt the next thing it draws.
+pub fn draw(out: *Io.Writer, rows: u16, text: []const u8) void {
+    if (rows < 2) return;
+    const p = ui.palette();
+    out.print("\x1b7" ++ term.csi ++ "{d};1H" ++ term.csi ++ "2K", .{rows}) catch {};
+    out.writeAll(p.dim) catch {};
+    out.writeAll(text) catch {};
+    out.writeAll(p.reset) catch {};
+    out.writeAll("\x1b8") catch {};
+    out.flush() catch {};
+}
+
+/// The keys, which are the reason the row exists.
+///
+/// `^C→agent` is there because the second question after "how do I get out" is
+/// "does Ctrl-C still reach Claude Code" — it does, and saying so is what stops
+/// people being afraid to press it.
+pub const keys = "^\\ dashboard · ^C→agent";
+
+/// What the row says: this session, then the others, then the keys.
+///
+/// Truncated from the left-hand end — the session list is the part that can be
+/// cut, because the keys are the part someone is looking for when they read it.
+pub fn compose(
+    buf: []u8,
+    list: []const sessions.Session,
+    current_id: []const u8,
+    cols: usize,
+) []const u8 {
+    // Display width, not `keys.len`: the separators are `·` and `→`, which are
+    // two and three bytes. Budgeting in bytes reserves more room than the text
+    // occupies and leaves the bar short of the width it was asked for.
+    const keys_width = ui.displayWidth(keys);
+    if (cols < keys_width + 2) return term.truncate(keys, cols);
+
+    var w: Io.Writer = .fixed(buf);
+    const budget = cols - keys_width - 2;
+    var used: usize = 0;
+
+    for (list) |s| {
+        const label = s.issue orelse s.branch;
+        const glyph = watch_table.glyph(s.parsedStatus());
+        const mark: []const u8 = if (std.mem.eql(u8, s.id, current_id)) "*" else " ";
+        // Two for the glyph and its space, plus the separator.
+        const cost = ui.displayWidth(label) + ui.displayWidth(glyph) + 3;
+        if (used + cost > budget) break;
+        w.print("{s}{s} {s} ", .{ mark, glyph, label }) catch break;
+        used += cost;
+    }
+
+    // Right-aligned keys, so they sit in the same place whatever the list does.
+    const pad = cols - used - keys_width;
+    w.splatByteAll(' ', pad) catch {};
+    w.writeAll(keys) catch {};
+    return term.truncate(w.buffered(), cols);
+}
+
+const testing = std.testing;
+
+fn testSessions() []const sessions.Session {
+    const S = struct {
+        const list = [_]sessions.Session{
+            .{ .id = "s-1", .issue = "PE-256", .branch = "feature/a", .status = "waiting" },
+            .{ .id = "s-2", .issue = "PE-270", .branch = "feature/b", .status = "active" },
+            .{ .id = "s-3", .issue = null, .branch = "feature/c", .status = "idle" },
+        };
+    };
+    return &S.list;
+}
+
+test "the row reserves every line but the last" {
+    var buf: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    reserve(&w, 40);
+    // Rows 1..39 belong to the child; row 40 is ours and it cannot scroll into
+    // it, which is the whole mechanism.
+    try testing.expectEqualStrings(term.csi ++ "1;39r", w.buffered());
+}
+
+test "a terminal too short for a bar gets no scroll region at all" {
+    var buf: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    // `CSI 1;0r` would be a degenerate region, and a one-row terminal has no
+    // room to give up. Better to render nothing than to wedge the session.
+    reserve(&w, 1);
+    try testing.expectEqual(@as(usize, 0), w.end);
+    draw(&w, 1, "anything");
+    try testing.expectEqual(@as(usize, 0), w.end);
+}
+
+test "drawing restores the cursor the child left behind" {
+    var buf: [256]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    ui.setColor(false);
+    draw(&w, 24, "hello");
+    const out = w.buffered();
+
+    // Save first and restore last: the cursor position is part of the child's
+    // rendering state, and leaving it moved corrupts whatever it draws next.
+    try testing.expect(std.mem.startsWith(u8, out, "\x1b7"));
+    try testing.expect(std.mem.endsWith(u8, out, "\x1b8"));
+    // Jump to the reserved row and clear it before writing, or yesterday's
+    // longer text shows through behind today's.
+    try testing.expect(std.mem.indexOf(u8, out, term.csi ++ "24;1H") != null);
+    try testing.expect(std.mem.indexOf(u8, out, term.csi ++ "2K") != null);
+}
+
+test "the keys are always present, and the session list is what gets cut" {
+    var buf: [512]u8 = undefined;
+    ui.setColor(false);
+
+    const wide = compose(&buf, testSessions(), "s-1", 100);
+    try testing.expect(std.mem.indexOf(u8, wide, keys) != null);
+    try testing.expect(std.mem.indexOf(u8, wide, "PE-256") != null);
+    try testing.expect(std.mem.indexOf(u8, wide, "PE-270") != null);
+    try testing.expectEqual(@as(usize, 100), ui.displayWidth(wide));
+
+    // Narrow: sessions fall off, the way back does not. Someone reading this row
+    // is looking for the way out, not for a roster.
+    var narrow_buf: [512]u8 = undefined;
+    const narrow = compose(&narrow_buf, testSessions(), "s-1", 30);
+    try testing.expect(std.mem.indexOf(u8, narrow, keys) != null);
+    try testing.expect(ui.displayWidth(narrow) <= 30);
+
+    // Narrower than the keys themselves: keep what fits rather than wrapping,
+    // since a wrapped bar would scroll the child's output.
+    var tiny_buf: [512]u8 = undefined;
+    const tiny = compose(&tiny_buf, testSessions(), "s-1", 10);
+    try testing.expect(ui.displayWidth(tiny) <= 10);
+}
+
+test "the attached session is marked, the others are not" {
+    var buf: [512]u8 = undefined;
+    ui.setColor(false);
+    const out = compose(&buf, testSessions(), "s-2", 100);
+
+    // Without a mark the bar lists sessions but never says which one you are
+    // looking at, which is the first thing you want to know after switching.
+    //
+    // Matched as whole fragments rather than by byte offset from the label: the
+    // glyphs are multi-byte, and arithmetic on them is exactly the mistake that
+    // made this test wrong the first time.
+    try testing.expect(std.mem.indexOf(u8, out, "*◐ PE-270") != null);
+    try testing.expect(std.mem.indexOf(u8, out, " ● PE-256") != null);
+}
+
+test "a bar never exceeds the width it was given" {
+    ui.setColor(false);
+    // Overflowing wraps, and a wrapped bar scrolls the child's screen — the one
+    // failure mode that corrupts the session rather than just looking wrong.
+    for ([_]usize{ 200, 120, 80, 60, 40, 30, 24, 12, 8, 4 }) |cols| {
+        var buf: [1024]u8 = undefined;
+        const out = compose(&buf, testSessions(), "s-1", cols);
+        if (ui.displayWidth(out) > cols) {
+            std.debug.print("at {d} cols the bar is {d} wide: \"{s}\"\n", .{ cols, ui.displayWidth(out), out });
+            return error.TestExpectedEqual;
+        }
+    }
+}

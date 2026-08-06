@@ -15,8 +15,11 @@
 
 const std = @import("std");
 const Io = std.Io;
+const ansi = @import("ansi.zig");
 const app_mod = @import("app.zig");
 const term = @import("term.zig");
+const sessions_mod = @import("sessions.zig");
+const watch_bar = @import("watch_bar.zig");
 const watch_client = @import("watch_client.zig");
 const wire = @import("wire.zig");
 
@@ -50,6 +53,11 @@ pub const Options = struct {
     /// Replay the scrollback so the screen is repainted on arrival, rather than
     /// staying blank until the agent next prints.
     replay: bool = true,
+    /// Reserve the bottom row for the status bar. The way back out is written
+    /// there, so turning it off is opting out of the only durable reminder.
+    status_bar: bool = true,
+    /// Drawn on the reserved row beside the keys.
+    peers: []const sessions_mod.Session = &.{},
 };
 
 pub fn run(app: app_mod.App, opts: Options) !Outcome {
@@ -62,23 +70,38 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
     // restore the modes lcc set, then undo the ones the *child* set — the
     // program that would normally clean those up is still running, on purpose.
     defer {
-        var out_buf: [512]u8 = undefined;
-        var out_writer: Io.File.Writer = .init(.stdout(), app.io, &out_buf);
+        var exit_buf: [512]u8 = undefined;
+        var out_writer: Io.File.Writer = .init(.stdout(), app.io, &exit_buf);
+        watch_bar.release(&out_writer.interface);
         term.sanitize(&out_writer.interface);
         out_writer.interface.flush() catch {};
         terminal.restore();
         conn.close(app.io);
     }
 
+    var bar_buf: [512]u8 = undefined;
+    var out_buf: [8192]u8 = undefined;
+    var bar_writer: Io.File.Writer = .init(.stdout(), app.io, &out_buf);
+    var scanner: ansi.Scanner = .{};
+
+    // One row shorter than the terminal: the child lays out against what it is
+    // told, so reserving a row means telling it the smaller number.
+    const child_rows = childRows(size.rows, opts.status_bar);
+    if (opts.status_bar) {
+        watch_bar.reserve(&bar_writer.interface, size.rows);
+        bar_writer.interface.flush() catch {};
+    }
+
     try conn.sendControl(app.gpa, .attach, wire.Attach{
         .session_id = opts.session_id,
         .cols = size.cols,
-        .rows = size.rows,
+        .rows = child_rows,
         .replay = opts.replay,
     });
 
     const sock = conn.stream.socket.handle;
     var in_buf: [4096]u8 = undefined;
+    var bar_dirty = opts.status_bar;
 
     while (true) {
         // Re-queried every iteration rather than driven by SIGWINCH, matching
@@ -86,10 +109,23 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
         const now_size = terminal.size();
         if (now_size.rows != size.rows or now_size.cols != size.cols) {
             size = now_size;
+            if (opts.status_bar) {
+                watch_bar.reserve(&bar_writer.interface, size.rows);
+                bar_dirty = true;
+            }
             conn.sendControl(app.gpa, .resize, wire.Resize{
                 .cols = size.cols,
-                .rows = size.rows,
+                .rows = childRows(size.rows, opts.status_bar),
             }) catch return .daemon_gone;
+        }
+
+        if (bar_dirty and opts.status_bar) {
+            watch_bar.draw(
+                &bar_writer.interface,
+                size.rows,
+                watch_bar.compose(&bar_buf, opts.peers, opts.session_id, size.cols),
+            );
+            bar_dirty = false;
         }
 
         var fds = [_]std.posix.pollfd{
@@ -123,12 +159,28 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
                 // Straight to the terminal, unexamined. These bytes are Claude
                 // Code's own rendering and anything that reinterpreted them
                 // would corrupt the screen.
-                .output => writeAll(chunk_stdout, frame.payload),
+                .output => {
+                    writeAll(chunk_stdout, frame.payload);
+                    // Claude Code emits a bare `CSI r` as its second command,
+                    // which hands the reserved row straight back. Watching the
+                    // stream is the only way to know it happened.
+                    if (opts.status_bar and scanner.scan(frame.payload).any()) {
+                        watch_bar.reserve(&bar_writer.interface, size.rows);
+                        bar_dirty = true;
+                    }
+                },
                 .exited => return .ended,
                 else => {},
             };
         }
     }
+}
+
+/// What the child is told the terminal is. One row is kept back for the bar,
+/// and a terminal too short to spare one keeps all of them.
+fn childRows(rows: u16, status_bar: bool) u16 {
+    if (!status_bar or rows < 3) return rows;
+    return rows - 1;
 }
 
 const chunk_stdout: std.posix.fd_t = 1;
@@ -170,6 +222,16 @@ test "a UTF-8 continuation byte can never be mistaken for the detach key" {
 
     const emoji = "🚀 працює";
     try testing.expect(detachAt(emoji) == null);
+}
+
+test "the child is told one row less, unless there is none to spare" {
+    try testing.expectEqual(@as(u16, 39), childRows(40, true));
+    // Opted out: the child gets the whole screen.
+    try testing.expectEqual(@as(u16, 40), childRows(40, false));
+    // Too short to give a row away — taking one here would leave almost nothing
+    // to render into, which looks like a hang rather than a small window.
+    try testing.expectEqual(@as(u16, 2), childRows(2, true));
+    try testing.expectEqual(@as(u16, 1), childRows(1, true));
 }
 
 test "Ctrl-C is not the detach key" {
