@@ -1255,6 +1255,217 @@ test "a registered session runs, echoes, and its output survives a reconnect" {
     }
 }
 
+test "a child that exits tells the attached client instead of leaving it on a dead screen" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("LCC_WATCH_DIR", base);
+    const socket_path = watch_paths.socket(arena, &environ) catch |err| switch (err) {
+        error.SocketPathTooLong => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var daemon_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer daemon_arena.deinit();
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_w: Io.Writer = .fixed(&out_buf);
+    var err_w: Io.Writer = .fixed(&err_buf);
+    const daemon_app: app_mod.App = .{
+        .gpa = daemon_arena.allocator(),
+        .io = io,
+        .environ = &environ,
+        .ui = .{ .io = io, .out = &out_w, .err = &err_w },
+    };
+
+    const thread = try std.Thread.spawn(.{}, runForTest, .{ daemon_app, Options{
+        .foreground = true,
+        .idle_exit_seconds = 3600,
+    } });
+    defer thread.join();
+
+    var budget: i32 = 15_000;
+    while (budget > 0) : (budget -= 50) {
+        if (Io.Dir.cwd().statFile(io, socket_path, .{})) |_| break else |_| {}
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+
+    var conn = try TestConn.open(arena, io, socket_path);
+    defer conn.close();
+    var b: i32 = 15_000;
+    try conn.hello(arena, &b);
+
+    try conn.send(arena, .register, wire.Register{
+        .worktree = base,
+        .branch = "feature/pe-2-exit",
+        .issue = "PE-2",
+        .repo_root = base,
+        .program = "/bin/cat",
+        .argv = &.{},
+        .env = &.{"TERM=dumb"},
+        .cols = 80,
+        .rows = 24,
+    });
+    const body = try wire.parse(wire.Registered, arena, try conn.recv(.registered, &b));
+
+    var attach_conn = try TestConn.open(arena, io, socket_path);
+    defer attach_conn.close();
+    var ab: i32 = 15_000;
+    try attach_conn.send(arena, .hello, wire.Hello{ .role = "attach", .pid = 0 });
+    _ = try attach_conn.recv(.hello, &ab);
+    attach_conn.dec.role = .attach;
+    try attach_conn.send(arena, .attach, wire.Attach{
+        .session_id = body.session_id,
+        .cols = 80,
+        .rows = 24,
+        .replay = true,
+    });
+    _ = try attach_conn.recv(.attached, &ab);
+
+    // Typed first, then ended — the order that matters. Someone types `/exit`
+    // into the agent, so the frame that reports the exit is never the first
+    // thing this client has exchanged.
+    try attach_conn.raw(.input, "hello\n");
+    var echoed: std.ArrayList(u8) = .empty;
+    defer echoed.deinit(gpa);
+    while (ab > 0) {
+        const frame = try attach_conn.recv(.output, &ab);
+        try echoed.appendSlice(gpa, frame.payload);
+        if (std.mem.indexOf(u8, echoed.items, "hello") != null) break;
+    }
+
+    // Ctrl-D at the start of a line: the tty driver hands `cat` EOF and it
+    // exits of its own accord, which is what `/exit` looks like to the daemon.
+    try attach_conn.raw(.input, &.{0x04});
+
+    // The assertion the attach loop's only exit condition rests on. Without
+    // this frame the client polls a session that will never speak again and the
+    // person inside it can do nothing but detach — a hang with no explanation.
+    _ = attach_conn.recv(.exited, &ab) catch |err| {
+        std.debug.print(
+            "no `exited` frame arrived within {d}ms of the child ending: {s}.\n" ++
+                "An attached client has no other way to learn the session is over, " ++
+                "so it sits on the dead screen until the detach key is pressed.\n",
+            .{ 15_000 - ab, @errorName(err) },
+        );
+        return err;
+    };
+
+    try conn.send(arena, .stop, wire.Stop{ .force = true });
+}
+
+test "a grandchild still holding the pty cannot hide the child's exit" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("LCC_WATCH_DIR", base);
+    const socket_path = watch_paths.socket(arena, &environ) catch |err| switch (err) {
+        error.SocketPathTooLong => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var daemon_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer daemon_arena.deinit();
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_w: Io.Writer = .fixed(&out_buf);
+    var err_w: Io.Writer = .fixed(&err_buf);
+    const daemon_app: app_mod.App = .{
+        .gpa = daemon_arena.allocator(),
+        .io = io,
+        .environ = &environ,
+        .ui = .{ .io = io, .out = &out_w, .err = &err_w },
+    };
+
+    const thread = try std.Thread.spawn(.{}, runForTest, .{ daemon_app, Options{
+        .foreground = true,
+        .idle_exit_seconds = 3600,
+    } });
+    defer thread.join();
+
+    var budget: i32 = 15_000;
+    while (budget > 0) : (budget -= 50) {
+        if (Io.Dir.cwd().statFile(io, socket_path, .{})) |_| break else |_| {}
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+
+    var conn = try TestConn.open(arena, io, socket_path);
+    defer conn.close();
+    var b: i32 = 15_000;
+    try conn.hello(arena, &b);
+
+    // Claude Code's real shape, reduced: it leaves MCP servers, shells and
+    // watchers behind it, and every one of them inherits the pty slave. The
+    // master therefore does *not* report EOF when the agent itself exits, so a
+    // daemon that learned about exits only by reading the pty would never learn
+    // about this one. `sleep` outlives `cat` by design.
+    try conn.send(arena, .register, wire.Register{
+        .worktree = base,
+        .branch = "feature/pe-3-grandchild",
+        .issue = "PE-3",
+        .repo_root = base,
+        .program = "/bin/sh",
+        .argv = &.{ "-c", "sleep 30 & exec cat" },
+        .env = &.{"TERM=dumb"},
+        .cols = 80,
+        .rows = 24,
+    });
+    const body = try wire.parse(wire.Registered, arena, try conn.recv(.registered, &b));
+
+    var attach_conn = try TestConn.open(arena, io, socket_path);
+    defer attach_conn.close();
+    var ab: i32 = 15_000;
+    try attach_conn.send(arena, .hello, wire.Hello{ .role = "attach", .pid = 0 });
+    _ = try attach_conn.recv(.hello, &ab);
+    attach_conn.dec.role = .attach;
+    try attach_conn.send(arena, .attach, wire.Attach{
+        .session_id = body.session_id,
+        .cols = 80,
+        .rows = 24,
+        .replay = true,
+    });
+    _ = try attach_conn.recv(.attached, &ab);
+
+    try attach_conn.raw(.input, "hello\n");
+    var echoed: std.ArrayList(u8) = .empty;
+    defer echoed.deinit(gpa);
+    while (ab > 0) {
+        const frame = try attach_conn.recv(.output, &ab);
+        try echoed.appendSlice(gpa, frame.payload);
+        if (std.mem.indexOf(u8, echoed.items, "hello") != null) break;
+    }
+
+    try attach_conn.raw(.input, &.{0x04});
+
+    _ = attach_conn.recv(.exited, &ab) catch |err| {
+        std.debug.print(
+            "no `exited` frame after {d}ms, with a grandchild still holding the pty: {s}.\n" ++
+                "SIGCHLD is the only signal left in this case — the pty stays open — " ++
+                "so an attached client is stranded on a session that has ended.\n",
+            .{ 15_000 - ab, @errorName(err) },
+        );
+        return err;
+    };
+
+    try conn.send(arena, .stop, wire.Stop{ .force = true });
+}
+
 test "a directory sitting on the socket path is a named error, not a panic" {
     const gpa = testing.allocator;
     const io = testing.io;
