@@ -212,7 +212,6 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
     var in_buf: [4096]u8 = undefined;
     var bar_dirty = opts.status_bar;
     var peers = opts.peers;
-    var bar_drawn_at: i64 = 0;
     var peers_at: i64 = 0;
 
     while (true) {
@@ -221,58 +220,13 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
         const now_size = terminal.size();
         if (now_size.rows != size.rows or now_size.cols != size.cols) {
             size = now_size;
-            if (opts.status_bar) {
-                watch_bar.reserve(&bar_writer.interface, size.rows);
-                bar_dirty = true;
-            }
+            if (opts.status_bar) bar_dirty = true;
             conn.sendControl(app.gpa, .resize, wire.Resize{
                 .cols = size.cols,
                 .rows = childRows(size.rows, opts.status_bar),
             }) catch return .daemon_gone;
         }
 
-        if (opts.status_bar) {
-            const at = app_mod.nowSeconds(app.io);
-            // Redrawn on a slow tick, not only when something is known to have
-            // disturbed it. A scroll region confines *scrolling*; it does not
-            // stop the child addressing the last row or erasing the screen
-            // outside it, and neither does anything stop a program lcc never
-            // sees. Repainting a hundred bytes once a second costs nothing and
-            // means the row cannot be lost permanently by a cause nobody
-            // anticipated — which, for the line that tells you how to get out,
-            // is the property that matters.
-            // Never while the child is holding the terminal's one saved-cursor
-            // slot: borrowing it there destroys the position the child will
-            // restore to, and its cursor then lands somewhere it never was.
-            //
-            // Bounded, because a child that saves and forgets would otherwise
-            // cost the bar entirely — after a few seconds it is more honest to
-            // take the slot and be briefly wrong than to leave the way out
-            // unwritten.
-            const child_holds = scanner.cursor_saved and at - bar_drawn_at < 3;
-            if (!child_holds and (bar_dirty or at != bar_drawn_at)) {
-                // The peers go stale otherwise: they were a snapshot taken when
-                // this attach began, and a bar claiming a session is `waiting`
-                // ten minutes after it stopped is worse than one that says
-                // nothing. Refreshed far more slowly than it is drawn — it is a
-                // socket round trip, where the redraw is not.
-                if (at - peers_at >= 2) {
-                    if (watch_client.snapshot(app) catch null) |fresh| peers = fresh;
-                    peers_at = at;
-                }
-                watch_bar.reserve(&bar_writer.interface, size.rows);
-                watch_bar.draw(
-                    &bar_writer.interface,
-                    size.rows,
-                    // One column short of the width. Filling the last cell
-                    // leaves the terminal poised to wrap, and what happens
-                    // next is up to the emulator rather than up to us.
-                    watch_bar.compose(&bar_buf, peers, opts.session_id, size.cols -| 1),
-                );
-                bar_dirty = false;
-                bar_drawn_at = at;
-            }
-        }
 
         var fds = [_]std.posix.pollfd{
             .{ .fd = terminal.fd, .events = std.posix.POLL.IN, .revents = 0 },
@@ -314,6 +268,7 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
                 .replay => {
                     const kept = replay_filter.filter(frame.payload, &filtered);
                     note(dump, app.io, "replay", kept);
+                    paintBar(app, &bar_writer, &bar_buf, opts, &peers, &peers_at, size, &bar_dirty);
                     writeAll(chunk_stdout, kept);
                     if (opts.status_bar and scanner.scan(kept).any()) {
                         watch_bar.reserve(&bar_writer.interface, size.rows);
@@ -322,6 +277,7 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
                 },
                 .output => {
                     note(dump, app.io, "out", frame.payload);
+                    paintBar(app, &bar_writer, &bar_buf, opts, &peers, &peers_at, size, &bar_dirty);
                     writeAll(chunk_stdout, frame.payload);
                     // Claude Code emits a bare `CSI r` as its second command,
                     // which hands the reserved row straight back. Watching the
@@ -336,6 +292,45 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
             };
         }
     }
+}
+
+/// Repaint the reserved row, immediately before the caller writes the child's
+/// own output.
+///
+/// The order is the point. The child's bytes follow within microseconds and
+/// carry its own cursor positioning, so the cursor is never left sitting in the
+/// bar — and nothing here has to know, save, or guess where it was. While the
+/// child is silent this is not called at all: nothing has changed, and a row
+/// nobody has disturbed does not need repainting.
+fn paintBar(
+    app: app_mod.App,
+    writer: *Io.File.Writer,
+    buf: []u8,
+    opts: Options,
+    peers: *[]const sessions_mod.Session,
+    peers_at: *i64,
+    size: term.Size,
+    dirty: *bool,
+) void {
+    if (!opts.status_bar) return;
+    const at = app_mod.nowSeconds(app.io);
+    // Whatever the child last wrote may have reclaimed the scroll region, and
+    // it costs six bytes to be sure.
+    watch_bar.reserve(&writer.interface, size.rows);
+    // A snapshot is a socket round trip, so it is refreshed on its own slow
+    // clock rather than on every burst of output.
+    if (at - peers_at.* >= 2) {
+        if (watch_client.snapshot(app) catch null) |fresh| peers.* = fresh;
+        peers_at.* = at;
+    }
+    watch_bar.draw(
+        &writer.interface,
+        size.rows,
+        // One column short: filling the last cell leaves the terminal poised
+        // to wrap, and what happens then is the emulator's decision, not ours.
+        watch_bar.compose(buf, peers.*, opts.session_id, size.cols -| 1),
+    );
+    dirty.* = false;
 }
 
 /// What the child is told the terminal is. One row is kept back for the bar,
