@@ -265,13 +265,13 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
                 .replay => {
                     const kept = replay_filter.filter(frame.payload, &filtered);
                     note(dump, app.io, "replay", kept);
-                    paintBar(app, &bar_writer, &bar_buf, opts, &peers, &peers_at, size);
                     writeAll(chunk_stdout, kept);
+                    paintBar(app, &bar_writer, &bar_buf, opts, &peers, &peers_at, size);
                 },
                 .output => {
                     note(dump, app.io, "out", frame.payload);
-                    paintBar(app, &bar_writer, &bar_buf, opts, &peers, &peers_at, size);
                     writeAll(chunk_stdout, frame.payload);
+                    paintBar(app, &bar_writer, &bar_buf, opts, &peers, &peers_at, size);
                 },
                 .exited => return .ended,
                 else => {},
@@ -280,14 +280,20 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
     }
 }
 
-/// Repaint the reserved row, immediately before the caller writes the child's
-/// own output.
+/// Repaint the reserved row, immediately *after* the caller has written the
+/// child's own output.
 ///
-/// The order is the point. The child's bytes follow within microseconds and
-/// carry its own cursor positioning, so the cursor is never left sitting in the
-/// bar — and nothing here has to know, save, or guess where it was. While the
-/// child is silent this is not called at all: nothing has changed, and a row
-/// nobody has disturbed does not need repainting.
+/// The order is the whole of it, and both halves matter.
+///
+/// After, not before: Claude Code moves its cursor relatively — `CSI 4A` and
+/// the like — so it renders from wherever the cursor already is. Painting first
+/// left it on the bar row and every relative move that followed was measured
+/// from the wrong place, which is what a misdrawn UI looks like. Painting last
+/// means the cursor is exactly where the child put it when this runs.
+///
+/// Only alongside output, never on a timer: while the child is silent nothing
+/// has changed and nothing has disturbed the row, so a repaint would move the
+/// cursor for no reason and leave it moved until the child next spoke.
 fn paintBar(
     app: app_mod.App,
     writer: *Io.File.Writer,

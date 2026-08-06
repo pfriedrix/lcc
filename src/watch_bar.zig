@@ -37,20 +37,19 @@ pub fn release(out: *Io.Writer) void {
     out.writeAll(term.csi ++ "r") catch {};
 }
 
-/// Paint the reserved row. Leaves the cursor on it, deliberately.
+/// Paint the reserved row and put the cursor back where it was.
 ///
-/// There is no save and no restore here, and that is the whole design. A
-/// terminal has one saved-cursor slot and the child uses it; borrowing it
-/// destroyed the position the child would later return to. Nor is the cursor
-/// worth tracking: the child owns rows 1..n-1, renders correctly inside them,
-/// and positions its own cursor every time it draws.
+/// The save and restore are unavoidable: the child renders with relative cursor
+/// moves, so it has to find the cursor where it left it. What made them harmful
+/// before was *when* they ran — on a one-second timer, including mid-render and
+/// while the child was silent. Called only after a burst of the child's output
+/// has been written, the position being saved is the one the child just chose,
+/// and handing it straight back is exactly right.
 ///
-/// So the rule is not "put the cursor back" but "only take it when the child
-/// is about to want it anyway". The caller paints this immediately before
-/// forwarding a burst of the child's output, and those bytes put the cursor
-/// where the child wants it microseconds later. While the child is silent
-/// nothing repaints the bar, because nothing has changed and there is nothing
-/// to fix.
+/// A terminal has one saved-cursor slot and the child uses it too, so this can
+/// still collide with a DECSC of the child's own that spans two bursts. That is
+/// a narrow window rather than a repeating one, and it is the cost of drawing
+/// on a screen owned by someone else without emulating a terminal to do it.
 pub fn draw(out: *Io.Writer, rows: u16, text: []const u8) void {
     if (rows < 2) return;
     const p = ui.palette();
@@ -62,9 +61,10 @@ pub fn draw(out: *Io.Writer, rows: u16, text: []const u8) void {
     // background reaches the edge without the text having to. Nothing is
     // written after it — a second erase once the cursor sits in the last
     // column is where the trailing characters were going.
-    out.print(term.csi ++ "{d};1H" ++ term.csi ++ "7m" ++ term.csi ++ "2K", .{rows}) catch {};
+    out.print("\x1b7" ++ term.csi ++ "{d};1H" ++ term.csi ++ "7m" ++ term.csi ++ "2K", .{rows}) catch {};
     out.writeAll(text) catch {};
     out.writeAll(p.reset) catch {};
+    out.writeAll("\x1b8") catch {};
     out.flush() catch {};
 }
 
@@ -209,10 +209,11 @@ test "drawing restores the cursor the child left behind" {
     draw(&w, 24, "hello");
     const out = w.buffered();
 
-    // No save and no restore: the slot belongs to the child, and the bytes the
-    // caller writes next are what puts the cursor back.
-    try testing.expect(std.mem.indexOf(u8, out, "\x1b7") == null);
-    try testing.expect(std.mem.indexOf(u8, out, "\x1b8") == null);
+    // Saved first and restored last. The child renders with relative moves, so
+    // it must find the cursor where it left it — a bar that returned it
+    // anywhere else would offset everything drawn next.
+    try testing.expect(std.mem.startsWith(u8, out, "\x1b7"));
+    try testing.expect(std.mem.endsWith(u8, out, "\x1b8"));
     // Jump to the reserved row and clear it before writing, or yesterday's
     // longer text shows through behind today's.
     try testing.expect(std.mem.indexOf(u8, out, term.csi ++ "24;1H") != null);
