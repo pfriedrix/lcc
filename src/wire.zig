@@ -27,12 +27,17 @@ pub const protocol: u32 = 1;
 
 pub const header_len = 5;
 
+/// One cap for every frame, on both connections.
+///
 /// A full repaint at 200x60 with colour runs about 50 KB, so one repaint is one
-/// frame and the sender splits anything larger.
-pub const max_data_payload = 64 * 1024;
-/// Only a snapshot of many sessions needs this. Past it the daemon truncates
-/// the list and says so, rather than failing.
-pub const max_control_payload = 256 * 1024;
+/// frame and the sender splits anything larger. A snapshot is the only control
+/// frame that could want more, and at the daemon's session cap it comes to
+/// roughly 26 KB — so a second, larger cap would buy nothing and cost the thing
+/// that matters: a client's decoder buffer has to be sized at `accept`, before
+/// `hello` has said which role the connection is. One size removes that
+/// ordering problem entirely. Past the cap the daemon truncates the session
+/// list and says so, rather than failing.
+pub const max_payload = 64 * 1024;
 
 pub const Error = error{
     FrameTooLarge,
@@ -60,6 +65,8 @@ pub const Type = enum(u8) {
     subscribe = 0x12,
     kill = 0x13,
     stop = 0x14,
+    /// A Claude Code hook reporting what a session is doing, keyed by cwd.
+    hook = 0x15,
 
     snapshot = 0x20,
     event = 0x21,
@@ -88,6 +95,7 @@ pub fn known(t: Type) bool {
         .subscribe,
         .kill,
         .stop,
+        .hook,
         .snapshot,
         .event,
         .registered,
@@ -115,27 +123,9 @@ pub fn allowedOn(t: Type, role: Role) bool {
     };
 }
 
-/// The cap for a frame of this type.
-///
-/// Every type that can reach an *attach* connection takes the smaller cap,
-/// including `hello` and `err`, which travel on both. That is not tidiness: an
-/// attach connection's decoder buffer is sized for data frames, and a protocol
-/// that permitted a 256 KB frame there would permit one that cannot fit the
-/// buffer it must land in. The test at the bottom pins the rule rather than
-/// trusting this switch to stay in step with `allowedOn`.
-pub fn maxFor(t: Type) usize {
-    return switch (t) {
-        .register, .list, .subscribe, .kill, .stop, .snapshot, .event, .registered => max_control_payload,
-        else => max_data_payload,
-    };
-}
-
-/// The buffer a decoder for this role must be given.
-pub fn bufferLen(role: Role) usize {
-    return switch (role) {
-        .control => max_control_payload + header_len,
-        .attach => max_data_payload + header_len,
-    };
+/// The buffer every decoder must be given, whatever its role.
+pub fn bufferLen() usize {
+    return max_payload + header_len;
 }
 
 pub const Frame = struct {
@@ -162,14 +152,14 @@ pub fn decodeHeader(bytes: *const [header_len]u8) Error!struct { type: Type, len
     // length is whatever the peer wrote, and `Io.Reader.take(n)` past its
     // buffer *panics* rather than erroring — over a raw-mode terminal that is a
     // stack trace across someone's session.
-    if (len > maxFor(t)) return Error.FrameTooLarge;
+    if (len > max_payload) return Error.FrameTooLarge;
     return .{ .type = t, .len = len };
 }
 
 /// Header and payload in one call, so a reader can never observe a header
 /// without the body behind it.
 pub fn writeFrame(w: *Io.Writer, t: Type, payload: []const u8) (Io.Writer.Error || Error)!void {
-    if (payload.len > maxFor(t)) return Error.FrameTooLarge;
+    if (payload.len > max_payload) return Error.FrameTooLarge;
     const header = encodeHeader(t, @intCast(payload.len));
     try w.writeAll(&header);
     try w.writeAll(payload);
@@ -213,7 +203,7 @@ pub const Decoder = struct {
     role: Role,
 
     pub fn init(buf: []u8, role: Role) Error!Decoder {
-        if (buf.len < bufferLen(role)) return Error.ShortBuffer;
+        if (buf.len < bufferLen()) return Error.ShortBuffer;
         return .{ .buf = buf, .role = role };
     }
 
@@ -307,7 +297,7 @@ pub const Snapshot = struct {
     daemon_pid: i32,
     protocol: u32,
     sessions: []const sessions.Session,
-    /// Set when the list was cut to fit `max_control_payload`. A contract, not
+    /// Set when the list was cut to fit `max_payload`. A contract, not
     /// a failure — a caller that sees it knows the view is partial.
     truncated: bool,
 };
@@ -339,6 +329,15 @@ pub const Attached = struct {
 };
 
 pub const Resize = struct { cols: u16, rows: u16 };
+
+/// What `lcc watch-hook` forwards. `cwd` is the worktree, which is already the
+/// key the daemon files sessions under — so a hook needs no session id from
+/// lcc's side and no correlation table to keep in step.
+pub const Hook = struct {
+    cwd: []const u8,
+    session_id: []const u8,
+    event: []const u8,
+};
 pub const Kill = struct { session_id: []const u8, signal: []const u8 };
 pub const Stop = struct { force: bool };
 pub const Exited = struct { session_id: []const u8, exit_code: ?i32, signal: ?i32 };
@@ -360,29 +359,24 @@ test "a length past the cap is refused before anything is sized from it" {
     // The length field is whatever the peer wrote. `Io.Reader.take(n)` beyond
     // its buffer panics rather than erroring, so this check is what stands
     // between a hostile or buggy length and a stack trace over a raw terminal.
-    var head = encodeHeader(.output, max_data_payload + 1);
+    var head = encodeHeader(.output, max_payload + 1);
     try std.testing.expectError(Error.FrameTooLarge, decodeHeader(&head));
 
     head = encodeHeader(.output, std.math.maxInt(u32));
     try std.testing.expectError(Error.FrameTooLarge, decodeHeader(&head));
 
     // Exactly at the cap is fine — an off-by-one here would drop full repaints.
-    head = encodeHeader(.output, max_data_payload);
+    head = encodeHeader(.output, max_payload);
     _ = try decodeHeader(&head);
 }
 
-test "every frame that can reach an attach connection fits an attach buffer" {
-    // The invariant that keeps `bufferLen` honest. Without it, adding a large
-    // control frame that also travels on the attach connection would permit a
-    // frame the receiving buffer cannot hold — which is not a recoverable
-    // error, it is a protocol that contradicts its own buffer sizing.
-    for (std.enums.values(Type)) |t| {
-        if (!known(t)) continue;
-        if (!allowedOn(t, .attach)) continue;
-        try std.testing.expect(maxFor(t) + header_len <= bufferLen(.attach));
-    }
-    // And the larger cap is actually reachable somewhere, or it is dead weight.
-    try std.testing.expectEqual(max_control_payload, maxFor(.snapshot));
+test "every frame the protocol permits fits the buffer every decoder is given" {
+    // The invariant that keeps `bufferLen` honest: a frame larger than the
+    // buffer it must land in is not a recoverable error, it is a protocol
+    // contradicting its own sizing. One cap makes this trivially true — the
+    // test stays because the property is what matters, not the arithmetic, and
+    // reintroducing a per-type cap would have to keep it.
+    try std.testing.expect(max_payload + header_len <= bufferLen());
 }
 
 test "role separation rejects a frame that arrived on the wrong connection" {
@@ -394,7 +388,7 @@ test "role separation rejects a frame that arrived on the wrong connection" {
     try std.testing.expect(!allowedOn(.output, .control));
 
     // And the decoder enforces it, rather than leaving it to each call site.
-    var buf: [bufferLen(.attach)]u8 = undefined;
+    var buf: [bufferLen()]u8 = undefined;
     var dec = try Decoder.init(&buf, .attach);
     try dec.push(&encodeHeader(.list, 0));
     try std.testing.expectError(Error.WrongRole, dec.next());
@@ -419,7 +413,7 @@ test "the decoder reassembles frames split at every possible byte offset" {
 
     var split: usize = 1;
     while (split < stream.items.len) : (split += 1) {
-        var buf: [bufferLen(.attach)]u8 = undefined;
+        var buf: [bufferLen()]u8 = undefined;
         var dec = try Decoder.init(&buf, .attach);
 
         var got: usize = 0;
@@ -437,7 +431,7 @@ test "the decoder reassembles frames split at every possible byte offset" {
 }
 
 test "a zero-length payload is an empty slice, not a missing frame" {
-    var buf: [bufferLen(.attach)]u8 = undefined;
+    var buf: [bufferLen()]u8 = undefined;
     var dec = try Decoder.init(&buf, .attach);
 
     // `detach` carries nothing. If an empty payload read as "need more bytes"
@@ -451,12 +445,13 @@ test "a zero-length payload is an empty slice, not a missing frame" {
 }
 
 test "a decoder given too small a buffer says so instead of overflowing later" {
+    // The mistake this catches is sizing a decoder by hand and getting it
+    // wrong — the buffer has to hold the largest frame the protocol permits, or
+    // a legal frame arrives and cannot be assembled.
     var small: [16]u8 = undefined;
     try std.testing.expectError(Error.ShortBuffer, Decoder.init(&small, .attach));
-    // A control decoder needs the larger buffer, and an attach-sized one is not
-    // enough — the mistake this catches is reusing one buffer for both roles.
-    var attach_sized: [bufferLen(.attach)]u8 = undefined;
-    try std.testing.expectError(Error.ShortBuffer, Decoder.init(&attach_sized, .control));
+    var one_short: [max_payload + header_len - 1]u8 = undefined;
+    try std.testing.expectError(Error.ShortBuffer, Decoder.init(&one_short, .control));
 }
 
 test "writeFrame emits the header and the body as one unit" {
@@ -486,7 +481,7 @@ test "writeFrame emits the header and the body as one unit" {
 test "writeFrame refuses an oversized payload rather than emitting a bad length" {
     var buf: [64]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
-    const huge = try std.testing.allocator.alloc(u8, max_data_payload + 1);
+    const huge = try std.testing.allocator.alloc(u8, max_payload + 1);
     defer std.testing.allocator.free(huge);
     @memset(huge, 'x');
     try std.testing.expectError(Error.FrameTooLarge, writeFrame(&w, .output, huge));

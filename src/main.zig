@@ -4,6 +4,7 @@ const Io = std.Io;
 const app_mod = @import("app.zig");
 const auth_cmd = @import("commands/auth.zig");
 const clean_cmd = @import("commands/clean.zig");
+const daemon_cmd = @import("commands/daemon.zig");
 const issue_cmd = @import("commands/issue.zig");
 const list_cmd = @import("commands/list.zig");
 const open_cmd = @import("commands/open.zig");
@@ -11,6 +12,7 @@ const remove_cmd = @import("commands/remove.zig");
 const setup_cmd = @import("commands/setup.zig");
 const start_cmd = @import("commands/start.zig");
 const stats_cmd = @import("commands/stats.zig");
+const watch_cmd = @import("commands/watch.zig");
 const config = @import("config.zig");
 const ui = @import("ui.zig");
 
@@ -33,6 +35,18 @@ const usage =
     \\    --plan <file>          start from a plan that already exists instead of
     \\                           opening in plan mode — reaches the agent as {plan}
     \\                           in startTaskCommand, as a path, not inlined
+    \\    --watch                hand the session to the lcc daemon instead of taking
+    \\                           over this terminal — it then survives the terminal
+    \\                           closing, and `lcc watch` shows it
+    \\    --no-attach            with --watch, print the session id and exit
+    \\  watch                    What the daemon is running
+    \\    --json                 print the sessions instead of a table
+    \\  daemon                   Run or control the session daemon
+    \\    --foreground           stay attached to this terminal
+    \\    --stop                 ask a running daemon to exit
+    \\      --force              kill its sessions rather than letting them finish
+    \\    --status               whether one is running, and how many sessions
+    \\    --json                 with --status, print it instead of a summary
     \\  issue <sub> PE-N         Read or write one Linear issue — no repository needed
     \\    show                   state, project, labels and description — read-only
     \\    state "<name>"         move it, by the team's own workflow-state name
@@ -138,6 +152,9 @@ fn dispatch(app: app_mod.App, args: []const []const u8) !void {
     if (eq(first, "issue")) return issueCommand(app, args[1..]);
     if (eq(first, "start")) return startCommand(app, args[1..]);
     if (eq(first, "stats")) return statsCommand(app, args[1..]);
+    if (eq(first, "watch")) return watchCommand(app, args[1..]);
+    if (eq(first, "watch-hook")) return watchHookCommand(app, args[1..]);
+    if (eq(first, "daemon")) return daemonCommand(app, args[1..]);
     if (std.mem.startsWith(u8, first, "-")) return error.UnknownOption;
     return error.UnknownCommand;
 }
@@ -163,6 +180,10 @@ fn startCommand(app: app_mod.App, args: []const []const u8) !void {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.plan = args[i];
+        } else if (eq(arg, "--watch")) {
+            opts.watch = true;
+        } else if (eq(arg, "--no-attach")) {
+            opts.no_attach = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownOption;
         } else if (opts.issue == null) {
@@ -393,6 +414,61 @@ fn cleanCommand(app: app_mod.App, args: []const []const u8) !void {
     return clean_cmd.run(app, opts);
 }
 
+fn watchCommand(app: app_mod.App, args: []const []const u8) !void {
+    var opts: watch_cmd.Opts = .{};
+    for (args) |arg| {
+        if (eq(arg, "--json")) {
+            opts.json = true;
+        } else return error.UnknownOption;
+    }
+
+    // stdout belongs to the payload in machine mode, same as `start --json`.
+    var machine = app;
+    machine.ui.divert = opts.json;
+    return watch_cmd.run(machine, opts);
+}
+
+fn watchHookCommand(app: app_mod.App, args: []const []const u8) !void {
+    var opts: watch_cmd.HookOpts = .{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (eq(args[i], "--socket")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.socket = args[i];
+        } else if (eq(args[i], "--event")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.event = args[i];
+        } else return error.UnknownOption;
+    }
+    // Never fails. A Claude Code hook runs on every turn of every watched
+    // session, and one that could report an error would be one that could
+    // disturb the work it exists only to observe.
+    watch_cmd.hook(app, opts) catch {};
+}
+
+fn daemonCommand(app: app_mod.App, args: []const []const u8) !void {
+    var opts: daemon_cmd.Opts = .{};
+    for (args) |arg| {
+        if (eq(arg, "--foreground")) {
+            opts.foreground = true;
+        } else if (eq(arg, "--stop")) {
+            opts.stop = true;
+        } else if (eq(arg, "--force")) {
+            opts.force = true;
+        } else if (eq(arg, "--status")) {
+            opts.status = true;
+        } else if (eq(arg, "--json")) {
+            opts.json = true;
+        } else return error.UnknownOption;
+    }
+
+    var machine = app;
+    machine.ui.divert = opts.json;
+    return daemon_cmd.run(machine, opts);
+}
+
 fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
@@ -428,11 +504,14 @@ test {
     _ = @import("ui.zig");
     _ = @import("usage.zig");
     _ = @import("usage_cache.zig");
+    _ = @import("watch_client.zig");
     _ = @import("watch_hooks.zig");
     _ = @import("watch_paths.zig");
+    _ = @import("watch_session.zig");
     _ = @import("watch_status.zig");
     _ = @import("wire.zig");
     _ = @import("xcode.zig");
+    _ = @import("commands/daemon.zig");
     _ = @import("commands/issue.zig");
     _ = @import("commands/list.zig");
     _ = @import("commands/remove.zig");
@@ -440,6 +519,7 @@ test {
     _ = @import("commands/start.zig");
     _ = @import("commands/start_plan_test.zig");
     _ = @import("commands/stats.zig");
+    _ = @import("commands/watch.zig");
 }
 
 fn describe(err: anyerror) []const u8 {
