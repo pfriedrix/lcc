@@ -104,6 +104,7 @@ already there, starting one if not.
   ISSUE   STATUS        BRANCH                              AGE
 ❯ PE-256  ● waiting     feature/pe-256-app-hangs-on-launch  4s
   PE-270  ◐ active      feature/pe-270-crash-in-mapview     12s
+  PE-301  ◈ plan        feature/pe-301-widget-refresh       31s
   PE-9    · no session  feature/pe-9-unrelated              —
 
   ↑↓ move · enter opens · n new issue · x kill · q quit
@@ -126,6 +127,13 @@ is unchanged and still opens a worktree in Xcode.
 prompt or a question. `◐ active` is a turn in flight, `○ idle` is finished.
 Those come from Claude Code's own hooks rather than from reading its screen, so
 a new Claude Code release cannot quietly make them wrong.
+
+`◈ plan` is a turn in flight too, in Claude Code's plan mode — it is researching
+and writing a plan, and has not been approved to touch any files yet. Since
+`planMode` defaults to on, every session starts there and leaves when you
+approve the plan, so the marker going away is the useful half of it. A session
+that is *blocked* on that approval reads `● waiting`, not `◈ plan`: the prompt
+in front of you outranks the mode behind it.
 
 Enter attaches, and from there the terminal is entirely Claude Code's — lcc
 writes nothing of its own over it. **`^\` returns to the dashboard** without

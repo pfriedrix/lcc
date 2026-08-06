@@ -48,7 +48,7 @@ pub const Row = struct {
     pub fn attachable(self: Row) bool {
         if (self.session_id == null) return false;
         return switch (self.status orelse return false) {
-            .starting, .active, .waiting, .idle, .orphan => true,
+            .starting, .active, .plan, .waiting, .idle, .orphan => true,
             .exited, .unknown => false,
         };
     }
@@ -62,6 +62,9 @@ fn glyph(status: ?sessions.Status) []const u8 {
     return switch (status orelse return "·") {
         .waiting => "●",
         .active => "◐",
+        // The only glyph here that is not a circle, because plan mode is the
+        // only one of these that is not a point in the lifecycle.
+        .plan => "◈",
         .idle => "○",
         .starting => "◌",
         .exited => "✗",
@@ -74,6 +77,9 @@ fn paint(status: ?sessions.Status, palette: ui.Palette) []const u8 {
     return switch (status orelse return palette.dim) {
         .waiting => palette.yellow,
         .active => palette.green,
+        // Its own colour, not `active`'s: the whole reason the row says `plan`
+        // is that those two are different answers to "can it touch my files".
+        .plan => palette.cyan,
         .orphan => palette.yellow,
         .exited => palette.red,
         .idle, .starting, .unknown => palette.dim,
@@ -445,9 +451,38 @@ test "a row is attachable only when something is actually behind it" {
     row.status = .orphan;
     try testing.expect(row.attachable());
 
+    // A session still writing its plan is very much running, and Enter on it
+    // should attach rather than try to start a second one in the same worktree.
+    row.status = .plan;
+    try testing.expect(row.attachable());
+
     row.status = null;
     row.session_id = null;
     try testing.expect(!row.attachable());
+}
+
+test "a planning row says plan, not active" {
+    var buf: [4096]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    ui.setColor(false);
+
+    const rows = [_]Row{.{
+        .key = "/w",
+        .session_id = "s-1",
+        .status = .plan,
+        .issue = "PE-256",
+        .branch = "feature/pe-256",
+        .worktree = "/w",
+        .last_activity_at = 900,
+        .exit_code = null,
+        .stale = false,
+    }};
+    _ = render(&w, &rows, fit(measure(&rows), 120), 120, "/w", 1000);
+
+    // The distinction the status is for: this agent has not been approved to
+    // touch files, and a row reading `active` would say the opposite.
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "◈ plan") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "active") == null);
 }
 
 test "a worktree with nothing running shows no age, not one measured from the epoch" {

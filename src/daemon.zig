@@ -639,7 +639,7 @@ fn handleFrame(loop: *Loop, client: *Client, frame: wire.Frame, at: i64) void {
             // session it did not start — ignored rather than an error, so a
             // stale hook config cannot make anything fail.
             const session = loop.findByWorktree(body.cwd) orelse return;
-            if (session.note(event, at)) loop.dirty = true;
+            if (session.note(event, body.permission_mode, at)) loop.dirty = true;
         },
         .attach => attachClient(loop, client, frame),
         .detach => detachClient(loop, client),
@@ -702,7 +702,10 @@ fn registerSession(loop: *Loop, client: *Client, frame: wire.Frame, at: i64) voi
     loop.sendControl(client, .registered, wire.Registered{
         .session_id = id,
         .pid = @intCast(session.pid),
-        .status = @tagName(session.status),
+        // `shown`, like every other status that leaves this process. It is
+        // always `starting` here, but a second spelling of "what a reader is
+        // told" is how the two answers drift apart later.
+        .status = @tagName(session.shown()),
         .started_at = session.started_at,
     });
 }
@@ -1251,6 +1254,25 @@ test "a registered session runs, echoes, and its output survives a reconnect" {
         const after = try conn.recv(.snapshot, &b);
         const after_view = try wire.parse(wire.Snapshot, arena, after);
         try testing.expectEqualStrings("waiting", after_view.sessions[0].status);
+
+        // And the mode rides the same frame. The unit tests prove the payload
+        // parses and prove the projection; only this proves the field survives
+        // the socket and reaches the session the cwd names.
+        try conn.send(arena, .hook, wire.Hook{
+            .cwd = base,
+            .session_id = "irrelevant",
+            .event = "active",
+            .permission_mode = "plan",
+        });
+        waited = 5_000;
+        while (waited > 0) : (waited -= 100) {
+            try conn.send(arena, .list, .{});
+            const snap = try conn.recv(.snapshot, &b);
+            const view = try wire.parse(wire.Snapshot, arena, snap);
+            if (std.mem.eql(u8, view.sessions[0].status, "plan")) break;
+            io.sleep(.fromMilliseconds(100), .awake) catch {};
+        }
+        try testing.expect(waited > 0);
     }
 
     // Everything above is gone — both connections closed, as if the terminal
@@ -1392,13 +1414,13 @@ test "a hook reports to the socket it was handed, not to the one its environment
     // Without a socket there is nothing to fall back to but that environment,
     // and the report is lost. Asserted so the fallback stays a fallback: if this
     // ever starts landing, the test above it has stopped proving anything.
-    watch_client.report(hook_app, null, base, "s", "waiting");
+    watch_client.report(hook_app, null, base, "s", "waiting", "");
     io.sleep(.fromMilliseconds(300), .awake) catch {};
     try testing.expectEqualStrings("starting", try statusNow(&conn, arena, &b));
 
     // Handed the daemon's own socket, exactly as `watch_hooks.settingsJson`
     // writes it, the same report lands.
-    watch_client.report(hook_app, socket_path, base, "s", "waiting");
+    watch_client.report(hook_app, socket_path, base, "s", "waiting", "");
     var waited: i32 = 5_000;
     while (waited > 0) : (waited -= 100) {
         if (std.mem.eql(u8, try statusNow(&conn, arena, &b), "waiting")) break;

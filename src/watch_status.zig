@@ -6,6 +6,14 @@
 //!
 //! The daemon owns `exited` — `waitpid` answers it, not a hook, because a
 //! process that died in a way that skipped `SessionEnd` still died.
+//!
+//! Plan mode is *projected* here rather than applied. It is a mode, not a
+//! transition: nothing fires when a plan is approved — the next hook that
+//! carries a `permission_mode` simply reports a different one. Modelling it as
+//! a state would put a "which mode am I in" question inside `apply` and a
+//! "does this decay" question inside `decay`, to describe something neither of
+//! them drives. So the session keeps its lifecycle status, carries plan mode
+//! beside it, and `present` decides what the two of them add up to.
 
 const std = @import("std");
 const sessions = @import("sessions.zig");
@@ -56,6 +64,31 @@ pub fn decay(current: Status, seconds_since_event: i64) Status {
 /// arrived. `now` is a parameter so this stays pure and its tests use literals.
 pub fn resolve(current: Status, last_event_at: i64, now: i64) Status {
     return decay(current, now - last_event_at);
+}
+
+/// The lifecycle status and plan mode, combined into the one thing a row shows.
+///
+/// Only `active` and `idle` give way. The rest outrank plan mode, each for its
+/// own reason:
+///
+/// `waiting` because it is the only status that means "go here now", and the
+/// moment plan mode matters most — the approval prompt at the end of a plan —
+/// *is* a permission prompt. Showing `plan` there would replace the signal the
+/// dashboard exists for with a restatement of something the user already knows.
+///
+/// `exited` and `orphan` because they are facts about the process and the
+/// worktree rather than about what the agent is doing, and `unknown` because it
+/// means nothing on disk can be believed — including this.
+///
+/// `starting` because it means the child has not produced a byte yet, which
+/// plan mode does not contradict; it lasts under a second, and its own decay
+/// runs off the lifecycle field either way.
+pub fn present(current: Status, plan: bool) Status {
+    if (!plan) return current;
+    return switch (current) {
+        .active, .idle => .plan,
+        .starting, .waiting, .exited, .orphan, .unknown, .plan => current,
+    };
 }
 
 const testing = std.testing;
@@ -123,5 +156,44 @@ test "every hook event maps to a status a session can actually be in" {
         const status = apply(.starting, event);
         try testing.expect(status != .unknown);
         try testing.expect(status != .orphan);
+        // Nor `plan`, which is derived rather than reported. Routing an event
+        // to it here would compile and would put a mode into the lifecycle
+        // field, where the decay and the `exited` guard would then have to
+        // reason about it — the thing `present` exists to avoid.
+        try testing.expect(status != .plan);
+    }
+}
+
+test "plan mode replaces working, and never replaces being blocked" {
+    // The two that give way. `lcc start` launches every session in plan mode,
+    // so "a turn is in flight" is nearly always true and nearly never the thing
+    // worth a column; "has this been approved to touch files" is.
+    try testing.expectEqual(Status.plan, present(.active, true));
+    try testing.expectEqual(Status.plan, present(.idle, true));
+
+    // The one that must not. `waiting` is the only status meaning "go here
+    // now", and the approval prompt at the end of a plan is a permission
+    // prompt — precisely where showing `plan` would trade the signal the
+    // dashboard exists for against a restatement of what the user just did.
+    try testing.expectEqual(Status.waiting, present(.waiting, true));
+
+    // Facts about the process and the worktree, not about what the agent is
+    // doing. A dead session in plan mode is dead, and one whose worktree was
+    // deleted is still the row most worth seeing.
+    try testing.expectEqual(Status.exited, present(.exited, true));
+    try testing.expectEqual(Status.orphan, present(.orphan, true));
+    // `unknown` means nothing on disk can be believed, and that includes the
+    // mode the same file reported.
+    try testing.expectEqual(Status.unknown, present(.unknown, true));
+    // And the child has not spoken yet, which plan mode does not contradict.
+    try testing.expectEqual(Status.starting, present(.starting, true));
+}
+
+test "without plan mode, present changes nothing at all" {
+    // The property that lets every existing caller keep its behaviour: for a
+    // session that is not planning this is the identity, so nothing about the
+    // other six statuses moved when `plan` was added.
+    for ([_]Status{ .starting, .active, .waiting, .idle, .plan, .exited, .orphan, .unknown }) |status| {
+        try testing.expectEqual(status, present(status, false));
     }
 }

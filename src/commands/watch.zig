@@ -660,7 +660,7 @@ pub fn hook(app: app_mod.App, opts: HookOpts) !void {
     // `opts.socket`, not the environment: the daemon baked its own socket into
     // this command line, and the environment here is the session's — whichever
     // shell started it. See `watch_client.connectAt`.
-    watch_client.report(app, opts.socket, payload.cwd, payload.session_id, event);
+    watch_client.report(app, opts.socket, payload.cwd, payload.session_id, event, payload.permission_mode);
 }
 
 test "the --json keys name sessions, never the process behind them" {

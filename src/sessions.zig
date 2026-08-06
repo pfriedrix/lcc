@@ -27,6 +27,17 @@ pub const Status = enum {
     active,
     waiting,
     idle,
+    /// Working, but still in Claude Code's plan mode — it has not been approved
+    /// to touch files yet.
+    ///
+    /// A *mode* rather than a point in the lifecycle, and it sits in this enum
+    /// anyway because the column has one slot and this is the more useful thing
+    /// to put in it: `lcc start` launches every session in plan mode, so the
+    /// question a row has to answer is not "is a turn in flight" — it nearly
+    /// always is — but "has this one been let loose yet". It displaces `active`
+    /// and `idle` only. See `watch_status.present` for what it must never
+    /// displace and why.
+    plan,
     exited,
     /// The worktree is gone from disk but the agent is still running in it.
     orphan,
@@ -461,6 +472,11 @@ test "a worktree that is gone reads as orphan, and the row stays" {
             // An exited session's worktree being gone is ordinary cleanup, not
             // an orphan — there is no agent left to be stranded.
             .{ .id = "s-done", .worktree = try std.fs.path.join(arena, &.{ base, "removed" }), .status = "exited" },
+            // Still planning, and the directory it was planning in is gone. The
+            // reader's verdict has to win over the daemon's here as much as it
+            // does for `active` — an agent stranded in a deleted worktree is
+            // stranded whatever mode it is in.
+            .{ .id = "s-plan", .worktree = try std.fs.path.join(arena, &.{ base, "removed" }), .status = "plan" },
         },
     };
 
@@ -468,6 +484,15 @@ test "a worktree that is gone reads as orphan, and the row stays" {
     try testing.expectEqual(Status.active, rows[0].status);
     try testing.expectEqual(Status.orphan, rows[1].status);
     try testing.expectEqual(Status.exited, rows[2].status);
+    try testing.expectEqual(Status.orphan, rows[3].status);
+}
+
+test "plan round-trips as text, like every other status" {
+    // Stored as TEXT, so the tag order stays an implementation detail — adding
+    // `plan` in the middle of the enum must not repaint rows already on disk.
+    const s: Session = .{ .status = "plan" };
+    try testing.expectEqual(Status.plan, s.parsedStatus());
+    try testing.expectEqualStrings("plan", Status.plan.label());
 }
 
 test "owning matches the worktree and what is inside it, never a sibling prefix" {
