@@ -125,6 +125,20 @@ pub fn selfPath(gpa: std.mem.Allocator, io: Io) ![]const u8 {
     return Io.Dir.cwd().realPathFileAlloc(io, raw, gpa) catch gpa.dupe(u8, raw);
 }
 
+/// When the running binary was last written, in whole seconds.
+///
+/// Null when it cannot be determined, and callers must treat that as "no
+/// opinion": the one thing this feeds is a warning, and a warning invented from
+/// a failed stat is worse than none.
+pub fn selfModified(gpa: std.mem.Allocator, io: Io) ?i64 {
+    const path = selfPath(gpa, io) catch return null;
+    const info = Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+    // Nanoseconds are `i96` at the source, and seconds are what the registry
+    // records its own timestamps in — comparing the two needs one unit.
+    const ns = std.math.cast(i64, info.mtime.nanoseconds) orelse return null;
+    return @divFloor(ns, std.time.ns_per_s);
+}
+
 /// Combined output, trimmed — for error messages that should quote what the
 /// failing command said.
 pub fn message(out: Output) []const u8 {

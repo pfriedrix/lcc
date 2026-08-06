@@ -150,6 +150,14 @@ closing the pty revokes it and the agent gets a hangup, the same property tmux
 has. And `lcc remove` does not yet check whether a worktree has a live session
 in it, so check `lcc watch` before removing one.
 
+A daemon outlives rebuilds. It holds the image it started with, so after
+`zig build` the daemon answering you can be many commits behind the `lcc` that
+is asking — same path, same protocol, older behaviour, and every symptom of it
+looks like a bug in the new code. The dashboard says so when it happens
+(`daemon_outdated` in `--json`). It retires itself 30 minutes after the last
+session ends; `lcc daemon --stop` is immediate but signals every session's
+process group, which ends them.
+
 Turn the whole thing off with `lcc config watchByDefault false`, or per
 invocation with `lcc start --no-watch`. Either way `lcc start` goes back to
 running Claude Code in the terminal it was called from. If the daemon cannot be

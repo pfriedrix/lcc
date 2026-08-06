@@ -174,6 +174,41 @@ pub const Resolved = struct {
 /// debounce, so ordinary quiet does not read as staleness.
 pub const stale_after_seconds: i64 = 10;
 
+/// Whether the running daemon is an *older build* than the binary asking.
+///
+/// A different question from `Resolved.stale`, which is about how recently the
+/// file was written. This one is about code: a daemon outlives many rebuilds,
+/// and a `zig build` replaces the file on disk without touching the image the
+/// running process already exec'd. So the daemon can be hours of commits behind
+/// the client talking to it, on the same path, at the same `protocol`.
+///
+/// It is worth a warning because of how that failure presents. A daemon from
+/// before `announceExit` reaps its children and records `exited` in this very
+/// file — so every reader looks correct — while never telling an attached
+/// client its session is over. The client then polls a pty that will never
+/// speak again and the only way out is the detach key, with nothing on screen
+/// to say why. Hours were spent looking for that bug in code that was already
+/// fixed.
+///
+/// `started_at` rather than a build stamp the daemon writes, because this has to
+/// work on the daemons already running when it ships — one of which is what
+/// prompted it. The cost is precision: a rebuild that changed nothing still
+/// counts, and the answer is a hint, never a refusal.
+pub fn daemonOutdated(state: State, binary_modified: ?i64) bool {
+    const built = binary_modified orelse return false;
+    const daemon = state.daemon orelse return false;
+    // A registry from a build that did not record it. Silence beats a warning
+    // derived from a zero.
+    if (daemon.started_at == 0) return false;
+    // The daemon block outlives the daemon: it is whatever the last one wrote,
+    // and it is still sitting there after the process is gone. Asked here rather
+    // than left to each caller, because the first version left it to callers and
+    // promptly reported an outdated daemon beside `daemon_running: false` —
+    // which reads as two contradictory facts rather than one absent one.
+    if (!alive(state)) return false;
+    return built > daemon.started_at;
+}
+
 /// What a reader may believe, given who wrote the file and when.
 ///
 /// Readers never re-derive a status from timestamps: the daemon computed it
@@ -371,6 +406,40 @@ test "staleness is reported past the window, and a backwards clock is not freshn
     try testing.expect((try resolved(arena, io, state, 1000 + stale_after_seconds + 1))[0].stale);
     // A clock that jumped backwards must not read as infinitely fresh.
     try testing.expect(!(try resolved(arena, io, state, 900))[0].stale);
+}
+
+test "a daemon started before this binary was built is reported as the older build" {
+    // This process, so the liveness check has something real to find.
+    const running: State = .{ .daemon = .{ .pid = @intCast(std.c.getpid()), .started_at = 1_000 } };
+
+    // The case that cost hours: the daemon predates the fix in the binary now
+    // talking to it, and every other signal — the registry, the statuses, the
+    // protocol number — looks perfectly healthy.
+    try testing.expect(daemonOutdated(running, 1_001));
+    // Built before it started, which is the ordinary state of affairs.
+    try testing.expect(!daemonOutdated(running, 999));
+    // Same second: not evidence of anything, and a warning wants evidence.
+    try testing.expect(!daemonOutdated(running, 1_000));
+}
+
+test "nothing is out of date when there is no daemon to be out of date" {
+    const pid: i32 = @intCast(std.c.getpid());
+
+    // No daemon block at all.
+    try testing.expect(!daemonOutdated(.{}, 5_000));
+
+    // The block a dead daemon left behind. Every timestamp still says "older
+    // build", and saying so beside `daemon_running: false` gives a reader two
+    // facts that contradict each other instead of one that is simply absent.
+    try testing.expect(!daemonOutdated(.{ .daemon = .{ .pid = 0, .started_at = 1 } }, 5_000));
+
+    // A stat that failed. Inventing a warning from that would train people to
+    // ignore the one case it exists for.
+    try testing.expect(!daemonOutdated(.{ .daemon = .{ .pid = pid, .started_at = 1 } }, null));
+
+    // A registry from a build that never wrote `started_at`: the zero is absence,
+    // not 1970, and every binary would otherwise look newer than every daemon.
+    try testing.expect(!daemonOutdated(.{ .daemon = .{ .pid = pid, .started_at = 0 } }, 5_000));
 }
 
 test "a worktree that is gone reads as orphan, and the row stays" {

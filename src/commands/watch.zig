@@ -9,6 +9,7 @@ const std = @import("std");
 const Io = std.Io;
 const app_mod = @import("../app.zig");
 const config = @import("../config.zig");
+const exec = @import("../exec.zig");
 const sessions = @import("../sessions.zig");
 const ui = @import("../ui.zig");
 const watch_client = @import("../watch_client.zig");
@@ -72,11 +73,12 @@ fn snapshotOnce(app: app_mod.App, opts: Opts) !void {
     // not, so the answer is "nothing is running" rather than an error.
     const live = watch_client.snapshot(app) catch null;
     const now = app_mod.nowSeconds(app.io);
+    const outdated = outdatedDaemon(app, app.gpa, exec.selfModified(app.gpa, app.io));
 
     if (live) |list| {
         const rows = try app.gpa.alloc(Row, list.len);
         for (list, 0..) |s, i| rows[i] = toRow(s, false);
-        return emit(app, opts, rows, true, now);
+        return emit(app, opts, rows, true, outdated, now);
     }
 
     const state = sessions.load(app.gpa, app.io, app.environ);
@@ -89,8 +91,24 @@ fn snapshotOnce(app: app_mod.App, opts: Opts) !void {
         row.status = @tagName(r.status);
         rows[i] = row;
     }
-    return emit(app, opts, rows, false, now);
+    return emit(app, opts, rows, false, outdated, now);
 }
+
+/// Is the daemon holding these sessions an older build than this binary?
+///
+/// Read from the registry rather than asked over the wire, and deliberately: the
+/// daemons this is meant to catch are the ones already running, which cannot be
+/// taught to answer a new frame. `started_at` is the one thing every build has
+/// always written. See `sessions.daemonOutdated`.
+fn outdatedDaemon(app: app_mod.App, arena: std.mem.Allocator, built: ?i64) bool {
+    return sessions.daemonOutdated(sessions.load(arena, app.io, app.environ), built);
+}
+
+/// What to say about it, in one line, in the two places a person will be looking.
+const outdated_warning = "The daemon running these sessions is an older build of lcc than this one.";
+/// Naming what `--stop` costs, because it signals every session's process group
+/// and a hint that omitted that would be advice to lose work.
+const outdated_hint = "It retires itself 30 minutes after the last session ends. `lcc daemon --stop` is immediate, but ends them now.";
 
 fn toRow(s: sessions.Session, stale: bool) Row {
     return .{
@@ -107,10 +125,14 @@ fn toRow(s: sessions.Session, stale: bool) Row {
     };
 }
 
-fn emit(app: app_mod.App, opts: Opts, rows: []const Row, live: bool, now: i64) !void {
+fn emit(app: app_mod.App, opts: Opts, rows: []const Row, live: bool, outdated: bool, now: i64) !void {
     if (opts.json) {
         const body = try std.json.Stringify.valueAlloc(app.gpa, .{
             .daemon_running = live,
+            // Always present, like every other key here. A caller that sees it
+            // true knows the daemon may not behave the way this binary's
+            // contract says — which is otherwise indistinguishable from a bug.
+            .daemon_outdated = outdated,
             .sessions = rows,
         }, .{ .whitespace = .indent_2 });
         app.ui.payload("{s}\n", .{body});
@@ -127,6 +149,10 @@ fn emit(app: app_mod.App, opts: Opts, rows: []const Row, live: bool, now: i64) !
     }
 
     if (!live) app.ui.warn("No daemon is running — showing the last recorded state.", .{});
+    if (live and outdated) {
+        app.ui.warn("{s}", .{outdated_warning});
+        app.ui.hint("{s}", .{outdated_hint});
+    }
 
     var widths = struct { issue: usize, status: usize, branch: usize }{
         .issue = "ISSUE".len,
@@ -194,6 +220,11 @@ fn dashboard(app: app_mod.App) !void {
     // Tracked here rather than in a module variable: this repo has no globals,
     // and the only thing that needs it is this loop.
     var last_cols: u16 = 0;
+    // Read once: `selfModified` allocates a path, and `app.gpa` is the process
+    // arena, so a per-frame call would grow it for as long as the dashboard is
+    // open. The binary under a running process does not change often enough to
+    // be worth a leak an hour.
+    const built = exec.selfModified(app.gpa, app.io);
 
     while (true) {
         _ = frame_arena.reset(.retain_capacity);
@@ -215,6 +246,20 @@ fn dashboard(app: app_mod.App) !void {
 
         screen.eraseFrame();
         var lines: usize = 0;
+
+        // Above the table, not in the footer: the footer is keys, and this is
+        // not one. Re-asked every frame from the registry so restarting the
+        // daemon under an open dashboard clears it, rather than leaving a
+        // warning about a process that is gone.
+        if (outdatedDaemon(app, arena, built)) {
+            const p = ui.palette();
+            out.print("  {s}⚠ {s}{s}\n", .{
+                p.yellow,
+                term.truncate(outdated_warning, dims.cols -| 4),
+                p.reset,
+            }) catch {};
+            lines += 1;
+        }
 
         const widths = watch_table.fit(watch_table.measure(rows), dims.cols);
         if (rows.len == 0) {
