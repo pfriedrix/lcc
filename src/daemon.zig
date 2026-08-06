@@ -310,6 +310,32 @@ const Loop = struct {
     fn fail(self: *Loop, client: *Client, code: []const u8, message: []const u8) void {
         self.sendControl(client, .err, wire.ErrorBody{ .code = code, .message = message });
     }
+
+    /// Tell everyone watching a session that it is over.
+    ///
+    /// Without this an attached client waits forever on a pty that will never
+    /// speak again: it keeps its own status bar repainting over a screen that
+    /// has stopped changing, which is indistinguishable from a hang. The frame
+    /// type existed and the client handled it; nothing ever sent it.
+    fn announceExit(self: *Loop, session: *watch_session.Session) void {
+        for (self.clients.items) |*c| {
+            const id = c.attached orelse continue;
+            if (!std.mem.eql(u8, id, session.id)) continue;
+            self.sendControl(c, .exited, wire.Exited{
+                .session_id = session.id,
+                .exit_code = session.exitCode(),
+                .signal = null,
+            });
+        }
+    }
+
+    /// Reap, and announce it if this is the moment it died.
+    fn reapAndAnnounce(self: *Loop, session: *watch_session.Session, at: i64) bool {
+        if (session.exit != null) return false;
+        if (!session.reap(at)) return false;
+        self.announceExit(session);
+        return true;
+    }
 };
 
 /// Runs until the last session is gone or a client asks it to stop.
@@ -452,7 +478,9 @@ fn serve(loop: *Loop) !void {
             const s = &loop.list.items[i];
             if (revents & std.posix.POLL.OUT != 0) s.onWritable();
             if (revents & (std.posix.POLL.IN | std.posix.POLL.HUP) != 0) {
-                if (s.onReadable(at)) _ = s.reap(at);
+                if (s.onReadable(at)) {
+                    if (loop.reapAndAnnounce(s, at)) loop.dirty = true;
+                }
             }
         }
 
@@ -482,7 +510,7 @@ fn drainWake(loop: *Loop) void {
     // status `std.process.Child.wait` is blocked on elsewhere and hang it.
     const at = loop.now();
     for (loop.list.items) |*s| {
-        if (s.exit == null and s.reap(at)) loop.dirty = true;
+        if (loop.reapAndAnnounce(s, at)) loop.dirty = true;
     }
 }
 
@@ -793,7 +821,7 @@ fn tick(loop: *Loop, at: i64, idle_since: *?i64) void {
     for (loop.list.items) |*s| {
         if (s.tick(at)) loop.dirty = true;
         // A session whose pty closed but whose child has not been reaped yet.
-        if (!s.master_open and s.exit == null and s.reap(at)) loop.dirty = true;
+        if (!s.master_open and loop.reapAndAnnounce(s, at)) loop.dirty = true;
     }
 
     if (loop.dirty and loop.deadlines.registry_flush_at == null) {

@@ -45,9 +45,13 @@ pub fn release(out: *Io.Writer) void {
 pub fn draw(out: *Io.Writer, rows: u16, text: []const u8) void {
     if (rows < 2) return;
     const p = ui.palette();
-    out.print("\x1b7" ++ term.csi ++ "{d};1H" ++ term.csi ++ "2K", .{rows}) catch {};
-    out.writeAll(p.dim) catch {};
+    // Reverse video across the whole row, so it reads as a bar rather than as a
+    // line of output that happens to be at the bottom. `CSI K` after the text
+    // extends the inverted background to the edge without padding with spaces,
+    // which would have to be counted against the width.
+    out.print("\x1b7" ++ term.csi ++ "{d};1H" ++ term.csi ++ "7m" ++ term.csi ++ "2K", .{rows}) catch {};
     out.writeAll(text) catch {};
+    out.writeAll(term.csi ++ "K") catch {};
     out.writeAll(p.reset) catch {};
     out.writeAll("\x1b8") catch {};
     out.flush() catch {};
@@ -60,7 +64,19 @@ pub fn draw(out: *Io.Writer, rows: u16, text: []const u8) void {
 /// people being afraid to press it.
 pub const keys = "^\\ dashboard · ^C→agent";
 
-/// What the row says: this session, then the others, then the keys.
+/// The glyph for a session on the bar.
+///
+/// The attached one is a *filled* ring rather than the same glyph with a marker
+/// beside it. A separate `*` sat outside the circle and read as punctuation;
+/// filling the shape says "you are here" in the same place the eye is already
+/// looking. Colour still carries the status, so nothing is lost by spending the
+/// shape on selection.
+fn barGlyph(session: sessions.Session, attached: bool) []const u8 {
+    if (!attached) return watch_table.glyph(session.parsedStatus());
+    return "◉";
+}
+
+/// What the row says: the sessions, numbered, then the keys.
 ///
 /// Truncated from the left-hand end — the session list is the part that can be
 /// cut, because the keys are the part someone is looking for when they read it.
@@ -80,22 +96,34 @@ pub fn compose(
     const budget = cols - keys_width - 2;
     var used: usize = 0;
 
-    for (list) |s| {
+    const p = ui.palette();
+    for (list, 0..) |s, i| {
+        if (i >= 9) break; // numbered 1..9; past that there is no key to press
         const label = s.issue orelse s.branch;
-        const glyph = watch_table.glyph(s.parsedStatus());
-        const mark: []const u8 = if (std.mem.eql(u8, s.id, current_id)) "*" else " ";
-        // Two for the glyph and its space, plus the separator.
-        const cost = ui.displayWidth(label) + ui.displayWidth(glyph) + 3;
+        const attached = std.mem.eql(u8, s.id, current_id);
+        const glyph = barGlyph(s, attached);
+        // A digit per session, so the bar names the key rather than only the
+        // session — a list you cannot act on is decoration.
+        const cost = ui.displayWidth(label) + ui.displayWidth(glyph) + 4;
         if (used + cost > budget) break;
-        w.print("{s}{s} {s} ", .{ mark, glyph, label }) catch break;
+        w.print("{s}{d} {s}{s} {s}{s} ", .{
+            if (attached) p.bold else p.dim,
+            i + 1,
+            watch_table.paint(s.parsedStatus(), p),
+            glyph,
+            label,
+            p.reset,
+        }) catch break;
         used += cost;
     }
 
     // Right-aligned keys, so they sit in the same place whatever the list does.
     const pad = cols - used - keys_width;
     w.splatByteAll(' ', pad) catch {};
+    w.writeAll(p.dim) catch {};
     w.writeAll(keys) catch {};
-    return term.truncate(w.buffered(), cols);
+    w.writeAll(p.reset) catch {};
+    return w.buffered();
 }
 
 const testing = std.testing;
@@ -177,14 +205,16 @@ test "the attached session is marked, the others are not" {
     ui.setColor(false);
     const out = compose(&buf, testSessions(), "s-2", 100);
 
-    // Without a mark the bar lists sessions but never says which one you are
-    // looking at, which is the first thing you want to know after switching.
-    //
-    // Matched as whole fragments rather than by byte offset from the label: the
-    // glyphs are multi-byte, and arithmetic on them is exactly the mistake that
-    // made this test wrong the first time.
-    try testing.expect(std.mem.indexOf(u8, out, "*◐ PE-270") != null);
-    try testing.expect(std.mem.indexOf(u8, out, " ● PE-256") != null);
+    // The attached session's ring is filled; the others keep their status
+    // glyph. A marker beside the circle read as punctuation — filling the shape
+    // says "you are here" where the eye is already looking.
+    try testing.expect(std.mem.indexOf(u8, out, "◉ PE-270") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "● PE-256") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "*") == null);
+
+    // Numbered, so the bar names the key as well as the session.
+    try testing.expect(std.mem.indexOf(u8, out, "1 ") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "2 ") != null);
 }
 
 test "a bar never exceeds the width it was given" {
