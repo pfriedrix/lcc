@@ -23,9 +23,9 @@ const watch_table = @import("watch_table.zig");
 
 /// Reserve every row but the last for the child.
 ///
-/// Must be re-issued whenever `ansi.Scanner` reports a scroll region going
-/// past: Claude Code emits a bare `CSI r` as its second command, and a bar that
-/// set this once at attach would lose the row immediately.
+/// Re-issued before every paint: Claude Code emits a bare `CSI r` as its second
+/// command, and a bar that set this once at attach would lose the row
+/// immediately.
 pub fn reserve(out: *Io.Writer, rows: u16) void {
     if (rows < 2) return;
     out.print(term.csi ++ "1;{d}r", .{rows - 1}) catch {};

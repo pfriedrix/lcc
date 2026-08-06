@@ -189,7 +189,6 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
     var bar_buf: [512]u8 = undefined;
     var out_buf: [8192]u8 = undefined;
     var bar_writer: Io.File.Writer = .init(.stdout(), app.io, &out_buf);
-    var scanner: ansi.Scanner = .{};
     var replay_filter: ansi.ModeFilter = .{};
     var filtered: [wire.max_payload + 64]u8 = undefined;
 
@@ -210,7 +209,6 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
 
     const sock = conn.stream.socket.handle;
     var in_buf: [4096]u8 = undefined;
-    var bar_dirty = opts.status_bar;
     var peers = opts.peers;
     var peers_at: i64 = 0;
 
@@ -220,7 +218,6 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
         const now_size = terminal.size();
         if (now_size.rows != size.rows or now_size.cols != size.cols) {
             size = now_size;
-            if (opts.status_bar) bar_dirty = true;
             conn.sendControl(app.gpa, .resize, wire.Resize{
                 .cols = size.cols,
                 .rows = childRows(size.rows, opts.status_bar),
@@ -268,24 +265,13 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
                 .replay => {
                     const kept = replay_filter.filter(frame.payload, &filtered);
                     note(dump, app.io, "replay", kept);
-                    paintBar(app, &bar_writer, &bar_buf, opts, &peers, &peers_at, size, &bar_dirty);
+                    paintBar(app, &bar_writer, &bar_buf, opts, &peers, &peers_at, size);
                     writeAll(chunk_stdout, kept);
-                    if (opts.status_bar and scanner.scan(kept).any()) {
-                        watch_bar.reserve(&bar_writer.interface, size.rows);
-                        bar_dirty = true;
-                    }
                 },
                 .output => {
                     note(dump, app.io, "out", frame.payload);
-                    paintBar(app, &bar_writer, &bar_buf, opts, &peers, &peers_at, size, &bar_dirty);
+                    paintBar(app, &bar_writer, &bar_buf, opts, &peers, &peers_at, size);
                     writeAll(chunk_stdout, frame.payload);
-                    // Claude Code emits a bare `CSI r` as its second command,
-                    // which hands the reserved row straight back. Watching the
-                    // stream is the only way to know it happened.
-                    if (opts.status_bar and scanner.scan(frame.payload).any()) {
-                        watch_bar.reserve(&bar_writer.interface, size.rows);
-                        bar_dirty = true;
-                    }
                 },
                 .exited => return .ended,
                 else => {},
@@ -310,12 +296,13 @@ fn paintBar(
     peers: *[]const sessions_mod.Session,
     peers_at: *i64,
     size: term.Size,
-    dirty: *bool,
 ) void {
     if (!opts.status_bar) return;
     const at = app_mod.nowSeconds(app.io);
-    // Whatever the child last wrote may have reclaimed the scroll region, and
-    // it costs six bytes to be sure.
+    // Reasserted unconditionally rather than only when the child was seen to
+    // reclaim it. Claude Code emits a bare `CSI r` early, and anything else it
+    // runs may do the same — six bytes on every burst is cheaper than a scanner
+    // whose only job is to decide whether to send them.
     watch_bar.reserve(&writer.interface, size.rows);
     // A snapshot is a socket round trip, so it is refreshed on its own slow
     // clock rather than on every burst of output.
@@ -330,7 +317,6 @@ fn paintBar(
         // to wrap, and what happens then is the emulator's decision, not ours.
         watch_bar.compose(buf, peers.*, opts.session_id, size.cols -| 1),
     );
-    dirty.* = false;
 }
 
 /// What the child is told the terminal is. One row is kept back for the bar,

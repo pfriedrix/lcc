@@ -1,113 +1,16 @@
-//! Just enough escape-sequence parsing to notice when a child undoes something
-//! lcc set up.
+//! Just enough escape-sequence parsing to strip terminal configuration out of
+//! replayed scrollback.
 //!
 //! Explicitly **not** a terminal emulator, and the temptation to grow one is
-//! the failure mode here. It answers exactly one question: did this chunk of
-//! output contain a sequence that invalidates the reserved status row?
+//! the failure mode here. It once also watched the child's output to decide
+//! when to reassert the scroll region and when the cursor slot was free; both
+//! went away when the status bar stopped repainting on a schedule, and what is
+//! left answers one question — is this sequence configuration or drawing?
 //!
 //! It has to be an object rather than a function because a sequence can be
-//! split across two reads. A scanner that reset between chunks would miss a
-//! `CSI r` whose bytes landed either side of a 64 KB boundary — and missing it
-//! means the child silently reclaims the row lcc is drawing in.
+//! split across two reads, at whatever boundary the ring happened to wrap on.
 
 const std = @import("std");
-
-/// What a chunk contained. Flags rather than an event stream: the caller only
-/// ever asks "do I need to reassert", and several in one chunk still need one
-/// answer.
-pub const Seen = struct {
-    /// A DECSTBM — `CSI r` or `CSI <top>;<bottom> r`.
-    ///
-    /// Measured, not anticipated: a capture of Claude Code's startup has `CSI r`
-    /// as its *second* command, before it has drawn anything. A status bar that
-    /// set the scroll region once at attach would lose its row to that and
-    /// never know.
-    scroll_region: bool = false,
-    /// `CSI ?1049h` / `CSI ?1049l`. The alternate screen carries its own scroll
-    /// region, so entering or leaving it discards ours.
-    ///
-    /// The same capture shows Claude Code never uses it — it renders inline —
-    /// but a future release might, and the cost of handling it is this comment
-    /// plus one branch.
-    alt_screen: bool = false,
-
-    pub fn any(self: Seen) bool {
-        return self.scroll_region or self.alt_screen;
-    }
-
-    fn merge(self: Seen, other: Seen) Seen {
-        return .{
-            .scroll_region = self.scroll_region or other.scroll_region,
-            .alt_screen = self.alt_screen or other.alt_screen,
-        };
-    }
-};
-
-pub const Scanner = struct {
-    const State = enum { text, esc, csi };
-    const max_params = 32;
-
-    state: State = .text,
-    params: [max_params]u8 = undefined,
-    len: usize = 0,
-    /// The child has issued `ESC 7` and not yet its `ESC 8`.
-    ///
-    /// A terminal has exactly one saved-cursor slot. Anything else that saves
-    /// and restores while the child is holding it destroys the position the
-    /// child will later restore to — and the child then puts its cursor
-    /// somewhere it never was. Watching for the pair is the only way to know
-    /// when it is safe to borrow the cursor.
-    cursor_saved: bool = false,
-
-    pub fn scan(self: *Scanner, chunk: []const u8) Seen {
-        var seen: Seen = .{};
-        for (chunk) |byte| {
-            switch (self.state) {
-                .text => if (byte == 0x1b) {
-                    self.state = .esc;
-                },
-                .esc => {
-                    if (byte == '[') {
-                        self.state = .csi;
-                        self.len = 0;
-                    } else {
-                        // DECSC and DECRC: the pair whose slot must not be
-                        // borrowed while it is open.
-                        if (byte == '7') self.cursor_saved = true;
-                        if (byte == '8') self.cursor_saved = false;
-                        self.state = .text;
-                    }
-                },
-                .csi => {
-                    // Parameter and intermediate bytes; the final byte is
-                    // 0x40..0x7E and ends the sequence.
-                    if (byte >= 0x40 and byte <= 0x7e) {
-                        seen = seen.merge(self.finish(byte));
-                        self.state = .text;
-                    } else {
-                        // A sequence longer than the buffer is not one of ours,
-                        // and dropping the overflow keeps this bounded rather
-                        // than letting a hostile stream grow it.
-                        if (self.len < max_params) {
-                            self.params[self.len] = byte;
-                            self.len += 1;
-                        }
-                    }
-                },
-            }
-        }
-        return seen;
-    }
-
-    fn finish(self: *Scanner, final: u8) Seen {
-        const params = self.params[0..self.len];
-        return switch (final) {
-            'r' => .{ .scroll_region = true },
-            'h', 'l' => .{ .alt_screen = std.mem.eql(u8, params, "?1049") },
-            else => .{},
-        };
-    }
-};
 
 /// Drops the sequences that configure a terminal, keeping the ones that draw.
 ///
@@ -206,85 +109,6 @@ fn configures(body: []const u8) bool {
 
 const testing = std.testing;
 
-test "a bare CSI r is noticed — Claude Code emits one before anything else" {
-    var s: Scanner = .{};
-    // From a real capture: ESC 7, CSI r, ESC 8 are the first three sequences of
-    // a session. Missing this hands the reserved row straight back.
-    try testing.expect(s.scan("\x1b7\x1b[r\x1b8").scroll_region);
-}
-
-test "a parameterised scroll region counts too" {
-    var s: Scanner = .{};
-    // Any DECSTBM replaces ours, whether it resets or re-sets.
-    try testing.expect(s.scan("\x1b[1;39r").scroll_region);
-    try testing.expect(s.scan("\x1b[5;20r").scroll_region);
-}
-
-test "a sequence split across two reads is still recognised" {
-    var s: Scanner = .{};
-    // The whole reason this is an object. A 64 KB read boundary falls wherever
-    // it falls, and a scanner that reset between chunks would miss the half of
-    // the sequences that straddle one.
-    try testing.expect(!s.scan("output\x1b").scroll_region);
-    try testing.expect(!s.scan("[").scroll_region);
-    try testing.expect(s.scan("r more output").scroll_region);
-
-    // And split in the middle of the parameters.
-    var t: Scanner = .{};
-    try testing.expect(!t.scan("\x1b[1;").scroll_region);
-    try testing.expect(t.scan("39r").scroll_region);
-}
-
-test "the alternate screen is noticed in both directions" {
-    var s: Scanner = .{};
-    try testing.expect(s.scan("\x1b[?1049h").alt_screen);
-    try testing.expect(s.scan("\x1b[?1049l").alt_screen);
-
-    // A private mode that is not 1049 is not the alternate screen. Treating
-    // every `?…h` as one would reassert the scroll region on every cursor-hide,
-    // which Claude Code does constantly.
-    try testing.expect(!s.scan("\x1b[?25l").alt_screen);
-    try testing.expect(!s.scan("\x1b[?2004h").alt_screen);
-    try testing.expect(!s.scan("\x1b[?1000h").alt_screen);
-}
-
-test "ordinary output and unrelated sequences change nothing" {
-    var s: Scanner = .{};
-    // The common case by an enormous margin — colour runs, cursor moves and
-    // erases — and every false positive here is a needless redraw of the bar.
-    for ([_][]const u8{
-        "plain text with no escapes at all\n",
-        "\x1b[38;2;255;193;7m",
-        "\x1b[2K",
-        "\x1b[12G",
-        "\x1b[4A",
-        "\x1b]8;;https://example.com\x07",
-        "\x1b(B",
-    }) |chunk| {
-        try testing.expect(!s.scan(chunk).any());
-    }
-}
-
-test "the scanner knows when the child is holding the cursor slot" {
-    var s: Scanner = .{};
-    try testing.expect(!s.cursor_saved);
-
-    // Claude Code opens with exactly this pair.
-    _ = s.scan("\x1b7");
-    try testing.expect(s.cursor_saved);
-    _ = s.scan("\x1b[r");
-    // Still held: a sequence in between does not close it.
-    try testing.expect(s.cursor_saved);
-    _ = s.scan("\x1b8");
-    try testing.expect(!s.cursor_saved);
-
-    // Split across reads, like everything else here.
-    _ = s.scan("text\x1b");
-    try testing.expect(!s.cursor_saved);
-    _ = s.scan("7");
-    try testing.expect(s.cursor_saved);
-}
-
 test "a replay keeps what draws and drops what configures" {
     var f: ModeFilter = .{};
     var out: [512]u8 = undefined;
@@ -323,12 +147,3 @@ test "a mode sequence split across two frames is still dropped" {
     try testing.expectEqualStrings("b", f.filter("ub", &out));
 }
 
-test "a scanner survives a sequence longer than its parameter buffer" {
-    var s: Scanner = .{};
-    // Bounded rather than growable: the bytes come off a pty and nothing
-    // guarantees they are well formed.
-    const long = "\x1b[" ++ ("1;" ** 60) ++ "m";
-    try testing.expect(!s.scan(long).any());
-    // And it is still in a sane state afterwards.
-    try testing.expect(s.scan("\x1b[r").scroll_region);
-}
