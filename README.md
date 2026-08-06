@@ -60,18 +60,24 @@ lcc start            # pick an issue, bootstrap worktree, open Claude Code in pl
 lcc start PE-256     # that issue, no picker
 lcc start PE-256 --plan plan.md   # a plan already exists — skip plan mode
 lcc start PE-256 --json   # resolve it and print the result instead of launching an agent
+lcc start PE-256 --no-watch  # run in this terminal; the session dies with it
 lcc start --all      # ignore the activeStates filter
+lcc watch            # the sessions the daemon is running, live
+lcc watch --json     # the same as a one-shot, for a caller that parses it
+lcc daemon --status  # is one running, and how many sessions
+lcc daemon --stop    # ask it to exit
 lcc issue show PE-256        # state, project, labels, description — reads nothing else
 lcc issue show PE-256 --json # the same, for a caller that parses it
 lcc issue state PE-256 "In Progress"    # move it, by the name on the board
 lcc issue comment PE-256 -m "done"      # add a comment
 lcc issue comment PE-256 -f plan.md     # …or read the body off disk
 lcc issue project PE-256 --assign v2.6.0   # put it in a release project
-lcc setup            # configure worktree behavior
+lcc config           # every setting, in a list you move through and toggle
+lcc setup            # the same thing, under the name muscle memory reaches for
+lcc config watchByDefault false   # or name one directly, with no prompt
 lcc list             # dashboard of every worktree (--local to skip the network columns)
 lcc stats            # what each worktree has spent in Claude Code
-lcc open             # pick a worktree and open Claude Code in it
-lcc open claude      # the same, named explicitly
+lcc open             # the worktrees, and what is running in them
 lcc open xcode       # pick a worktree and open it in Xcode instead
 lcc remove           # select worktrees, remove them + their branches + Xcode build data
 lcc remove --merged  # bulk: every worktree and branch whose work already landed
@@ -85,7 +91,80 @@ lcc auth --logout    # clear the token from the Keychain
 
 Token statistics and session cleanup read Claude Code transcripts under `~/.claude/projects`.
 
-### The dashboard
+### Sessions that outlive the terminal
+
+`lcc start` hands the session to a small daemon that owns its pty, rather than
+taking over the terminal itself. Closing the window, losing an ssh link or
+rebooting the terminal emulator no longer kills the agent — the work carries on
+and `lcc watch` shows it.
+
+`lcc open` is the dashboard: every worktree of the repo you are in, and
+whatever is running in each. Enter opens one — attaching if a session is
+already there, starting one if not. `lcc watch` is an alias.
+
+```
+  ISSUE   STATUS        BRANCH                              AGE
+❯ PE-256  ● waiting     feature/pe-256-app-hangs-on-launch  4s
+  PE-270  ◐ active      feature/pe-270-crash-in-mapview     12s
+  PE-9    · no session  feature/pe-9-unrelated              —
+
+  ↑↓ move · enter opens · n new issue · x kill · q quit
+```
+
+Shortcuts are key *positions*, not characters, so they work on any keyboard
+layout — on Ukrainian ЙЦУКЕН the key labelled `n` prints `т` and still means
+new. The same goes for the `y`/`n` confirmation `lcc remove` puts in front of a
+deletion, which a Cyrillic layout previously had no way to answer at all.
+
+`n` picks another issue and starts it without leaving the dashboard — the same
+picker and the same bootstrap as `lcc start`, just without having to quit first.
+Changing your mind puts you back in the list rather than quitting lcc.
+
+A session running in another repository still appears, because an agent working
+somewhere you are not looking is the one you most need to see. `lcc open xcode`
+is unchanged and still opens a worktree in Xcode.
+
+`● waiting` is the one that wants you: the agent is blocked on a permission
+prompt or a question. `◐ active` is a turn in flight, `○ idle` is finished.
+Those come from Claude Code's own hooks rather than from reading its screen, so
+a new Claude Code release cannot quietly make them wrong.
+
+Enter attaches, and from there the terminal is entirely Claude Code's — lcc
+writes nothing of its own over it. **`^\` returns to the dashboard** without
+touching the session. `^C` still reaches the agent, which is the point of not
+using it to detach. `q` quits lcc entirely and the sessions keep running.
+
+That one keybinding is the thing worth remembering, because nothing on screen
+repeats it. There was a status bar on the bottom row that did — the child was
+told the terminal was a row shorter and a scroll region kept it out of the last
+line — and against Claude Code it lost. It repaints many times a second using
+cursor moves relative to wherever the cursor already is, so every paint has to
+borrow the cursor and hand it back exactly; it also resets the scroll region and
+uses the terminal's single saved-cursor slot itself. Three different repaint
+schedules each still disturbed its rendering. Doing it properly means emulating
+a terminal, which is more than one line of text is worth, so the row went back
+to the agent.
+
+**Two things worth knowing.** Sessions do not survive the *daemon* dying —
+closing the pty revokes it and the agent gets a hangup, the same property tmux
+has. And `lcc remove` does not yet check whether a worktree has a live session
+in it, so check `lcc watch` before removing one.
+
+A daemon outlives rebuilds. It holds the image it started with, so after
+`zig build` the daemon answering you can be many commits behind the `lcc` that
+is asking — same path, same protocol, older behaviour, and every symptom of it
+looks like a bug in the new code. The dashboard says so when it happens
+(`daemon_outdated` in `--json`). It retires itself 30 minutes after the last
+session ends; `lcc daemon --stop` is immediate but signals every session's
+process group, which ends them.
+
+Turn the whole thing off with `lcc config watchByDefault false`, or per
+invocation with `lcc start --no-watch`. Either way `lcc start` goes back to
+running Claude Code in the terminal it was called from. If the daemon cannot be
+reached, `lcc start` says so and falls back to that on its own rather than
+failing.
+
+### The worktree dashboard
 
 `lcc list` is the "what am I in the middle of" view — one row per worktree:
 
@@ -548,7 +627,40 @@ Session transcripts are what `claude --resume` replays — check before deleting
 
 ## Configuration
 
-`~/.config/lcc/config.json`, written by `lcc setup`:
+`~/.config/lcc/config.json`. `lcc config` opens it as a list — arrows to move,
+Enter to toggle a switch, cycle a choice, or edit a value, `q` to leave. Every
+change is written as it is made.
+
+```
+❯ Sessions outlive the terminal  on
+  Start in plan mode             on
+  Resume last session on open    on
+  PR and Linear columns          cached
+  Worktree path                  {repoRoot}/.lcc/worktrees/{branchLeaf}
+```
+
+Naming one setting skips the list entirely and never touches raw mode, which is
+the form a script, a slash command or a tool call can use:
+
+```bash
+lcc config                       # every setting, its value and what it does
+lcc config watchByDefault        # just the value
+lcc config watchByDefault false  # set it
+lcc config listNetwork local     # a choice, not a boolean
+lcc config activeStates "Todo, In Progress, In Review"   # lists are comma-separated
+```
+
+Every boolean setting has a flag on both sides, so a stored default is never a
+trap you cannot escape for one run: `--watch` / `--no-watch`, `--tokens` /
+`--no-tokens`, `--resume` / `--no-resume`, `--keep-branch` /
+`--no-keep-branch`, and so on. `lcc list` spells its three-way one as
+`--refresh`, `--cached` and `--local`.
+
+`--yes` and `--force` are deliberately **not** settings. A stored value that
+pre-approves a destructive operation removes the one confirmation standing
+between a mistyped command and a deleted worktree, and it does so invisibly,
+months after anyone typed it.
+
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -557,6 +669,13 @@ Session transcripts are what `claude --resume` replays — check before deleting
 | `startTaskCommand` | `""` | Passed to Claude Code as its initial prompt. Placeholders: `{identifier}`, `{branch}`, `{url}`, `{plan}` (the `--plan` path, empty without it — and required in the template before `--plan` is accepted) |
 | `linkPatterns` | `[".env", ".env.*", "CLAUDE.md", "CLAUDE.local.md", ".claude/settings.local.json"]` | Which files to symlink into each worktree |
 | `linkExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
+| `watchByDefault` | `true` | Hand new sessions to the daemon so they outlive the terminal |
+| `planMode` | `true` | Open new sessions in plan mode. `--plan <file>` turns it off regardless |
+| `resumeSessions` | `true` | `lcc open` resumes the worktree's last session |
+| `showTokens` | `true` | The TOKENS column in `lcc list`. Off skips reading transcripts, which is that column's whole cost |
+| `listNetwork` | `cached` | The PR and Linear columns in `lcc list`: `refresh`, `cached` or `local` |
+| `allIssues` | `false` | Offer every assigned issue in the picker, not just `activeStates` |
+| `keepBranch`, `keepDerivedData`, `keepXcode` | `false` | What `lcc remove` leaves behind |
 | `mcpCarry` | absent — all of them | Which local-scope MCP servers to carry into Claude; setup accepts a comma-separated list, `all`, or `none` |
 | `clientId` | built-in | Linear OAuth application. Override with `LCC_CLIENT_ID` or `lcc auth setup --client-id <id>` |
 

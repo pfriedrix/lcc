@@ -32,16 +32,28 @@ pub const Palette = struct {
     dim: []const u8,
     green: []const u8,
     cyan: []const u8,
+    red: []const u8,
+    yellow: []const u8,
 };
 
 pub fn palette() Palette {
-    if (!color_enabled) return .{ .reset = "", .bold = "", .dim = "", .green = "", .cyan = "" };
+    if (!color_enabled) return .{
+        .reset = "",
+        .bold = "",
+        .dim = "",
+        .green = "",
+        .cyan = "",
+        .red = "",
+        .yellow = "",
+    };
     return .{
         .reset = Code.reset,
         .bold = Code.bold,
         .dim = Code.dim,
         .green = Code.green,
         .cyan = Code.cyan,
+        .red = Code.red,
+        .yellow = Code.yellow,
     };
 }
 

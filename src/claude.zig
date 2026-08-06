@@ -6,7 +6,11 @@ const exec = @import("exec.zig");
 
 pub const Error = error{ClaudeNotFound} || std.mem.Allocator.Error;
 
-fn resolveBin(gpa: std.mem.Allocator, io: Io) Error![]u8 {
+/// The absolute `claude` binary.
+///
+/// Public because the watch path needs it *before* forking: a PATH search must
+/// not happen on the child side of a fork, where almost nothing is safe to call.
+pub fn resolvePath(gpa: std.mem.Allocator, io: Io) Error![]u8 {
     return exec.capture(gpa, io, &.{ "which", "claude" }, null) catch
         return Error.ClaudeNotFound;
 }
@@ -18,7 +22,7 @@ pub fn launch(
     cwd: []const u8,
     extra_args: []const []const u8,
 ) !u8 {
-    const bin = try resolveBin(gpa, io);
+    const bin = try resolvePath(gpa, io);
 
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(gpa, bin);

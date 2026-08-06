@@ -13,6 +13,8 @@ const prompt = @import("../prompt.zig");
 const repos = @import("../repos.zig");
 const ui = @import("../ui.zig");
 const usage = @import("../usage.zig");
+const watch_client = @import("../watch_client.zig");
+const watch_cmd = @import("watch.zig");
 
 const priority_label = [_][]const u8{ "   ", "U  ", "H  ", "M  ", "L  " };
 
@@ -31,7 +33,33 @@ pub const Opts = struct {
     /// A plan the agent should start from, reachable through `{plan}` in
     /// `startTaskCommand`. Only the path travels — see `expandCommand`.
     plan: ?[]const u8 = null,
+    /// Open in Claude Code's plan mode. A `--plan` file turns it off regardless,
+    /// since the session already has one. Resolved against `planMode` by the
+    /// argv layer.
+    plan_mode: bool = true,
+    /// Hand the session to the daemon instead of taking over this terminal, so
+    /// it survives the terminal closing. Everything above the launch is
+    /// unchanged — this only replaces the last step.
+    ///
+    /// Resolved against `watchByDefault`, which is on, by the argv layer.
+    watch: bool = true,
+    /// With `--watch`, print the session id and return instead of showing the
+    /// dashboard. What a slash command or a script uses.
+    no_attach: bool = false,
+    /// Cancelling a picker returns instead of exiting 130.
+    ///
+    /// Set only when this runs *inside* something else — the dashboard's `n`.
+    /// There, changing your mind about which issue to take should put you back
+    /// where you were, not quit lcc out from under the sessions you were
+    /// watching. Standalone, 130 is the conventional answer and stays.
+    cancel_returns: bool = false,
 };
+
+/// What a cancelled picker does, which depends on who is asking.
+fn cancel(opts: Opts) error{Cancelled} {
+    if (opts.cancel_returns) return error.Cancelled;
+    std.process.exit(app_mod.cancelled_exit_code);
+}
 
 pub fn run(app: app_mod.App, opts: Opts) !void {
     if (opts.json and opts.issue == null) {
@@ -61,9 +89,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         }
         break :blk resolved;
     } else null;
-    // Either the work is planned here or a plan was brought to it. One name, so the
-    // banner and the launch cannot come to different conclusions about which.
-    const plan_mode = plan_path == null;
     // Said before the read, not after: the Keychain grants access to a binary by its
     // code signature, so a freshly built lcc can block here on a system dialog for
     // the login password. Announced, that is a wait with a reason; unannounced, it
@@ -76,6 +101,10 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     }
 
     const cfg = try config.load(app.gpa, app.io, app.environ);
+
+    // Either the work is planned here or a plan was brought to it. One name, so the
+    // banner and the launch cannot come to different conclusions about which.
+    const plan_mode = plan_path == null and opts.plan_mode;
 
     // `{plan}` is the only thing that carries a plan to the agent, and
     // `startTaskCommand` is empty by default — so without the placeholder, `--plan`
@@ -176,6 +205,38 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         initial_prompt,
         plan_mode,
     );
+
+    // The only branch `--watch` adds. Everything above — the token, the issue,
+    // the repository, the worktree, the links, the argv — is shared, so the two
+    // launch paths cannot come to different conclusions about what to run.
+    if (opts.watch) {
+        if (watch_client.startSession(app, .{
+            .worktree = wt.path,
+            .branch = wt.branch,
+            .issue = selected.identifier,
+            .repo_root = repo.root,
+            .program = try claude.resolvePath(app.gpa, app.io),
+            .argv = args,
+        })) |started| {
+            if (opts.no_attach) {
+                app.ui.success("Session {s} running in the background.", .{started.id});
+                app.ui.hint("It survives this terminal closing — `lcc watch` shows it.", .{});
+                return;
+            }
+            app.ui.flush();
+            return watch_cmd.run(app, .{});
+        } else |err| {
+            // Falls through to the foreground launch rather than failing.
+            //
+            // This is the path *every* start takes now, so a daemon that cannot
+            // be reached must not be able to take `lcc start` down with it. Said
+            // out loud, though: a silent fallback would hide a broken daemon
+            // until someone noticed their sessions had stopped surviving.
+            app.ui.warn("Could not reach the lcc daemon ({s}) — starting in this terminal instead.", .{@errorName(err)});
+            app.ui.hint("The session will not survive this terminal closing. `lcc daemon --status` says more.", .{});
+        }
+    }
+
     const code = try claude.launch(app.gpa, app.io, wt.path, args);
     std.process.exit(code);
 }
@@ -266,7 +327,7 @@ fn pickFromActive(
     }
 
     return try pickIssue(app, result.matched) orelse
-        std.process.exit(app_mod.cancelled_exit_code);
+        return cancel(opts);
 }
 
 const MatchedBy = enum { branch, issue };
@@ -517,10 +578,10 @@ fn resolveRepo(app: app_mod.App, opts: Opts, identifier: []const u8) !git.Repo {
     // shortlist is worth more than the full list.
     const offer = if (started.len > 1) started else known;
     if (offer.len == 0) return error.NotAGitRepository;
-    return app.repoAt(try pickRepo(app, identifier, offer));
+    return app.repoAt(try pickRepo(app, opts, identifier, offer));
 }
 
-fn pickRepo(app: app_mod.App, identifier: []const u8, roots: []const []const u8) ![]const u8 {
+fn pickRepo(app: app_mod.App, opts: Opts, identifier: []const u8, roots: []const []const u8) ![]const u8 {
     const items = try app.gpa.alloc(prompt.Item, roots.len);
     for (roots, 0..) |root, i| {
         items[i] = .{
@@ -540,7 +601,7 @@ fn pickRepo(app: app_mod.App, identifier: []const u8, roots: []const []const u8)
         .{identifier},
     );
     const index = try prompt.search(app.gpa, app.io, message, items) orelse
-        std.process.exit(app_mod.cancelled_exit_code);
+        return cancel(opts);
     return roots[index];
 }
 
@@ -563,11 +624,11 @@ fn resolveBase(app: app_mod.App, opts: Opts, repo: git.Repo, branch: []const u8)
     app.ui.flush();
     const message = try std.fmt.allocPrint(app.gpa, "Base new branch on current '{s}'?", .{cur.?});
     const use_current = try prompt.confirm(app.gpa, app.io, message, true) orelse
-        std.process.exit(app_mod.cancelled_exit_code);
+        return cancel(opts);
     if (use_current) return cur.?;
 
     return try pickBaseBranch(app, repo) orelse
-        std.process.exit(app_mod.cancelled_exit_code);
+        return cancel(opts);
 }
 
 /// What `--json` promises: where the issue lives, and the git facts a caller would
