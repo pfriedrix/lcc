@@ -40,12 +40,89 @@ pub const Outcome = enum {
     daemon_gone,
 };
 
+/// `\` — the key itself, once a terminal has stopped sending it as a byte.
+const backslash = '\\';
+/// The control code Ctrl-\ produces, which some terminals report in place of
+/// the key when asked for a modified-key sequence.
+const backslash_ctrl_code = 0x1c;
+
 /// Where the detach key falls in a read, if it is there at all.
 ///
-/// Pure, so the one thing that can strand a user inside a session is testable
-/// without a terminal.
+/// Three encodings, because Claude Code turns on two protocols that change how
+/// the terminal reports a modified key, and both of those bytes pass straight
+/// through lcc to the real terminal:
+///
+///   0x1c                  the legacy control code
+///   CSI 92 ; <mods> u     kitty keyboard protocol — `CSI > 1 u`
+///   CSI 27 ; <mods> ; N ~ xterm modifyOtherKeys=2 — `CSI > 4 ; 2 m`
+///
+/// Scanning for the byte alone was enough against `/bin/cat`, which enables
+/// neither, and would have silently failed against the program this exists for
+/// — leaving someone inside a session with no way back and a status bar
+/// claiming otherwise.
+///
+/// Pure, so the one thing that can strand a user is testable without a terminal.
 pub fn detachAt(bytes: []const u8) ?usize {
-    return std.mem.indexOfScalar(u8, bytes, detach_key);
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        if (bytes[i] == detach_key) return i;
+        if (bytes[i] != 0x1b) continue;
+        if (i + 2 >= bytes.len or bytes[i + 1] != '[') continue;
+        if (csiDetach(bytes[i + 2 ..])) return i;
+    }
+    return null;
+}
+
+/// Whether a CSI body (everything after `ESC [`) is a modified backslash.
+///
+/// Only the ctrl bit is required: a terminal that folds shift or meta into the
+/// same report should still detach rather than send the sequence to the agent,
+/// which would do nothing with it either way.
+fn csiDetach(body: []const u8) bool {
+    var params: [4]u32 = .{ 0, 0, 0, 0 };
+    var count: usize = 0;
+    var value: u32 = 0;
+    var seen_digit = false;
+
+    for (body) |byte| {
+        switch (byte) {
+            '0'...'9' => {
+                value = value *| 10 +| (byte - '0');
+                seen_digit = true;
+            },
+            ';' => {
+                if (count < params.len) params[count] = value;
+                count += 1;
+                value = 0;
+                seen_digit = false;
+            },
+            'u', '~' => {
+                if (count < params.len) params[count] = value;
+                count += 1;
+                if (!seen_digit and count < 2) return false;
+                return matches(byte, params[0..@min(count, params.len)]);
+            },
+            // Any other byte either ends the sequence as something else, or is
+            // not part of one at all. Either way it is not a detach.
+            else => return false,
+        }
+    }
+    return false;
+}
+
+fn matches(final: u8, params: []const u32) bool {
+    if (params.len < 2) return false;
+    // Modifiers are reported as 1 + a bitmask, and ctrl is bit 2 (value 4).
+    const ctrl = ((params[1] -| 1) & 4) != 0;
+    if (!ctrl) return false;
+    return switch (final) {
+        // kitty: the keysym comes first.
+        'u' => params[0] == backslash or params[0] == backslash_ctrl_code,
+        // modifyOtherKeys: `27 ; mods ; keysym ~`.
+        '~' => params[0] == 27 and params.len >= 3 and
+            (params[2] == backslash or params[2] == backslash_ctrl_code),
+        else => false,
+    };
 }
 
 pub const Options = struct {
@@ -102,6 +179,9 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
     const sock = conn.stream.socket.handle;
     var in_buf: [4096]u8 = undefined;
     var bar_dirty = opts.status_bar;
+    var peers = opts.peers;
+    var bar_drawn_at: i64 = 0;
+    var peers_at: i64 = 0;
 
     while (true) {
         // Re-queried every iteration rather than driven by SIGWINCH, matching
@@ -119,13 +199,35 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
             }) catch return .daemon_gone;
         }
 
-        if (bar_dirty and opts.status_bar) {
-            watch_bar.draw(
-                &bar_writer.interface,
-                size.rows,
-                watch_bar.compose(&bar_buf, opts.peers, opts.session_id, size.cols),
-            );
-            bar_dirty = false;
+        if (opts.status_bar) {
+            const at = app_mod.nowSeconds(app.io);
+            // Redrawn on a slow tick, not only when something is known to have
+            // disturbed it. A scroll region confines *scrolling*; it does not
+            // stop the child addressing the last row or erasing the screen
+            // outside it, and neither does anything stop a program lcc never
+            // sees. Repainting a hundred bytes once a second costs nothing and
+            // means the row cannot be lost permanently by a cause nobody
+            // anticipated — which, for the line that tells you how to get out,
+            // is the property that matters.
+            if (bar_dirty or at != bar_drawn_at) {
+                // The peers go stale otherwise: they were a snapshot taken when
+                // this attach began, and a bar claiming a session is `waiting`
+                // ten minutes after it stopped is worse than one that says
+                // nothing. Refreshed far more slowly than it is drawn — it is a
+                // socket round trip, where the redraw is not.
+                if (at - peers_at >= 2) {
+                    if (watch_client.snapshot(app) catch null) |fresh| peers = fresh;
+                    peers_at = at;
+                }
+                watch_bar.reserve(&bar_writer.interface, size.rows);
+                watch_bar.draw(
+                    &bar_writer.interface,
+                    size.rows,
+                    watch_bar.compose(&bar_buf, peers, opts.session_id, size.cols),
+                );
+                bar_dirty = false;
+                bar_drawn_at = at;
+            }
         }
 
         var fds = [_]std.posix.pollfd{
@@ -203,12 +305,40 @@ fn writeAll(fd: std.posix.fd_t, bytes: []const u8) void {
 
 const testing = std.testing;
 
-test "the detach key is found wherever it falls, and nowhere it does not" {
-    try testing.expect(detachAt("hello") == null);
+test "the detach key is found in every encoding a terminal may send it as" {
+    // The legacy byte, which is all `/bin/cat` ever produces.
     try testing.expectEqual(@as(usize, 0), detachAt(&.{detach_key}).?);
+
+    // kitty keyboard protocol, which Claude Code turns on with `CSI > 1 u`.
+    try testing.expectEqual(@as(usize, 0), detachAt("\x1b[92;5u").?);
+    try testing.expectEqual(@as(usize, 4), detachAt("abcd\x1b[92;5u").?);
+    // Some report the control code rather than the key.
+    try testing.expect(detachAt("\x1b[28;5u") != null);
+    // Shift or meta folded in alongside ctrl still counts.
+    try testing.expect(detachAt("\x1b[92;7u") != null);
+
+    // xterm modifyOtherKeys=2, which it turns on with `CSI > 4 ; 2 m`.
+    try testing.expect(detachAt("\x1b[27;5;92~") != null);
+    try testing.expect(detachAt("\x1b[27;5;28~") != null);
+
+    // Without ctrl it is a plain backslash and belongs to the agent.
+    try testing.expect(detachAt("\x1b[92;1u") == null);
+    try testing.expect(detachAt("\x1b[27;1;92~") == null);
+    // A different key with ctrl is not a detach either.
+    try testing.expect(detachAt("\x1b[99;5u") == null);
+    try testing.expect(detachAt("\x1b[27;5;99~") == null);
+}
+
+test "ordinary output and other escapes are not mistaken for it" {
+    try testing.expect(detachAt("hello") == null);
     try testing.expectEqual(@as(usize, 3), detachAt("abc\x1cdef").?);
     try testing.expectEqual(@as(usize, 5), detachAt("hello\x1c").?);
     try testing.expect(detachAt("") == null);
+
+    // Arrow keys, function keys and a bare Esc all reach the agent untouched.
+    for ([_][]const u8{ "\x1b[A", "\x1b[B", "\x1b", "\x1b[1;5C", "\x1b[200~pasted\x1b[201~" }) |seq| {
+        try testing.expect(detachAt(seq) == null);
+    }
 }
 
 test "a UTF-8 continuation byte can never be mistaken for the detach key" {
