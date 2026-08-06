@@ -137,7 +137,37 @@ pub const Options = struct {
     peers: []const sessions_mod.Session = &.{},
 };
 
+/// Tees every byte in both directions to a file, for diagnosing a terminal that
+/// is not the one lcc was developed against.
+///
+/// Keys are encoded by the *terminal*, and Claude Code turns on two protocols
+/// that change that encoding. A pty in a test harness implements neither, so a
+/// key that misbehaves under Ghostty or iTerm cannot be reproduced by reasoning
+/// about it — only by reading what actually arrived.
+fn openDump(app: app_mod.App) ?Io.File {
+    const path = app.environ.get("LCC_WATCH_DUMP") orelse return null;
+    if (path.len == 0) return null;
+    return Io.Dir.cwd().createFile(app.io, path, .{ .truncate = false }) catch null;
+}
+
+fn note(dump: ?Io.File, io: Io, comptime label: []const u8, bytes: []const u8) void {
+    const file = dump orelse return;
+    var buf: [64]u8 = undefined;
+    const head = std.fmt.bufPrint(&buf, "\n[{s} {d}] ", .{ label, bytes.len }) catch return;
+    var w = file.writer(io, &.{});
+    w.interface.writeAll(head) catch {};
+    // Hex, because the interesting bytes are escapes and control codes that a
+    // text dump would either hide or mangle.
+    for (bytes) |byte| {
+        const pair = std.fmt.bufPrint(&buf, "{x:0>2} ", .{byte}) catch continue;
+        w.interface.writeAll(pair) catch {};
+    }
+    w.interface.flush() catch {};
+}
+
 pub fn run(app: app_mod.App, opts: Options) !Outcome {
+    const dump = openDump(app);
+    defer if (dump) |f| f.close(app.io);
     const terminal = try term.Terminal.enterRaw();
     var size = terminal.size();
 
@@ -242,6 +272,7 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
             const n = std.posix.read(terminal.fd, &in_buf) catch 0;
             if (n == 0) return .detached;
             const chunk = in_buf[0..n];
+            note(dump, app.io, "key", chunk);
             if (detachAt(chunk)) |at| {
                 // Anything typed before the key is still meant for the agent,
                 // and dropping it would silently lose a keystroke.
@@ -262,6 +293,7 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
                 // Code's own rendering and anything that reinterpreted them
                 // would corrupt the screen.
                 .output => {
+                    note(dump, app.io, "out", frame.payload);
                     writeAll(chunk_stdout, frame.payload);
                     // Claude Code emits a bare `CSI r` as its second command,
                     // which hands the reserved row straight back. Watching the
