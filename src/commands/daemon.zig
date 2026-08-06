@@ -1,32 +1,31 @@
-//! `lcc daemon` — run the session daemon, stop it, or ask what it is doing.
+//! `lcc daemon` — run the session daemon, or ask what it is doing.
 //!
-//! Named explicitly rather than left implicit. `lcc start --watch` starts one
-//! on demand, but a background process a user cannot see, inspect or stop is
-//! not something to acquire by accident.
+//! **Not in `usage`, and not for users.** `watch_client` re-execs this to bring
+//! the session host up; `--foreground` and `--status` exist for whoever is
+//! debugging that. Someone running `lcc` has sessions, not a daemon, and every
+//! sentence they read says so.
+//!
+//! What they do need — seeing the sessions and ending all of them — is
+//! `lcc open` and `lcc open --stop-all`. Both live in `commands/watch.zig`, so
+//! the visible vocabulary and the plumbing stay separable.
 
 const std = @import("std");
 const Io = std.Io;
 const app_mod = @import("../app.zig");
 const daemon = @import("../daemon.zig");
 const sessions = @import("../sessions.zig");
-const ui = @import("../ui.zig");
-const watch_client = @import("../watch_client.zig");
 const watch_paths = @import("../watch_paths.zig");
 const wire = @import("../wire.zig");
 
 pub const Opts = struct {
     /// Stay attached to this terminal instead of detaching.
     foreground: bool = false,
-    stop: bool = false,
-    /// SIGKILL the sessions rather than asking them to finish.
-    force: bool = false,
     status: bool = false,
     json: bool = false,
 };
 
 pub fn run(app: app_mod.App, opts: Opts) !void {
     if (opts.status) return status(app, opts);
-    if (opts.stop) return stop(app, opts);
     return daemon.run(app, .{ .foreground = opts.foreground });
 }
 
@@ -66,19 +65,4 @@ fn status(app: app_mod.App, opts: Opts) !void {
         state.sessions.len,
     });
     app.ui.hint("Socket: {s}", .{socket_path});
-}
-
-fn stop(app: app_mod.App, opts: Opts) !void {
-    var conn = (watch_client.connectExisting(app, .control) catch null) orelse {
-        app.ui.info("No daemon running.", .{});
-        return;
-    };
-    defer conn.close(app.io);
-
-    try conn.sendControl(app.gpa, .stop, wire.Stop{ .force = opts.force });
-    if (opts.force) {
-        app.ui.success("Asked the daemon to stop and kill its sessions.", .{});
-    } else {
-        app.ui.success("Asked the daemon to stop.", .{});
-    }
 }

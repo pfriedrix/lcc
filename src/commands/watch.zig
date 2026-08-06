@@ -1,9 +1,14 @@
-//! `lcc watch` — what the daemon is running, and the handler its hooks call.
+//! `lcc open` — the worktrees and the sessions running in them, and the handler
+//! its hooks call.
 //!
-//! Only the non-interactive half exists so far: `--json` is a one-shot
-//! snapshot that never enters raw mode, which is both the tool-callable path
-//! CLAUDE.md requires and the resolution of a conflict the interactive version
-//! has — a full-screen TUI cannot write its frames through `app.ui`.
+//! The file is still named for `watch`, which is what the command was called
+//! before `lcc open` absorbed it; renaming it would move every `watch_*.zig`
+//! sibling for no gain.
+//!
+//! `--json` is a one-shot snapshot that never enters raw mode, which is both the
+//! tool-callable path CLAUDE.md requires and the resolution of a conflict the
+//! interactive version has — a full-screen TUI cannot write its frames through
+//! `app.ui`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -22,9 +27,18 @@ const linear = @import("../linear.zig");
 const mcp = @import("../mcp.zig");
 const start_cmd = @import("start.zig");
 const watch_table = @import("../watch_table.zig");
+const wire = @import("../wire.zig");
 
 pub const Opts = struct {
     json: bool = false,
+    /// End every background session and let the daemon holding them exit.
+    ///
+    /// Lives here rather than on `lcc daemon` because the daemon is not a thing
+    /// a user of lcc has to know about: they started sessions, and this is how
+    /// they end all of them at once.
+    stop_all: bool = false,
+    /// With `stop_all`, SIGKILL the sessions rather than asking them to finish.
+    force: bool = false,
 };
 
 /// The `lcc watch-hook` side. Deliberately a separate entry point: it is not a
@@ -34,7 +48,7 @@ pub const HookOpts = struct {
     event: ?[]const u8 = null,
 };
 
-const Row = struct {
+pub const Row = struct {
     id: []const u8,
     issue: ?[]const u8,
     branch: []const u8,
@@ -53,6 +67,10 @@ const Row = struct {
 /// points whose errors go straight to `describe`, so nothing downstream reads
 /// the set anyway.
 pub fn run(app: app_mod.App, opts: Opts) anyerror!void {
+    // Before the tty check: `--stop-all` is a one-shot that must work from a
+    // tool call and from a script, not only from a terminal that would get the
+    // dashboard instead.
+    if (opts.stop_all) return stopAll(app, opts);
     // `--json` is a one-shot that never enters raw mode. That is both the
     // tool-callable path CLAUDE.md requires and the resolution of a real
     // conflict: a full-screen TUI cannot write its frames through `app.ui`,
@@ -63,9 +81,26 @@ pub fn run(app: app_mod.App, opts: Opts) anyerror!void {
     if (!opts.json and !(Io.File.stdout().isTty(app.io) catch false)) {
         // Checked before connecting, so the suggestion arrives instead of a
         // failure from somewhere further in.
-        app.ui.hint("Not a terminal — use `lcc watch --json`.", .{});
+        app.ui.hint("Not a terminal — use `lcc open --json`.", .{});
     }
     return snapshotOnce(app, opts);
+}
+
+/// `lcc open --stop-all`. Nothing running is a result, not a failure — the
+/// caller asked for no sessions and there are none.
+fn stopAll(app: app_mod.App, opts: Opts) !void {
+    var conn = (watch_client.connectExisting(app, .control) catch null) orelse {
+        app.ui.info("No background sessions are running.", .{});
+        return;
+    };
+    defer conn.close(app.io);
+
+    try conn.sendControl(app.gpa, .stop, wire.Stop{ .force = opts.force });
+    if (opts.force) {
+        app.ui.success("Killed every background session.", .{});
+    } else {
+        app.ui.success("Asked every background session to finish.", .{});
+    }
 }
 
 fn snapshotOnce(app: app_mod.App, opts: Opts) !void {
@@ -105,10 +140,14 @@ fn outdatedDaemon(app: app_mod.App, arena: std.mem.Allocator, built: ?i64) bool 
 }
 
 /// What to say about it, in one line, in the two places a person will be looking.
-const outdated_warning = "The daemon running these sessions is an older build of lcc than this one.";
-/// Naming what `--stop` costs, because it signals every session's process group
-/// and a hint that omitted that would be advice to lose work.
-const outdated_hint = "It retires itself 30 minutes after the last session ends. `lcc daemon --stop` is immediate, but ends them now.";
+///
+/// Says "these sessions are running an older build" rather than naming the
+/// daemon: the process is not the reader's problem, the behaviour they are
+/// about to get from it is.
+const outdated_warning = "These sessions are running an older build of lcc than this one.";
+/// Naming what `--stop-all` costs, because it signals every session's process
+/// group and a hint that omitted that would be advice to lose work.
+const outdated_hint = "They end on their own 30 minutes after the last one finishes. `lcc open --stop-all` is immediate, but ends them now.";
 
 fn toRow(s: sessions.Session, stale: bool) Row {
     return .{
@@ -125,16 +164,27 @@ fn toRow(s: sessions.Session, stale: bool) Row {
     };
 }
 
+/// The `--json` body, built where a test can read it.
+///
+/// Split out of `emit` because this is stable surface: the keys are what every
+/// slash command parsing `lcc open --json` is written against, and a rename here
+/// breaks them silently. `pub` for the test at the bottom of this file.
+pub fn snapshotJson(gpa: std.mem.Allocator, rows: []const Row, live: bool, outdated: bool) ![]u8 {
+    return std.json.Stringify.valueAlloc(gpa, .{
+        // Whether anything is actually running these sessions right now, as
+        // opposed to `sessions` being the last state written to disk.
+        .sessions_live = live,
+        // Always present, like every other key here. A caller that sees it
+        // true knows the sessions may not behave the way this binary's
+        // contract says — which is otherwise indistinguishable from a bug.
+        .outdated_build = outdated,
+        .sessions = rows,
+    }, .{ .whitespace = .indent_2 });
+}
+
 fn emit(app: app_mod.App, opts: Opts, rows: []const Row, live: bool, outdated: bool, now: i64) !void {
     if (opts.json) {
-        const body = try std.json.Stringify.valueAlloc(app.gpa, .{
-            .daemon_running = live,
-            // Always present, like every other key here. A caller that sees it
-            // true knows the daemon may not behave the way this binary's
-            // contract says — which is otherwise indistinguishable from a bug.
-            .daemon_outdated = outdated,
-            .sessions = rows,
-        }, .{ .whitespace = .indent_2 });
+        const body = try snapshotJson(app.gpa, rows, live, outdated);
         app.ui.payload("{s}\n", .{body});
         app.ui.flush();
         return;
@@ -148,7 +198,7 @@ fn emit(app: app_mod.App, opts: Opts, rows: []const Row, live: bool, outdated: b
         return;
     }
 
-    if (!live) app.ui.warn("No daemon is running — showing the last recorded state.", .{});
+    if (!live) app.ui.warn("Nothing is running these sessions — showing the last recorded state.", .{});
     if (live and outdated) {
         app.ui.warn("{s}", .{outdated_warning});
         app.ui.hint("{s}", .{outdated_hint});
@@ -605,4 +655,36 @@ pub fn hook(app: app_mod.App, opts: HookOpts) !void {
     if (payload.cwd.len == 0) return;
 
     watch_client.report(app, payload.cwd, payload.session_id, event);
+}
+
+test "the --json keys name sessions, never the process behind them" {
+    const gpa = std.testing.allocator;
+
+    const body = try snapshotJson(gpa, &.{}, true, false);
+    defer gpa.free(body);
+
+    // Renaming any of these breaks every slash command parsing this snapshot,
+    // and breaks it silently: a missing key reads as `null`, which reads as
+    // "nothing is running" rather than as a contract that moved.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"sessions_live\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"outdated_build\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"sessions\"") != null);
+
+    // The point of the rename. A caller has sessions; the daemon holding them is
+    // an implementation detail it must not be able to grow a dependency on.
+    try std.testing.expect(std.mem.indexOf(u8, body, "daemon") == null);
+}
+
+test "an empty snapshot still carries both flags, rather than dropping them" {
+    const gpa = std.testing.allocator;
+
+    // The dead-daemon case, which is the one a caller is most likely to hit and
+    // least likely to have tested: no sessions, nothing running them. Both keys
+    // are still present and false, per the JSON contract in CLAUDE.md — absent
+    // values are `null`, never dropped.
+    const body = try snapshotJson(gpa, &.{}, false, false);
+    defer gpa.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"sessions_live\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"outdated_build\": false") != null);
 }

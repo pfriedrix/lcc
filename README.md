@@ -62,10 +62,6 @@ lcc start PE-256 --plan plan.md   # a plan already exists — skip plan mode
 lcc start PE-256 --json   # resolve it and print the result instead of launching an agent
 lcc start PE-256 --no-watch  # run in this terminal; the session dies with it
 lcc start --all      # ignore the activeStates filter
-lcc watch            # the sessions the daemon is running, live
-lcc watch --json     # the same as a one-shot, for a caller that parses it
-lcc daemon --status  # is one running, and how many sessions
-lcc daemon --stop    # ask it to exit
 lcc issue show PE-256        # state, project, labels, description — reads nothing else
 lcc issue show PE-256 --json # the same, for a caller that parses it
 lcc issue state PE-256 "In Progress"    # move it, by the name on the board
@@ -78,6 +74,8 @@ lcc config watchByDefault false   # or name one directly, with no prompt
 lcc list             # dashboard of every worktree (--local to skip the network columns)
 lcc stats            # what each worktree has spent in Claude Code
 lcc open             # the worktrees, and what is running in them
+lcc open --json      # the sessions as a one-shot, for a caller that parses it
+lcc open --stop-all  # end every session running in the background
 lcc open xcode       # pick a worktree and open it in Xcode instead
 lcc remove           # select worktrees, remove them + their branches + Xcode build data
 lcc remove --merged  # bulk: every worktree and branch whose work already landed
@@ -93,14 +91,14 @@ Token statistics and session cleanup read Claude Code transcripts under `~/.clau
 
 ### Sessions that outlive the terminal
 
-`lcc start` hands the session to a small daemon that owns its pty, rather than
-taking over the terminal itself. Closing the window, losing an ssh link or
-rebooting the terminal emulator no longer kills the agent — the work carries on
-and `lcc watch` shows it.
+`lcc start` runs the session in the background rather than taking over the
+terminal it was called from. Closing the window, losing an ssh link or rebooting
+the terminal emulator no longer kills the agent — the work carries on and
+`lcc open` shows it.
 
 `lcc open` is the dashboard: every worktree of the repo you are in, and
 whatever is running in each. Enter opens one — attaching if a session is
-already there, starting one if not. `lcc watch` is an alias.
+already there, starting one if not.
 
 ```
   ISSUE   STATUS        BRANCH                              AGE
@@ -145,24 +143,28 @@ schedules each still disturbed its rendering. Doing it properly means emulating
 a terminal, which is more than one line of text is worth, so the row went back
 to the agent.
 
-**Two things worth knowing.** Sessions do not survive the *daemon* dying —
-closing the pty revokes it and the agent gets a hangup, the same property tmux
-has. And `lcc remove` does not yet check whether a worktree has a live session
-in it, so check `lcc watch` before removing one.
+`lcc open --stop-all` ends every background session at once, and `--force`
+kills them rather than letting them finish. Otherwise they retire on their own
+30 minutes after the last one is done, so nothing accumulates from a month of
+finished work.
 
-A daemon outlives rebuilds. It holds the image it started with, so after
-`zig build` the daemon answering you can be many commits behind the `lcc` that
-is asking — same path, same protocol, older behaviour, and every symptom of it
-looks like a bug in the new code. The dashboard says so when it happens
-(`daemon_outdated` in `--json`). It retires itself 30 minutes after the last
-session ends; `lcc daemon --stop` is immediate but signals every session's
-process group, which ends them.
+**Two things worth knowing.** Sessions run in one shared background process, and
+they do not survive it: if it dies the ptys are revoked and every agent gets a
+hangup, the same property tmux has. And `lcc remove` does not yet check whether a
+worktree has a live session in it, so check `lcc open` before removing one.
+
+Sessions also hold the build of `lcc` they started under. After `zig build` the
+sessions still running can be many commits behind the `lcc` you are typing —
+older behaviour reached through the same command, and every symptom of it looks
+like a bug in the new code. The dashboard says so when it happens
+(`outdated_build` in `--json`), and `lcc open --stop-all` clears it, at the cost
+of ending the work in flight.
 
 Turn the whole thing off with `lcc config watchByDefault false`, or per
 invocation with `lcc start --no-watch`. Either way `lcc start` goes back to
-running Claude Code in the terminal it was called from. If the daemon cannot be
-reached, `lcc start` says so and falls back to that on its own rather than
-failing.
+running Claude Code in the terminal it was called from. If a session cannot be
+put in the background, `lcc start` says so and falls back to that on its own
+rather than failing.
 
 ### The worktree dashboard
 
@@ -470,7 +472,9 @@ Failures take the same shape as `lcc start --json` — JSON on stdout, the human
 
 ### `lcc open`
 
-Bare `lcc open` opens Claude Code. `lcc open claude` and `lcc open xcode` name the target explicitly, case-insensitively. Claude resumes only when the worktree has transcripts; `--no-resume` starts it fresh.
+Bare `lcc open` is the dashboard above; `lcc open claude` names that target explicitly and `lcc open xcode` picks the other one, case-insensitively.
+
+`--json` prints the sessions as a one-shot instead of drawing the dashboard, and `--stop-all` (with `--force` to kill rather than ask) ends every background session. Both are non-interactive, so both work from a script or a tool call, where the dashboard cannot. Neither means anything to `lcc open xcode`, which rejects them rather than ignoring them.
 
 ### `lcc open xcode`
 
@@ -669,7 +673,7 @@ months after anyone typed it.
 | `startTaskCommand` | `""` | Passed to Claude Code as its initial prompt. Placeholders: `{identifier}`, `{branch}`, `{url}`, `{plan}` (the `--plan` path, empty without it — and required in the template before `--plan` is accepted) |
 | `linkPatterns` | `[".env", ".env.*", "CLAUDE.md", "CLAUDE.local.md", ".claude/settings.local.json"]` | Which files to symlink into each worktree |
 | `linkExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
-| `watchByDefault` | `true` | Hand new sessions to the daemon so they outlive the terminal |
+| `watchByDefault` | `true` | Run new sessions in the background so they outlive the terminal |
 | `planMode` | `true` | Open new sessions in plan mode. `--plan <file>` turns it off regardless |
 | `resumeSessions` | `true` | `lcc open` resumes the worktree's last session |
 | `showTokens` | `true` | The TOKENS column in `lcc list`. Off skips reading transcripts, which is that column's whole cost |
