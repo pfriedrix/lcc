@@ -99,20 +99,35 @@ pub fn compose(
     var used: usize = 0;
 
     const p = ui.palette();
-    for (list, 0..) |s, i| {
-        if (i >= 9) break; // numbered 1..9; past that there is no key to press
+    var shown: usize = 0;
+    for (list) |s| {
+        // A finished session is not somewhere you can go. It lingers in the
+        // registry for a few minutes so the dashboard can say what became of
+        // it, but on a switcher it is a number that does nothing — and when a
+        // worktree has been restarted it sits there as a second entry with the
+        // same name as the live one.
+        if (s.parsedStatus() == .exited) continue;
         const label = s.issue orelse s.branch;
         const attached = std.mem.eql(u8, s.id, current_id);
         const glyph = barGlyph(s, attached);
-        // A digit per session, so the bar names the key rather than only the
-        // session — a list you cannot act on is decoration.
-        const cost = ui.displayWidth(label) + ui.displayWidth(glyph) + 4;
+        // glyph + one space + label + one trailing space. Counting a column
+        // that is not printed leaves the row short of the width it padded for,
+        // and the right-aligned keys lose their last characters.
+        const cost = ui.displayWidth(glyph) + 1 + ui.displayWidth(label) + 1;
         if (used + cost > budget) break;
-        w.print("{s}{d} {s}{s} {s}{s} ", .{
-            if (attached) p.bold else p.dim,
-            i + 1,
+        shown += 1;
+        // No numbers. They were a key you could press, and there is no such
+        // key — the bar was advertising a switch that does not exist.
+        //
+        // Colour on the glyph alone. Painting the label too made a whole entry
+        // one colour, which reads as an alert rather than as a status, and
+        // with several sessions the row becomes competing signals instead of a
+        // list.
+        w.print("{s}{s}{s} {s}{s}{s} ", .{
             watch_table.paint(s.parsedStatus(), p),
             glyph,
+            p.reset,
+            if (attached) p.bold else p.dim,
             label,
             p.reset,
         }) catch break;
@@ -136,9 +151,24 @@ fn testSessions() []const sessions.Session {
             .{ .id = "s-1", .issue = "PE-256", .branch = "feature/a", .status = "waiting" },
             .{ .id = "s-2", .issue = "PE-270", .branch = "feature/b", .status = "active" },
             .{ .id = "s-3", .issue = null, .branch = "feature/c", .status = "idle" },
+            // Restarted: the finished one lingers in the registry beside the
+            // live one, under the same name.
+            .{ .id = "s-4", .issue = "PE-256", .branch = "feature/a", .status = "exited" },
         };
     };
     return &S.list;
+}
+
+test "a finished session is not offered as somewhere to go" {
+    var buf: [512]u8 = undefined;
+    ui.setColor(false);
+    const out = compose(&buf, testSessions(), "s-1", 100);
+    // PE-256 appears once — the live one — not twice with its own corpse.
+    var count: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, out, at, "PE-256")) |found| : (at = found + 1) count += 1;
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expect(std.mem.indexOf(u8, out, "✗") == null);
 }
 
 test "the row reserves every line but the last" {
@@ -214,9 +244,9 @@ test "the attached session is marked, the others are not" {
     try testing.expect(std.mem.indexOf(u8, out, "● PE-256") != null);
     try testing.expect(std.mem.indexOf(u8, out, "*") == null);
 
-    // Numbered, so the bar names the key as well as the session.
-    try testing.expect(std.mem.indexOf(u8, out, "1 ") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "2 ") != null);
+    // No numbers: they read as keys you could press, and there is none.
+    try testing.expect(std.mem.indexOf(u8, out, "1 ") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "2 ") == null);
 }
 
 test "a bar never exceeds the width it was given" {
