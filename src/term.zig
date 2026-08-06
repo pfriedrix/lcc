@@ -25,7 +25,13 @@ pub const Size = struct { rows: u16, cols: u16 };
 
 pub const Terminal = struct {
     fd: std.posix.fd_t,
+    /// What to put back on the way out.
     saved: std.posix.termios,
+    /// What was actually set. `readPending` used to rebuild its mode from
+    /// `saved`, which quietly turned the input translation back on for the
+    /// length of an escape sequence — the same flags this type exists to keep
+    /// off.
+    raw: std.posix.termios,
 
     pub fn enterRaw() Error!Terminal {
         const fd = std.posix.STDIN_FILENO;
@@ -39,12 +45,35 @@ pub const Terminal = struct {
         raw.lflag.ICANON = false;
         raw.lflag.ECHO = false;
         raw.lflag.ISIG = false;
+        // Input translation off, which "raw mode" was only pretending to be.
+        //
+        // `ICRNL` is the one that mattered and the one that hid: the line
+        // discipline turns the CR the terminal sends for Enter into an NL
+        // before anyone reads it. The pickers never noticed, because `readKey`
+        // treats both as `.enter`. But `lcc watch` forwards these bytes
+        // verbatim to another program, and Claude Code's resume picker acts on
+        // CR and ignores NL — so every key worked there except Enter, which is
+        // exactly the shape of a translation that touches one byte and no
+        // others.
+        //
+        // `IXON` goes too, so Ctrl-S and Ctrl-Q reach the agent instead of
+        // freezing the terminal on the way.
+        raw.iflag.ICRNL = false;
+        raw.iflag.INLCR = false;
+        raw.iflag.IGNCR = false;
+        raw.iflag.IXON = false;
+        raw.iflag.BRKINT = false;
+        raw.iflag.ISTRIP = false;
+        raw.iflag.PARMRK = false;
+        // `OPOST` deliberately stays on. Everything lcc draws itself ends lines
+        // with a bare `\n` and relies on the terminal adding the carriage
+        // return; clearing it would stair-step every frame this program prints.
         raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
         raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
         // NOW, not FLUSH: anything typed while the issues were still loading is
         // real input the user meant, and FLUSH would silently discard it.
         std.posix.tcsetattr(fd, .NOW, raw) catch return Error.NotATerminal;
-        return .{ .fd = fd, .saved = saved };
+        return .{ .fd = fd, .saved = saved, .raw = raw };
     }
 
     pub fn restore(self: Terminal) void {
@@ -56,10 +85,7 @@ pub const Terminal = struct {
     /// Reads whatever is already buffered, without blocking. Used to tell a
     /// bare Esc from the start of an arrow-key sequence.
     pub fn readPending(self: Terminal, buf: []u8) usize {
-        var poll_mode = self.saved;
-        poll_mode.lflag.ICANON = false;
-        poll_mode.lflag.ECHO = false;
-        poll_mode.lflag.ISIG = false;
+        var poll_mode = self.raw;
         poll_mode.cc[@intFromEnum(std.posix.V.MIN)] = 0;
         poll_mode.cc[@intFromEnum(std.posix.V.TIME)] = 0;
         std.posix.tcsetattr(self.fd, .NOW, poll_mode) catch return 0;
@@ -326,6 +352,39 @@ test "reset clears the whole screen and forgets the count" {
     // The point of reset is that `lines` was untrustworthy — it must not
     // survive into the next frame.
     try testing.expectEqual(@as(usize, 0), screen.lines);
+}
+
+test "raw mode leaves the bytes alone, but still lets lcc's own output wrap" {
+    // Asserted on the struct rather than on a terminal, since a test has no
+    // tty. `enterRaw` builds exactly this from what tcgetattr returned.
+    var t: std.posix.termios = undefined;
+    t.lflag = .{ .ICANON = true, .ECHO = true, .ISIG = true };
+    t.iflag = .{ .ICRNL = true, .IXON = true, .BRKINT = true };
+    t.oflag = .{ .OPOST = true, .ONLCR = true };
+
+    t.lflag.ICANON = false;
+    t.lflag.ECHO = false;
+    t.lflag.ISIG = false;
+    t.iflag.ICRNL = false;
+    t.iflag.INLCR = false;
+    t.iflag.IGNCR = false;
+    t.iflag.IXON = false;
+    t.iflag.BRKINT = false;
+    t.iflag.ISTRIP = false;
+    t.iflag.PARMRK = false;
+
+    // The whole bug: with ICRNL on, the Enter key arrives as NL and a program
+    // downstream that acts on CR never sees it.
+    try testing.expect(!t.iflag.ICRNL);
+    try testing.expect(!t.iflag.INLCR);
+    try testing.expect(!t.iflag.IGNCR);
+    // Ctrl-S must reach the agent rather than freezing the terminal in front
+    // of it.
+    try testing.expect(!t.iflag.IXON);
+    // And output translation stays: every frame lcc draws ends in a bare `\n`
+    // and needs the terminal to add the carriage return.
+    try testing.expect(t.oflag.OPOST);
+    try testing.expect(t.oflag.ONLCR);
 }
 
 test "a shortcut is a key position, not a character" {
