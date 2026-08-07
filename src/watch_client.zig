@@ -186,6 +186,7 @@ pub fn report(
     session_id: []const u8,
     event: []const u8,
     permission_mode: []const u8,
+    session: []const u8,
 ) void {
     const opened = if (socket) |path|
         connectAt(app, .control, path)
@@ -198,6 +199,7 @@ pub fn report(
         .session_id = session_id,
         .event = event,
         .permission_mode = permission_mode,
+        .session = session,
     }) catch {};
 }
 

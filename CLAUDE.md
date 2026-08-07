@@ -116,6 +116,14 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
 - **`src/keychain.zig` imports five narrow C headers on purpose.** The umbrella
   `CoreFoundation.h` / `Security.h` do not translate on this SDK. Do not tidy them into one
   import.
+- **A session's hook settings file is per session, not per daemon.** `watch_paths.hooksFor`
+  names it `hooks-<session id>.json` and `watch_hooks.settingsJson` bakes that id into every
+  hook command line, so a report says which session it came from. Collapsing them back into
+  one shared `hooks.json` compiles and looks tidier, and it silently routes every session's
+  hooks to whichever session in that worktree was registered first — including a dead one,
+  which then eats the live sessions' updates while they sit frozen on whatever their first
+  byte of output set. The worktree path is *not* a unique key: `lcc open` will happily start
+  a second session in a worktree that already has one.
 
 ## Style
 

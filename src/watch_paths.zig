@@ -31,9 +31,14 @@ pub fn lock(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]
     return std.fs.path.join(gpa, &.{ base, "daemon.lock" });
 }
 
-pub fn hooks(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
+pub fn hooksFor(
+    gpa: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    session_id: []const u8,
+) ![]const u8 {
     const base = try dir(gpa, environ);
-    return std.fs.path.join(gpa, &.{ base, "hooks.json" });
+    const name = try std.fmt.allocPrint(gpa, "hooks-{s}.json", .{session_id});
+    return std.fs.path.join(gpa, &.{ base, name });
 }
 
 pub fn logFile(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
@@ -65,8 +70,27 @@ test "LCC_WATCH_DIR moves the socket, the lock and the hooks together" {
 
     try std.testing.expectEqualStrings("/tmp/lcc-test/daemon.sock", try socket(arena, &environ));
     try std.testing.expectEqualStrings("/tmp/lcc-test/daemon.lock", try lock(arena, &environ));
-    try std.testing.expectEqualStrings("/tmp/lcc-test/hooks.json", try hooks(arena, &environ));
     try std.testing.expectEqualStrings("/tmp/lcc-test/daemon.log", try logFile(arena, &environ));
+}
+
+test "each session gets a settings file of its own, named for it" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("LCC_WATCH_DIR", "/tmp/lcc-test");
+
+    try std.testing.expectEqualStrings(
+        "/tmp/lcc-test/hooks-s-00000001.json",
+        try hooksFor(arena, &environ, "s-00000001"),
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        try hooksFor(arena, &environ, "s-00000001"),
+        try hooksFor(arena, &environ, "s-00000002"),
+    ));
 }
 
 test "an empty override is not an override" {

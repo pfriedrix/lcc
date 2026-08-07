@@ -500,6 +500,10 @@ fn watchHookCommand(app: app_mod.App, args: []const []const u8) !void {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.event = args[i];
+        } else if (eq(args[i], "--session")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.session = args[i];
         } else return error.UnknownOption;
     }
     watch_cmd.hook(app, opts) catch {};

@@ -26,6 +26,7 @@ pub const Opts = struct {
 pub const HookOpts = struct {
     socket: ?[]const u8 = null,
     event: ?[]const u8 = null,
+    session: ?[]const u8 = null,
 };
 
 pub const Row = struct {
@@ -418,11 +419,14 @@ fn collect(app: app_mod.App, arena: std.mem.Allocator, now: i64) ![]watch_table.
     return rows.toOwnedSlice(arena);
 }
 
-fn findSession(list: []const sessions.Session, worktree: []const u8) ?sessions.Session {
+pub fn findSession(list: []const sessions.Session, worktree: []const u8) ?sessions.Session {
+    var fallback: ?sessions.Session = null;
     for (list) |s| {
-        if (std.mem.eql(u8, s.worktree, worktree)) return s;
+        if (!std.mem.eql(u8, s.worktree, worktree)) continue;
+        if (s.parsedStatus() != .exited) return s;
+        if (fallback == null) fallback = s;
     }
-    return null;
+    return fallback;
 }
 
 fn issueOf(gpa: std.mem.Allocator, branch: []const u8) ?[]const u8 {
@@ -494,7 +498,15 @@ pub fn hook(app: app_mod.App, opts: HookOpts) !void {
     const payload = watch_hooks.parsePayload(app.gpa, raw) orelse return;
     if (payload.cwd.len == 0) return;
 
-    watch_client.report(app, opts.socket, payload.cwd, payload.session_id, event, payload.permission_mode);
+    watch_client.report(
+        app,
+        opts.socket,
+        payload.cwd,
+        payload.session_id,
+        event,
+        payload.permission_mode,
+        opts.session orelse "",
+    );
 }
 
 test "the --json keys name sessions, never the process behind them" {
@@ -518,4 +530,40 @@ test "an empty snapshot still carries both flags, rather than dropping them" {
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"sessions_live\": false") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"outdated_build\": false") != null);
+}
+
+test "a worktree row shows the session that is alive, not the first one recorded" {
+    const dead: sessions.Session = .{
+        .id = "s-00000005",
+        .worktree = "/w/pe-289",
+        .branch = "feature/pe-289",
+        .issue = "PE-289",
+        .repo_root = "/r",
+        .pid = 34387,
+        .status = "exited",
+        .status_at = 1000,
+        .started_at = 900,
+        .last_activity_at = 1000,
+        .exit_code = 0,
+    };
+    var live = dead;
+    live.id = "s-00000009";
+    live.status = "idle";
+    live.exit_code = null;
+
+    const picked = findSession(&.{ dead, live }, "/w/pe-289").?;
+    if (!std.mem.eql(u8, picked.id, "s-00000009")) {
+        std.debug.print(
+            "picked {s} ({s}) over the live {s}: the row reports a corpse while an agent " ++
+                "is working in that worktree, and enter on it starts yet another session " ++
+                "instead of attaching.\n",
+            .{ picked.id, picked.status, live.id },
+        );
+        return error.TestExpectedEqual;
+    }
+
+    const only_dead = findSession(&.{dead}, "/w/pe-289").?;
+    try std.testing.expectEqualStrings("s-00000005", only_dead.id);
+
+    try std.testing.expect(findSession(&.{ dead, live }, "/w/somewhere-else") == null);
 }
