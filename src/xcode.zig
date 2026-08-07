@@ -1,13 +1,8 @@
-//! The Xcode side of a worktree: finding its entry point, opening it, and asking
-//! a running Xcode to let go of it before the directory is deleted.
-
 const std = @import("std");
 const Io = std.Io;
 const disk = @import("disk.zig");
 const exec = @import("exec.zig");
 
-// Directories that never hold the project we want to open — skip them while
-// searching so we don't descend into dependencies or build output.
 const ignore_dirs = [_][]const u8{ "node_modules", "Pods", "Carthage", "DerivedData", "vendor" };
 
 pub const Kind = enum {
@@ -15,7 +10,6 @@ pub const Kind = enum {
     project,
     package,
 
-    /// Same depth wins by kind: a workspace references its projects, so prefer it.
     fn rank(self: Kind) u8 {
         return switch (self) {
             .workspace => 0,
@@ -46,8 +40,6 @@ const Candidate = struct {
 
 pub const Error = error{ XcodeLaunchFailed, XcodeCloseFailed } || std.mem.Allocator.Error;
 
-/// Best Xcode entry point under `root`: shallowest match, then
-/// workspace > project > package at the same depth. Null when nothing matches.
 pub fn findTarget(gpa: std.mem.Allocator, io: Io, root: []const u8, max_depth: u8) !?Target {
     var found: std.ArrayList(Candidate) = .empty;
     try walk(gpa, io, root, 0, max_depth, &found);
@@ -81,11 +73,11 @@ fn walk(
         if (entry.kind == .directory) {
             if (std.mem.endsWith(u8, entry.name, ".xcworkspace")) {
                 try out.append(gpa, .{ .path = full, .kind = .workspace, .depth = depth });
-                continue; // bundle — don't descend
+                continue;
             }
             if (std.mem.endsWith(u8, entry.name, ".xcodeproj")) {
                 try out.append(gpa, .{ .path = full, .kind = .project, .depth = depth });
-                continue; // bundle — don't descend
+                continue;
             }
             if (std.mem.startsWith(u8, entry.name, ".")) continue;
             var ignored = false;
@@ -110,8 +102,6 @@ pub fn describe(gpa: std.mem.Allocator, target: Target) ![]u8 {
     });
 }
 
-/// `open -a Xcode` returns as soon as the app is handed the document — Xcode is
-/// a GUI app, not attached to this process.
 pub fn open(gpa: std.mem.Allocator, io: Io, target: []const u8) Error!void {
     const out = exec.run(gpa, io, &.{ "open", "-a", "Xcode", target }, null) catch
         return Error.XcodeLaunchFailed;
@@ -123,14 +113,9 @@ pub fn open(gpa: std.mem.Allocator, io: Io, target: []const u8) Error!void {
 
 pub var last_error: []const u8 = "";
 
-/// One document open in one running Xcode.
 pub const Document = struct {
-    /// App bundle of the instance holding it, e.g. `/Applications/Xcode.app`.
     app: []const u8,
-    /// Path exactly as Xcode reported it — the string `close` is matched against.
     path: []const u8,
-    /// The same path with symlinks resolved, which is what containment is judged
-    /// by: Xcode answers `/tmp/…` where git says `/private/tmp/…`.
     resolved: []const u8,
 
     pub fn name(self: Document) []const u8 {
@@ -138,26 +123,15 @@ pub const Document = struct {
     }
 };
 
-/// What the running Xcodes are holding right now.
 pub const Open = struct {
-    /// Project and workspace windows — the documents that can be closed. Closing
-    /// one takes the editors inside it along.
     workspaces: []const Document = &.{},
-    /// Documents with edits that are not on disk, of any kind. Xcode's scripting
-    /// interface has no `save` (its documents answer `close` and nothing else), so
-    /// these are a reason to stop rather than something lcc can settle on the
-    /// user's behalf.
     unsaved: []const Document = &.{},
-    /// A running Xcode that could not be asked — automation not permitted, or one
-    /// too busy to answer in time. An empty list from that run means "we don't
-    /// know", not "nothing is open", and the caller should say so.
     unanswered: bool = false,
 
     pub fn empty(self: Open) bool {
         return self.workspaces.len == 0 and self.unsaved.len == 0;
     }
 
-    /// The subset sitting at or below `worktree`.
     pub fn inside(self: Open, gpa: std.mem.Allocator, io: Io, worktree: []const u8) !Open {
         const root_path = disk.realPath(gpa, io, worktree);
         return .{
@@ -171,8 +145,6 @@ pub const Open = struct {
 fn under(gpa: std.mem.Allocator, docs: []const Document, root_path: []const u8) ![]const Document {
     var kept: std.ArrayList(Document) = .empty;
     for (docs) |doc| {
-        // A Swift package opened by its folder is reported as that folder, so the
-        // worktree root can *be* the document rather than contain one.
         const at_root = std.mem.eql(u8, doc.resolved, root_path);
         if (!at_root and !disk.isInside(gpa, root_path, doc.resolved)) continue;
         try kept.append(gpa, doc);
@@ -180,12 +152,6 @@ fn under(gpa: std.mem.Allocator, docs: []const Document, root_path: []const u8) 
     return kept.toOwnedSlice(gpa);
 }
 
-/// Every document open in every running Xcode.
-///
-/// Nothing running, automation refused, an Xcode wedged mid-index — none of those
-/// is an error here. They cost lcc the chance to close a window, not the ability
-/// to remove the worktree, so they come back as an empty `Open` with `unanswered`
-/// set where a live Xcode actually stonewalled us.
 pub fn openDocuments(gpa: std.mem.Allocator, io: Io) !Open {
     var workspaces: std.ArrayList(Document) = .empty;
     var unsaved: std.ArrayList(Document) = .empty;
@@ -206,11 +172,6 @@ pub fn openDocuments(gpa: std.mem.Allocator, io: Io) !Open {
     };
 }
 
-/// Closes `docs`, telling each Xcode instance once.
-///
-/// `saving no` is deliberate: a CLI must not be able to raise a save dialog nobody
-/// is looking at. Callers refuse to get this far while anything under the worktree
-/// is unsaved, so by now there is nothing to discard.
 pub fn closeDocuments(gpa: std.mem.Allocator, io: Io, docs: []const Document) Error!void {
     var told: std.ArrayList([]const u8) = .empty;
     for (docs) |doc| {
@@ -226,8 +187,6 @@ pub fn closeDocuments(gpa: std.mem.Allocator, io: Io, docs: []const Document) Er
 fn closeIn(gpa: std.mem.Allocator, io: Io, bundle: []const u8, docs: []const Document) Error!void {
     const script = try std.fmt.allocPrint(gpa, close_script, .{try quote(gpa, bundle)});
 
-    // The paths go as arguments rather than into the script, so a path lcc did not
-    // write cannot end up as AppleScript source.
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(gpa, &.{ "osascript", "-e", script, "--" });
     for (docs) |doc| {
@@ -241,13 +200,6 @@ fn closeIn(gpa: std.mem.Allocator, io: Io, bundle: []const u8, docs: []const Doc
     }
 }
 
-/// The app bundle of every Xcode running right now, deduplicated.
-///
-/// Found through `ps` rather than asked of macOS, because the question is which
-/// *bundles* are live: a beta carries the release build's bundle id, so
-/// `application id "com.apple.dt.Xcode"` silently picks one of the two — and on a
-/// machine running both, the wrong pick is the one holding the worktree. Addressed
-/// by path, each instance answers for itself.
 fn runningApps(gpa: std.mem.Allocator, io: Io) ![]const []const u8 {
     const out = exec.run(gpa, io, &.{ "ps", "-axo", "comm=" }, null) catch return &.{};
     defer out.deinit(gpa);
@@ -272,8 +224,6 @@ fn parseApps(gpa: std.mem.Allocator, listing: []const u8) ![]const []const u8 {
     return apps.toOwnedSlice(gpa);
 }
 
-/// One round trip per instance: its windows, then whatever it has unsaved.
-/// Null when that Xcode did not answer.
 fn query(gpa: std.mem.Allocator, io: Io, bundle: []const u8) ?[]const u8 {
     const script = std.fmt.allocPrint(gpa, list_script, .{quote(gpa, bundle) catch return null}) catch
         return null;
@@ -314,7 +264,6 @@ fn collect(
     }
 }
 
-/// A path as an AppleScript string literal.
 fn quote(gpa: std.mem.Allocator, path: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     for (path) |c| {
@@ -324,8 +273,6 @@ fn quote(gpa: std.mem.Allocator, path: []const u8) ![]const u8 {
     return out.toOwnedSlice(gpa);
 }
 
-/// `with timeout` keeps a busy Xcode from holding the whole command hostage — the
-/// default Apple event timeout is a full minute.
 const list_script =
     \\set out to ""
     \\with timeout of 5 seconds
@@ -369,7 +316,6 @@ test "shallowest match wins, workspace beats project at equal depth" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // A deep project, plus a workspace and a project side by side one level up.
     try tmp.dir.createDirPath(io, "App/Deep/Nested/Thing.xcodeproj");
     try tmp.dir.createDirPath(io, "App/Thing.xcodeproj");
     try tmp.dir.createDirPath(io, "App/Thing.xcworkspace");
@@ -393,7 +339,6 @@ test "Package.swift is found when nothing else is" {
     defer arena_state.deinit();
 
     try tmp.dir.writeFile(io, .{ .sub_path = "Package.swift", .data = "// swift-tools-version:5.9\n" });
-    // Dependency output must never be picked up.
     try tmp.dir.createDirPath(io, "node_modules/thing.xcodeproj");
 
     const found = (try findTarget(arena_state.allocator(), io, root, 4)).?;
@@ -406,8 +351,6 @@ test "a beta running beside the release build is two instances, not one" {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
 
-    // What `ps -axo comm=` looks like with both open: helper processes belonging to
-    // Xcode are all over it, and only the app executables count.
     const listing =
         \\/Applications/Xcode.app/Contents/MacOS/Xcode
         \\/Users/me/Downloads/Xcode-beta.app/Contents/MacOS/Xcode
@@ -443,8 +386,6 @@ test "a listing splits into windows and unsaved work" {
     try std.testing.expectEqual(@as(usize, 1), unsaved.items.len);
     try std.testing.expectEqualStrings("App.xcodeproj", workspaces.items[0].name());
 
-    // Only what belongs to this worktree comes back, and the other project's
-    // window is left out of both lists.
     const held: Open = .{ .workspaces = workspaces.items, .unsaved = unsaved.items };
     const here = try held.inside(arena, io, "/Users/me/Projects/App/.lcc/worktrees/pe-101");
     try std.testing.expectEqual(@as(usize, 1), here.workspaces.len);
@@ -480,7 +421,6 @@ test "an unanswered Xcode is not an empty one" {
 
     const held: Open = .{ .unanswered = true };
     try std.testing.expect(held.empty());
-    // The doubt has to survive the filter, or the caller reports silence as safety.
     const here = try held.inside(arena_state.allocator(), io, "/Users/me/Projects/App");
     try std.testing.expect(here.unanswered);
 }

@@ -1,15 +1,3 @@
-//! `lcc open` — the worktrees and the sessions running in them, and the handler
-//! its hooks call.
-//!
-//! The file is still named for `watch`, which is what the command was called
-//! before `lcc open` absorbed it; renaming it would move every `watch_*.zig`
-//! sibling for no gain.
-//!
-//! `--json` is a one-shot snapshot that never enters raw mode, which is both the
-//! tool-callable path CLAUDE.md requires and the resolution of a conflict the
-//! interactive version has — a full-screen TUI cannot write its frames through
-//! `app.ui`.
-
 const std = @import("std");
 const Io = std.Io;
 const app_mod = @import("../app.zig");
@@ -31,24 +19,14 @@ const wire = @import("../wire.zig");
 
 pub const Opts = struct {
     json: bool = false,
-    /// End every background session and let the daemon holding them exit.
-    ///
-    /// Lives here rather than on `lcc daemon` because the daemon is not a thing
-    /// a user of lcc has to know about: they started sessions, and this is how
-    /// they end all of them at once.
     stop_all: bool = false,
-    /// With `stop_all`, SIGKILL the sessions rather than asking them to finish.
     force: bool = false,
 };
 
-/// The `lcc watch-hook` side. Deliberately a separate entry point: it is not a
-/// user-facing command, it is what a Claude Code hook execs.
 pub const HookOpts = struct {
-    /// The daemon's socket, as the daemon wrote it into the hook command line.
-    /// Authoritative over anything in the environment — a hook inherits the
-    /// session's, which belongs to whatever shell started it.
     socket: ?[]const u8 = null,
     event: ?[]const u8 = null,
+    session: ?[]const u8 = null,
 };
 
 pub const Row = struct {
@@ -64,33 +42,17 @@ pub const Row = struct {
     stale: bool,
 };
 
-/// The error set is written out rather than inferred, which it cannot be:
-/// `start` opens this dashboard, and the dashboard's `n` starts an issue
-/// through `start`. Inference chases that in a circle. Both are command entry
-/// points whose errors go straight to `describe`, so nothing downstream reads
-/// the set anyway.
 pub fn run(app: app_mod.App, opts: Opts) anyerror!void {
-    // Before the tty check: `--stop-all` is a one-shot that must work from a
-    // tool call and from a script, not only from a terminal that would get the
-    // dashboard instead.
     if (opts.stop_all) return stopAll(app, opts);
-    // `--json` is a one-shot that never enters raw mode. That is both the
-    // tool-callable path CLAUDE.md requires and the resolution of a real
-    // conflict: a full-screen TUI cannot write its frames through `app.ui`,
-    // and `ui.divert` has no meaning for one.
     if (!opts.json and Io.File.stdout().isTty(app.io) catch false) {
         return dashboard(app);
     }
     if (!opts.json and !(Io.File.stdout().isTty(app.io) catch false)) {
-        // Checked before connecting, so the suggestion arrives instead of a
-        // failure from somewhere further in.
         app.ui.hint("Not a terminal — use `lcc open --json`.", .{});
     }
     return snapshotOnce(app, opts);
 }
 
-/// `lcc open --stop-all`. Nothing running is a result, not a failure — the
-/// caller asked for no sessions and there are none.
 fn stopAll(app: app_mod.App, opts: Opts) !void {
     var conn = (watch_client.connectExisting(app, .control) catch null) orelse {
         app.ui.info("No background sessions are running.", .{});
@@ -107,8 +69,6 @@ fn stopAll(app: app_mod.App, opts: Opts) !void {
 }
 
 fn snapshotOnce(app: app_mod.App, opts: Opts) !void {
-    // The live snapshot when a daemon is up; the on-disk projection when it is
-    // not, so the answer is "nothing is running" rather than an error.
     const live = watch_client.snapshot(app) catch null;
     const now = app_mod.nowSeconds(app.io);
     const outdated = outdatedDaemon(app, app.gpa, exec.selfModified(app.gpa, app.io));
@@ -124,32 +84,17 @@ fn snapshotOnce(app: app_mod.App, opts: Opts) !void {
     const rows = try app.gpa.alloc(Row, resolved.len);
     for (resolved, 0..) |r, i| {
         var row = toRow(r.session, r.stale);
-        // The reader's verdict wins over what the file claims: a dead daemon
-        // makes every status unknown, and a vanished worktree makes it orphan.
         row.status = @tagName(r.status);
         rows[i] = row;
     }
     return emit(app, opts, rows, false, outdated, now);
 }
 
-/// Is the daemon holding these sessions an older build than this binary?
-///
-/// Read from the registry rather than asked over the wire, and deliberately: the
-/// daemons this is meant to catch are the ones already running, which cannot be
-/// taught to answer a new frame. `started_at` is the one thing every build has
-/// always written. See `sessions.daemonOutdated`.
 fn outdatedDaemon(app: app_mod.App, arena: std.mem.Allocator, built: ?i64) bool {
     return sessions.daemonOutdated(sessions.load(arena, app.io, app.environ), built);
 }
 
-/// What to say about it, in one line, in the two places a person will be looking.
-///
-/// Says "these sessions are running an older build" rather than naming the
-/// daemon: the process is not the reader's problem, the behaviour they are
-/// about to get from it is.
 const outdated_warning = "These sessions are running an older build of lcc than this one.";
-/// Naming what `--stop-all` costs, because it signals every session's process
-/// group and a hint that omitted that would be advice to lose work.
 const outdated_hint = "They end on their own 30 minutes after the last one finishes. `lcc open --stop-all` is immediate, but ends them now.";
 
 fn toRow(s: sessions.Session, stale: bool) Row {
@@ -167,19 +112,9 @@ fn toRow(s: sessions.Session, stale: bool) Row {
     };
 }
 
-/// The `--json` body, built where a test can read it.
-///
-/// Split out of `emit` because this is stable surface: the keys are what every
-/// slash command parsing `lcc open --json` is written against, and a rename here
-/// breaks them silently. `pub` for the test at the bottom of this file.
 pub fn snapshotJson(gpa: std.mem.Allocator, rows: []const Row, live: bool, outdated: bool) ![]u8 {
     return std.json.Stringify.valueAlloc(gpa, .{
-        // Whether anything is actually running these sessions right now, as
-        // opposed to `sessions` being the last state written to disk.
         .sessions_live = live,
-        // Always present, like every other key here. A caller that sees it
-        // true knows the sessions may not behave the way this binary's
-        // contract says — which is otherwise indistinguishable from a bug.
         .outdated_build = outdated,
         .sessions = rows,
     }, .{ .whitespace = .indent_2 });
@@ -194,8 +129,6 @@ fn emit(app: app_mod.App, opts: Opts, rows: []const Row, live: bool, outdated: b
     }
 
     if (rows.len == 0) {
-        // An empty dashboard is an answer, not a failure — `stats` treats "this
-        // one has cost nothing yet" the same way.
         app.ui.info("No watched sessions.", .{});
         app.ui.hint("Start one with: lcc start PE-256", .{});
         return;
@@ -233,11 +166,6 @@ fn emit(app: app_mod.App, opts: Opts, rows: []const Row, live: bool, outdated: b
     }
 }
 
-/// The live dashboard.
-///
-/// Draw at the top, block at the bottom, recount every frame — `prompt.zig`'s
-/// line discipline unchanged. Only the *trigger* for a frame differs: a
-/// keystroke there, a keystroke or a second's tick here.
 fn dashboard(app: app_mod.App) !void {
     const terminal = try term.Terminal.enterRaw();
     defer terminal.restore();
@@ -254,29 +182,14 @@ fn dashboard(app: app_mod.App) !void {
         out.flush() catch {};
     }
 
-    // `app.gpa` is a process arena: a dashboard redrawing once a second for
-    // eight hours would grow without bound on formatted cells alone. Nothing
-    // per-frame may touch it. No other command in this repo has had to care,
-    // because no other command is long-lived.
     var frame_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer frame_arena.deinit();
 
-    // Held as an id, not an index: snapshots re-sort as statuses change, and an
-    // index would move the selection under the user's finger.
     var cursor_id: []const u8 = "";
-    // A path, not a session id. Sixty-four bytes held an `s-00000001` with room
-    // to spare and silently truncated the first real worktree path, after which
-    // the copy never matched the row it came from and the cursor lived nowhere.
     var cursor_buf: [std.fs.max_path_bytes]u8 = undefined;
     var confirming_kill = false;
     var key_buf: [8]u8 = undefined;
-    // Tracked here rather than in a module variable: this repo has no globals,
-    // and the only thing that needs it is this loop.
     var last_cols: u16 = 0;
-    // Read once: `selfModified` allocates a path, and `app.gpa` is the process
-    // arena, so a per-frame call would grow it for as long as the dashboard is
-    // open. The binary under a running process does not change often enough to
-    // be worth a leak an hour.
     const built = exec.selfModified(app.gpa, app.io);
 
     while (true) {
@@ -285,8 +198,6 @@ fn dashboard(app: app_mod.App) !void {
         const now = app_mod.nowSeconds(app.io);
         const dims = terminal.size();
 
-        // A width change invalidates the line count: rows drawn at the old
-        // width may already have wrapped.
         if (dims.cols != last_cols) {
             screen.reset();
             last_cols = dims.cols;
@@ -300,10 +211,6 @@ fn dashboard(app: app_mod.App) !void {
         screen.eraseFrame();
         var lines: usize = 0;
 
-        // Above the table, not in the footer: the footer is keys, and this is
-        // not one. Re-asked every frame from the registry so restarting the
-        // daemon under an open dashboard clears it, rather than leaving a
-        // warning about a process that is gone.
         if (outdatedDaemon(app, arena, built)) {
             const p = ui.palette();
             out.print("  {s}⚠ {s}{s}\n", .{
@@ -316,8 +223,6 @@ fn dashboard(app: app_mod.App) !void {
 
         const widths = watch_table.fit(watch_table.measure(rows), dims.cols);
         if (rows.len == 0) {
-            // Points at the key that is already on screen rather than at a
-            // command to quit and run — the empty dashboard can start one.
             out.print("  {s}No sessions yet — press n to start one.{s}\n", .{
                 ui.palette().dim, ui.palette().reset,
             }) catch {};
@@ -333,10 +238,6 @@ fn dashboard(app: app_mod.App) !void {
         var fds = [_]std.posix.pollfd{
             .{ .fd = terminal.fd, .events = std.posix.POLL.IN, .revents = 0 },
         };
-        // The timeout does three jobs, which is why it exists at all: it is the
-        // resize tick (no SIGWINCH), the age tick (`4s` becoming `5s`, with no
-        // timer machinery — this repo has none), and the staleness tick, since
-        // a *wedged* daemon produces no readable event to notice it by.
         const ready = std.posix.poll(&fds, 1000) catch 0;
         if (ready == 0) continue;
 
@@ -346,9 +247,6 @@ fn dashboard(app: app_mod.App) !void {
             .down => cursor_id = copyId(&cursor_buf, step(rows, cursor_id, 1)),
             .enter => {
                 if (findRow(rows, cursor_id)) |row| {
-                    // Asked of the row rather than of the id: a dead daemon
-                    // leaves its ids in the projection, and attaching to one of
-                    // those finds nothing listening and returns in silence.
                     const id = if (row.attachable())
                         row.session_id.?
                     else blk: {
@@ -362,9 +260,6 @@ fn dashboard(app: app_mod.App) !void {
                 }
             },
             .text => |t| {
-                // The key's position, not the character it printed: on a
-                // Cyrillic layout `n` prints `т`, and reading the character
-                // means every shortcut stops working on a layout switch.
                 const key = term.layoutKey(t) orelse continue;
                 if (confirming_kill) {
                     confirming_kill = false;
@@ -380,12 +275,6 @@ fn dashboard(app: app_mod.App) !void {
                     'n' => try newSession(app, &screen, terminal),
                     'j' => cursor_id = copyId(&cursor_buf, step(rows, cursor_id, 1)),
                     'k' => cursor_id = copyId(&cursor_buf, step(rows, cursor_id, -1)),
-                    // Two keys, inline, rather than a nested raw-mode widget —
-                    // the terminal is already owned and re-entering it for a
-                    // yes/no would be a second redraw discipline to keep right.
-                    // Only a row with something running has anything to kill.
-                    // Only a row with something actually running has anything
-                    // to kill; a dead daemon's leftover id is not a target.
                     'x' => confirming_kill = if (findRow(rows, cursor_id)) |row| row.attachable() else false,
                     'r' => {},
                     '1'...'9' => {
@@ -405,9 +294,6 @@ fn dashboard(app: app_mod.App) !void {
     }
 }
 
-/// Leaving and re-entering cleanly around a passthrough: the dashboard's frame
-/// is erased first so the session starts on a clean screen, and the count is
-/// dropped so the next frame does not try to walk back over the agent's output.
 fn attachTo(
     app: app_mod.App,
     screen: *term.Screen,
@@ -426,15 +312,7 @@ fn attachTo(
     screen.reset();
 }
 
-/// Pick another issue and start it, without leaving the dashboard.
-///
-/// Runs the ordinary `lcc start` with the daemon path forced on and the
-/// dashboard suppressed — otherwise it would open a second one on top of this.
-/// Everything else about it is unchanged, including the picker, so there is one
-/// way a session comes into being rather than two that can drift.
 fn newSession(app: app_mod.App, screen: *term.Screen, terminal: term.Terminal) !void {
-    // `start` owns the terminal for its picker and its progress lines, the same
-    // handover an attach performs.
     screen.eraseFrame();
     screen.out.writeAll(term.csi ++ "?25h") catch {};
     screen.out.flush() catch {};
@@ -474,9 +352,6 @@ fn footer(
         }) catch {};
         return 1;
     }
-    // "enter opens" rather than "enter attaches": on a row with no session yet
-    // it starts one first, and promising only the second half would make the
-    // first look like a surprise.
     out.print("  {s}{s}{s}\n", .{
         p.dim,
         term.truncate("↑↓ move · enter opens · n new issue · x kill · q quit", cols -| 2),
@@ -485,24 +360,9 @@ fn footer(
     return 1;
 }
 
-/// Every worktree of the repo you are standing in, plus every session the
-/// daemon is running — merged on the worktree path.
-///
-/// One screen rather than two. `lcc open` used to list worktrees and know
-/// nothing about sessions; the dashboard listed sessions and knew nothing about
-/// worktrees. Each saw half of the same question — "where do I get back into
-/// Claude Code" — and the half it saw depended on which command you happened to
-/// type.
-///
-/// Sessions outside the current repo are kept rather than filtered: an agent
-/// running somewhere else is exactly the thing you must not lose sight of, and
-/// this may be run from no repository at all.
 fn collect(app: app_mod.App, arena: std.mem.Allocator, now: i64) ![]watch_table.Row {
     var rows: std.ArrayList(watch_table.Row) = .empty;
 
-    // The daemon when it is up, its projection when it is not — so a dead
-    // daemon shows `unknown` rather than an empty screen that reads as "nothing
-    // was ever running here".
     var live: []const sessions.Session = &.{};
     var stale = false;
     if (watch_client.snapshot(app) catch null) |list| {
@@ -519,8 +379,6 @@ fn collect(app: app_mod.App, arena: std.mem.Allocator, now: i64) ![]watch_table.
         live = carried;
     }
 
-    // Worktrees first, so the order is the repo's rather than the daemon's
-    // registration order, which changes as sessions come and go.
     if (app.repo()) |repo| {
         for (try app_mod.worktreeChoices(app, repo)) |choice| {
             const branch = choice.entry.branch orelse app_mod.shortHead(choice.entry.head);
@@ -561,30 +419,22 @@ fn collect(app: app_mod.App, arena: std.mem.Allocator, now: i64) ![]watch_table.
     return rows.toOwnedSlice(arena);
 }
 
-fn findSession(list: []const sessions.Session, worktree: []const u8) ?sessions.Session {
+pub fn findSession(list: []const sessions.Session, worktree: []const u8) ?sessions.Session {
+    var fallback: ?sessions.Session = null;
     for (list) |s| {
-        if (std.mem.eql(u8, s.worktree, worktree)) return s;
+        if (!std.mem.eql(u8, s.worktree, worktree)) continue;
+        if (s.parsedStatus() != .exited) return s;
+        if (fallback == null) fallback = s;
     }
-    return null;
+    return fallback;
 }
 
-/// `PE-288` out of `feature/pe-288-…`, for a worktree the daemon has never seen.
-///
-/// Upper-cased from the branch rather than asked of Linear: the dashboard
-/// redraws once a second and this is a label, not a lookup.
 fn issueOf(gpa: std.mem.Allocator, branch: []const u8) ?[]const u8 {
     const ref = linear.refFromBranch(branch) orelse return null;
     const team = std.ascii.allocUpperString(gpa, ref.team) catch return null;
     return std.fmt.allocPrint(gpa, "{s}-{d}", .{ team, ref.number }) catch null;
 }
 
-/// Hand an existing worktree to the daemon and return its session id.
-///
-/// What `lcc open` did in the foreground, done through the daemon instead: the
-/// same `--resume` when a transcript exists, the same MCP servers carried from
-/// the main checkout. Asking to resume in a directory Claude Code has never run
-/// in opens a picker with nothing in it, so it is only asked for once there is
-/// something to resume.
 fn startForWorktree(app: app_mod.App, row: watch_table.Row) !watch_client.Started {
     var argv: std.ArrayList([]const u8) = .empty;
     if (app.repo()) |repo| {
@@ -619,7 +469,6 @@ fn findRow(rows: []const watch_table.Row, key: []const u8) ?watch_table.Row {
     return null;
 }
 
-/// The neighbouring session's id, wrapping. Pure, so the wrap is testable.
 pub fn step(rows: []const watch_table.Row, key: []const u8, delta: i2) []const u8 {
     if (rows.len == 0) return "";
     var at: usize = 0;
@@ -633,20 +482,12 @@ pub fn step(rows: []const watch_table.Row, key: []const u8, delta: i2) []const u
     return rows[next].key;
 }
 
-/// The cursor outlives the arena its row came from, so its id is copied into a
-/// buffer that does not get reset with the frame.
 fn copyId(buf: []u8, id: []const u8) []const u8 {
     const take = @min(buf.len, id.len);
     @memcpy(buf[0..take], id[0..take]);
     return buf[0..take];
 }
 
-/// What a Claude Code hook execs. Reads the hook payload on stdin, forwards it
-/// to the daemon, and exits zero whatever happened.
-///
-/// **Always zero.** This runs on every turn of every watched session; a handler
-/// that could fail would be a handler that could disturb the work it is only
-/// meant to observe.
 pub fn hook(app: app_mod.App, opts: HookOpts) !void {
     const event = opts.event orelse return;
 
@@ -657,10 +498,15 @@ pub fn hook(app: app_mod.App, opts: HookOpts) !void {
     const payload = watch_hooks.parsePayload(app.gpa, raw) orelse return;
     if (payload.cwd.len == 0) return;
 
-    // `opts.socket`, not the environment: the daemon baked its own socket into
-    // this command line, and the environment here is the session's — whichever
-    // shell started it. See `watch_client.connectAt`.
-    watch_client.report(app, opts.socket, payload.cwd, payload.session_id, event, payload.permission_mode);
+    watch_client.report(
+        app,
+        opts.socket,
+        payload.cwd,
+        payload.session_id,
+        event,
+        payload.permission_mode,
+        opts.session orelse "",
+    );
 }
 
 test "the --json keys name sessions, never the process behind them" {
@@ -669,28 +515,55 @@ test "the --json keys name sessions, never the process behind them" {
     const body = try snapshotJson(gpa, &.{}, true, false);
     defer gpa.free(body);
 
-    // Renaming any of these breaks every slash command parsing this snapshot,
-    // and breaks it silently: a missing key reads as `null`, which reads as
-    // "nothing is running" rather than as a contract that moved.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"sessions_live\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"outdated_build\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"sessions\"") != null);
 
-    // The point of the rename. A caller has sessions; the daemon holding them is
-    // an implementation detail it must not be able to grow a dependency on.
     try std.testing.expect(std.mem.indexOf(u8, body, "daemon") == null);
 }
 
 test "an empty snapshot still carries both flags, rather than dropping them" {
     const gpa = std.testing.allocator;
 
-    // The dead-daemon case, which is the one a caller is most likely to hit and
-    // least likely to have tested: no sessions, nothing running them. Both keys
-    // are still present and false, per the JSON contract in CLAUDE.md — absent
-    // values are `null`, never dropped.
     const body = try snapshotJson(gpa, &.{}, false, false);
     defer gpa.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"sessions_live\": false") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"outdated_build\": false") != null);
+}
+
+test "a worktree row shows the session that is alive, not the first one recorded" {
+    const dead: sessions.Session = .{
+        .id = "s-00000005",
+        .worktree = "/w/pe-289",
+        .branch = "feature/pe-289",
+        .issue = "PE-289",
+        .repo_root = "/r",
+        .pid = 34387,
+        .status = "exited",
+        .status_at = 1000,
+        .started_at = 900,
+        .last_activity_at = 1000,
+        .exit_code = 0,
+    };
+    var live = dead;
+    live.id = "s-00000009";
+    live.status = "idle";
+    live.exit_code = null;
+
+    const picked = findSession(&.{ dead, live }, "/w/pe-289").?;
+    if (!std.mem.eql(u8, picked.id, "s-00000009")) {
+        std.debug.print(
+            "picked {s} ({s}) over the live {s}: the row reports a corpse while an agent " ++
+                "is working in that worktree, and enter on it starts yet another session " ++
+                "instead of attaching.\n",
+            .{ picked.id, picked.status, live.id },
+        );
+        return error.TestExpectedEqual;
+    }
+
+    const only_dead = findSession(&.{dead}, "/w/pe-289").?;
+    try std.testing.expectEqualStrings("s-00000005", only_dead.id);
+
+    try std.testing.expect(findSession(&.{ dead, live }, "/w/somewhere-else") == null);
 }

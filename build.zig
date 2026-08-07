@@ -10,8 +10,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    // Keychain access goes through the modern SecItem* API, which speaks
-    // CoreFoundation types.
     mod.linkFramework("CoreFoundation", .{});
     mod.linkFramework("Security", .{});
 
@@ -20,13 +18,6 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
     });
 
-    // The Keychain decides who may read the Linear token from the program's code
-    // signature, and Zig's linker only ad-hoc signs — an identity that is nothing
-    // but the hash of the binary. So every rebuild arrives at the Keychain as a
-    // *changed* program, which re-asks for the login password and blocks until it is
-    // answered. Signing with a real certificate, self-signed included, pins the
-    // designated requirement to `identifier "lcc"` plus that certificate, and one
-    // "Always Allow" then survives every later build.
     const install_exe = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&install_exe.step);
     if (signIdentity(b)) |identity| {
@@ -50,8 +41,6 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run lcc");
     run_step.dependOn(&run_cmd.step);
 
-    // A module of its own: reusing the executable's module made `zig build
-    // test` reuse the executable's compilation and silently skip the tests.
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -67,15 +56,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
 }
 
-/// Which certificate to sign the installed binary with. Nothing has to be set up for
-/// this: whatever the machine already has for code signing is what gets used, since
-/// *which* certificate it is does not matter — only that it stays the same between
-/// builds. `lcc-dev` first for anyone who made one on purpose, then an Apple
-/// Development certificate, which a machine that builds apps already has.
-///
-/// `-Dsign=<identity>` overrides, `-Dsign=none` opts out, `LCC_CODESIGN_IDENTITY`
-/// does the same from the environment. Finding nothing is not an error — the build
-/// then leaves the linker's ad-hoc signature alone.
 fn signIdentity(b: *std.Build) ?[]const u8 {
     const option = b.option(
         []const u8,
@@ -101,17 +81,12 @@ fn signIdentity(b: *std.Build) ?[]const u8 {
 
     for ([_][]const u8{ "lcc-dev", "Apple Development:" }) |preferred| {
         const found = commonNameContaining(identities, preferred) orelse continue;
-        // Named out loud rather than picked silently: the signature is what the
-        // Keychain recognises lcc by, so it should never be a surprise.
         std.log.info("signing lcc with \"{s}\"", .{found});
         return found;
     }
     return null;
 }
 
-/// The certificate name out of `security find-identity` output — the quoted common
-/// name on the first line mentioning `needle`. Lines look like:
-/// `  1) A1B2C3… "Apple Development: Someone (TEAMID)"`.
 fn commonNameContaining(identities: []const u8, needle: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, identities, '\n');
     while (lines.next()) |line| {

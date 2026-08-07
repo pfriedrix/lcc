@@ -44,13 +44,9 @@ fn openInClaude(
     picked: app_mod.Choice,
     no_resume: bool,
 ) !void {
-    // `--resume` in a directory Claude Code has never run in opens a picker with
-    // nothing to pick, so only ask for it once a transcript exists.
     const resumable = !no_resume and
         claude_projects.hasSessionsFor(app.gpa, app.io, app.environ, picked.entry.path);
 
-    // Same reason `lcc start` does it: local-scope MCP servers are keyed on the
-    // directory they were added in, so a worktree sees none of the repo's own.
     const carried = try mcp.carry(app.gpa, app.io, app.environ, repo.root);
 
     const label = picked.entry.branch orelse app_mod.shortHead(picked.entry.head);
@@ -61,7 +57,6 @@ fn openInClaude(
     });
     if (!resumable and !no_resume) app.ui.hint("No sessions here yet — starting fresh.", .{});
 
-    // What this task has cost so far, before adding to it.
     const spent = usage.forWorktree(app.gpa, app.io, app.environ, picked.entry.path);
     if (!spent.empty()) {
         app.ui.hint("Spent here: {f}", .{usage.brief(spent, app_mod.nowSeconds(app.io))});

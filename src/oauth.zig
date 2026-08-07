@@ -1,5 +1,3 @@
-//! Linear OAuth 2.0 with PKCE — browser flow, local callback, token refresh.
-
 const std = @import("std");
 const Io = std.Io;
 const config = @import("config.zig");
@@ -28,10 +26,8 @@ pub const Error = error{
     CallbackTimedOut,
 } || std.mem.Allocator.Error;
 
-/// How long to hold the callback port open before giving up on the browser.
 pub const callback_timeout_ms: i64 = 5 * 60 * 1000;
 
-/// Detail for the last failure, for messages worth reading.
 pub var last_detail: []const u8 = "";
 
 pub fn nowSeconds(io: Io) i64 {
@@ -44,7 +40,6 @@ fn nowMillis(io: Io) i64 {
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
 }
 
-/// Blocks until the socket has a connection waiting, or `deadline` passes.
 fn waitReadable(io: Io, handle: std.posix.fd_t, deadline: i64) Error!void {
     while (true) {
         const remaining = deadline - nowMillis(io);
@@ -60,8 +55,6 @@ fn waitReadable(io: Io, handle: std.posix.fd_t, deadline: i64) Error!void {
             return Error.CallbackFailed;
         };
         if (ready > 0) return;
-        // Zero means the poll timed out; loop so a signal-interrupted wait
-        // still honours the full deadline.
     }
 }
 
@@ -95,8 +88,6 @@ pub fn generateState(gpa: std.mem.Allocator, io: Io) ![]u8 {
     return base64url(gpa, &raw);
 }
 
-/// Percent-encodes everything outside the RFC 3986 unreserved set, which is
-/// what `URLSearchParams` effectively does for these values.
 fn encodeQueryComponent(w: *Io.Writer, value: []const u8) !void {
     for (value) |c| {
         switch (c) {
@@ -153,7 +144,6 @@ fn errorHtml(gpa: std.mem.Allocator, message: []const u8) ![]u8 {
     , .{message});
 }
 
-/// Percent-decodes in place semantics: returns a freshly allocated string.
 fn decodeComponent(gpa: std.mem.Allocator, value: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
@@ -212,9 +202,6 @@ pub const Callback = struct {
     state: []const u8,
 };
 
-/// Serves 127.0.0.1:39126 until Linear redirects the browser back to it.
-/// Requests for anything but the callback path get a 404 and are ignored, so a
-/// stray favicon fetch cannot end the flow.
 pub fn awaitCallback(gpa: std.mem.Allocator, io: Io, expected_state: []const u8) Error!Callback {
     const address: Io.net.IpAddress = .{ .ip4 = .loopback(config.redirect_port) };
     var server = address.listen(io, .{ .reuse_address = true }) catch |err| {
@@ -227,8 +214,6 @@ pub fn awaitCallback(gpa: std.mem.Allocator, io: Io, expected_state: []const u8)
     const deadline = nowMillis(io) + callback_timeout_ms;
 
     while (true) {
-        // Bound the wait, so an abandoned browser tab does not leave lcc
-        // holding the port forever.
         try waitReadable(io, server.socket.handle, deadline);
 
         var stream = server.accept(io) catch |err| {
@@ -351,8 +336,6 @@ fn postToken(gpa: std.mem.Allocator, io: Io, fields: []const [2][]const u8) Erro
     return .{
         .access_token = parsed.access_token,
         .refresh_token = parsed.refresh_token,
-        // Same minute of slack as the TypeScript version, so a token is never
-        // used in the last seconds of its life.
         .expires_at = if (parsed.expires_in) |secs| nowSeconds(io) + secs - 60 else null,
         .scope = parsed.scope,
         .token_type = parsed.token_type,
@@ -386,7 +369,6 @@ pub fn refreshAccessToken(
         .{ "refresh_token", refresh_token },
         .{ "client_id", client_id },
     });
-    // Linear may omit refresh_token on refresh; preserve previous value
     if (token.refresh_token == null) token.refresh_token = refresh_token;
     return token;
 }
@@ -411,7 +393,6 @@ pub fn clearToken() void {
     keychain.delete(service, account) catch {};
 }
 
-/// Returns a usable token, refreshing it first when it has expired.
 pub fn ensureFreshToken(gpa: std.mem.Allocator, io: Io, client_id: []const u8) Error!Token {
     const token = getToken(gpa) orelse return Error.NotAuthenticated;
     if (token.is_pat orelse false) return token;

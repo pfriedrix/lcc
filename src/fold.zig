@@ -1,37 +1,17 @@
-//! Case-insensitive matching over UTF-8.
-//!
-//! `std.ascii.indexOfIgnoreCase` only folds A-Z, which silently made search
-//! case-sensitive for Ukrainian and Russian issue titles. This folds the three
-//! alphabets lcc actually meets: ASCII, Latin-1 Supplement, and Cyrillic.
-//!
-//! Deliberately *not* a general Unicode implementation. Latin Extended-A
-//! (Polish, Czech, Turkish) has irregular case pairs and multi-codepoint
-//! foldings; covering it half-correctly would be worse than leaving it out,
-//! and none of it shows up in this workspace.
-
 const std = @import("std");
 
-/// Simple lowercase mapping for the covered ranges; identity elsewhere.
 pub fn foldCodepoint(cp: u21) u21 {
     if (cp < 0x80) return std.ascii.toLower(@intCast(cp));
 
-    // Latin-1 Supplement: À-Þ → à-þ. U+00D7 (×) sits inside the range and is
-    // not a letter.
     if (cp >= 0x00C0 and cp <= 0x00DE and cp != 0x00D7) return cp + 0x20;
 
-    // Cyrillic supplement block: Ѐ-Џ → ѐ-џ, which is where Ё, Є, І and Ї live.
     if (cp >= 0x0400 and cp <= 0x040F) return cp + 0x50;
-    // Cyrillic basic: А-Я → а-я.
     if (cp >= 0x0410 and cp <= 0x042F) return cp + 0x20;
-    // Historic and non-Slavic Cyrillic, including Ukrainian Ґ (U+0490):
-    // strictly even/odd upper/lower pairs.
     if (cp >= 0x0460 and cp <= 0x04FF and cp % 2 == 0) return cp + 1;
 
     return cp;
 }
 
-/// Decodes UTF-8, degrading to one codepoint per byte on malformed input so a
-/// search over odd data can never fail or loop.
 const Codepoints = struct {
     bytes: []const u8,
     i: usize = 0,
@@ -65,7 +45,6 @@ fn matchesAt(haystack: []const u8, start: usize, needle: []const u8) bool {
     return true;
 }
 
-/// Byte offset of the first case-insensitive occurrence of `needle`.
 pub fn indexOf(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0) return 0;
     var it: Codepoints = .{ .bytes = haystack };
@@ -101,11 +80,8 @@ test "ascii folding" {
 }
 
 test "cyrillic folding covers russian and ukrainian letters" {
-    // The regression this module exists for: a lowercase query against an
-    // uppercase title.
     try std.testing.expect(contains("ВИПРАВИТИ ПАДІННЯ", "виправити"));
     try std.testing.expect(contains("виправити падіння", "ПАДІННЯ"));
-    // Ї, І, Є, Ґ are in the supplement block, not the basic one.
     try std.testing.expect(contains("ЇЖАК", "їжак"));
     try std.testing.expect(contains("ІНДЕКС", "індекс"));
     try std.testing.expect(contains("ЄДНІСТЬ", "єдність"));
@@ -117,7 +93,6 @@ test "cyrillic folding covers russian and ukrainian letters" {
 test "latin-1 accents fold" {
     try std.testing.expect(contains("CAFÉ", "café"));
     try std.testing.expect(contains("Über", "ÜBER"));
-    // Multiplication sign must not be treated as a letter.
     try std.testing.expectEqual(@as(u21, 0x00D7), foldCodepoint(0x00D7));
 }
 

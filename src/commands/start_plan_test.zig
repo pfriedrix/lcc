@@ -1,19 +1,7 @@
-//! Test home for `lcc start`'s plan channel — the rules deciding whether a `--plan`
-//! path can reach the agent at all.
-//!
-//! `start.zig` keeps its tests in-source, next to what they cover. This file exists
-//! because the plan-channel tests are authored by an agent that may not touch a
-//! production file, and Zig collects tests only from files the test root imports
-//! (`main.zig`'s `test` block says so). An out-of-file home is the only shape those
-//! two rules leave, so the seam it needs is `pub`.
-
 const std = @import("std");
 const linear = @import("../linear.zig");
 const start = @import("start.zig");
 
-/// The issue every plan-channel case expands a template against. Nothing here is ever
-/// what a case is about — only the template is — so it is fixed once rather than
-/// restated per case.
 pub const issue_fixture: linear.Issue = .{
     .id = "uuid-1",
     .identifier = "PE-250",
@@ -35,18 +23,14 @@ test "the plan-channel test home reaches start.expandCommand" {
     try std.testing.expectEqualStrings("PE-250", got.text);
 }
 
-/// The branch a launch would use. Never what a case is about.
 const branch = "feature/pe-250-actual";
 
-/// A plan path that exists only as text — `expandCommand` substitutes it, nothing reads it.
 const plan_path = "/tmp/lcc-plan-fixture.md";
 
 fn yn(b: bool) []const u8 {
     return if (b) "true" else "false";
 }
 
-/// Asserts the predicate's answer for one template, and on disagreement says what the
-/// wrong answer costs — a refused launch, or a `--plan` accepted into a dead end.
 fn expectCarries(template: []const u8, want: bool) !void {
     const got = start.templateCarriesPlan(template);
     if (got != want) {
@@ -83,8 +67,6 @@ test "AC-2: templateCarriesPlan answers false when there is no {plan} placeholde
 }
 
 test "AC-3: templateCarriesPlan answers false for an empty template and for one that is only spaces and tabs" {
-    // The empty template is the stock config; a predicate that indexes it unguarded
-    // panics here rather than returning.
     try expectCarries("", false);
     try expectCarries("   \t  \t", false);
 }

@@ -1,5 +1,3 @@
-//! `~/.config/lcc/config.json` — same file and same keys as the TypeScript version.
-
 const std = @import("std");
 const Io = std.Io;
 
@@ -9,23 +7,9 @@ pub const authorize_url = "https://linear.app/oauth/authorize";
 pub const token_url = "https://api.linear.app/oauth/token";
 pub const default_scopes = "read,write";
 
-/// Public OAuth client for the `lcc` tool. client_id is non-secret by OAuth design;
-/// PKCE protects the flow without requiring a client_secret. Override with
-/// LCC_CLIENT_ID env var or `lcc auth setup --client-id <id>` for forks / self-hosted.
 pub const default_client_id = "6bf6dd7b761b5ce6539cf5a9ed99b4fb";
 
 const default_worktree_template = "{repoRoot}/.lcc/worktrees/{branchLeaf}";
-/// Gitignored files worth sharing with every worktree. `.claude/settings.local.json`
-/// is the permission allowlist: without it, each new worktree re-asks for approvals
-/// that were already granted in the main checkout.
-///
-/// `CLAUDE.md` and `CLAUDE.local.md` are here for the repos that keep theirs out of
-/// git — a worktree of one hands Claude Code no project instructions at all, which is
-/// the same session in a repo it knows nothing about. Claude Code walks up the parent
-/// directories looking for both, so a worktree *nested* inside the repo finds them
-/// without any help; the link is what covers a template that puts worktrees beside the
-/// repo instead. Linking never replaces a file that is already there, so a repo that
-/// commits its `CLAUDE.md` keeps the copy its branch carries.
 const default_link_patterns = [_][]const u8{
     ".env",
     ".env.*",
@@ -35,22 +19,11 @@ const default_link_patterns = [_][]const u8{
 };
 const default_link_exclude = [_][]const u8{ ".env.example", ".env.sample", ".env.template" };
 const default_active_states = [_][]const u8{ "Todo", "In Progress" };
-/// On by default. A session that outlives the terminal that started it is the
-/// behaviour worth having without asking for it; `--no-watch` and this key are
-/// the two ways back to a plain foreground launch.
 pub const default_watch_by_default = true;
 
-/// What `lcc list` may do about the PR and Linear columns.
-///
-/// One setting rather than two booleans because the three states are exclusive
-/// and two flags would let someone ask for both "skip the network" and "ignore
-/// the cache", which has no meaning.
 pub const ListNetwork = enum {
-    /// Ask GitHub and Linear again.
     refresh,
-    /// Reuse a recent answer.
     cached,
-    /// Skip those columns entirely.
     local,
 
     pub fn parse(text: []const u8) ?ListNetwork {
@@ -58,54 +31,32 @@ pub const ListNetwork = enum {
     }
 };
 
-/// What the file may contain. Every field optional: absence means "use the default".
 pub const Stored = struct {
     clientId: ?[]const u8 = null,
     worktreeTemplate: ?[]const u8 = null,
     linkPatterns: ?[]const []const u8 = null,
     linkExclude: ?[]const []const u8 = null,
-    /// Pre-nested-path names for the two above. Still read so an existing
-    /// config keeps working; `linkPatterns`/`linkExclude` win when both are set.
     envPatterns: ?[]const []const u8 = null,
     envExclude: ?[]const []const u8 = null,
     activeStates: ?[]const []const u8 = null,
     startTaskCommand: ?[]const u8 = null,
-    /// Which of the repo's local-scope MCP servers a worktree is worth handing.
-    /// Absent carries all of them. A server the work never calls still costs every
-    /// agent in the session its name and its instructions, on every turn.
     mcpCarry: ?[]const []const u8 = null,
-    /// Whether `lcc start` hands the session to the daemon rather than taking
-    /// over the terminal. On unless turned off — a session that survives its
-    /// terminal is what you want by default, and `--no-watch` covers the one-off.
     watchByDefault: ?bool = null,
-    /// Open new sessions in Claude Code's plan mode. A `--plan` file turns it
-    /// off regardless: the session already has a plan.
     planMode: ?bool = null,
-    /// `lcc open` resumes the worktree's last session rather than starting fresh.
     resumeSessions: ?bool = null,
-    /// The TOKENS column in `lcc list`. Off skips reading transcripts, which is
-    /// the whole cost of that column.
     showTokens: ?bool = null,
-    /// How `lcc list` treats the PR and Linear columns: `refresh`, `cached` or
-    /// `local`. Stored as text — the enum's numbering is an implementation
-    /// detail and must not reach disk.
     listNetwork: ?[]const u8 = null,
-    /// Offer every assigned issue in the picker, not just `activeStates`.
     allIssues: ?bool = null,
-    /// What `lcc remove` leaves behind by default.
     keepBranch: ?bool = null,
     keepDerivedData: ?bool = null,
     keepXcode: ?bool = null,
 };
 
-/// How a settings update changes the physical `mcpCarry` key. `all` removes the
-/// key, preserving the distinction between carrying everything and carrying none.
 pub const McpCarry = union(enum) {
     all,
     only: []const []const u8,
 };
 
-/// Values to merge into the stored configuration. A null field is left untouched.
 pub const Patch = struct {
     clientId: ?[]const u8 = null,
     worktreeTemplate: ?[]const u8 = null,
@@ -154,8 +105,6 @@ pub fn path(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]
     return std.fs.path.join(gpa, &.{ home, ".config", "lcc", "config.json" });
 }
 
-/// Reads the file if present. Strings are allocated with `gpa` and live as long
-/// as it does — callers use an arena.
 pub fn loadStored(
     gpa: std.mem.Allocator,
     io: Io,
@@ -170,8 +119,6 @@ pub fn loadStored(
     };
     defer gpa.free(raw);
 
-    // `alloc_always`: the default borrows slices out of `raw` where it can, and
-    // `raw` is freed on the way out of this function.
     return std.json.parseFromSliceLeaky(Stored, gpa, raw, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
@@ -200,8 +147,6 @@ pub fn load(
         .planMode = stored.planMode orelse true,
         .resumeSessions = stored.resumeSessions orelse true,
         .showTokens = stored.showTokens orelse true,
-        // An unrecognised value reads as the default rather than failing the
-        // whole file — a hand-edited typo should cost one setting, not the run.
         .listNetwork = if (stored.listNetwork) |v| (ListNetwork.parse(v) orelse .cached) else .cached,
         .allIssues = stored.allIssues orelse false,
         .keepBranch = stored.keepBranch orelse false,
@@ -210,8 +155,6 @@ pub fn load(
     };
 }
 
-/// Merges `patch` over what is on disk, then rewrites the file. Fields left
-/// null in `patch` keep their stored value.
 pub fn save(
     gpa: std.mem.Allocator,
     io: Io,
@@ -223,7 +166,6 @@ pub fn save(
     if (patch.worktreeTemplate) |v| merged.worktreeTemplate = v;
     if (patch.linkPatterns) |v| {
         merged.linkPatterns = v;
-        // Drop the superseded key rather than leave two sources of truth on disk.
         merged.envPatterns = null;
     }
     if (patch.linkExclude) |v| {
@@ -269,7 +211,6 @@ pub fn save(
     try writer.interface.flush();
 }
 
-/// The precedence `load` applies, without touching the filesystem.
 fn resolveLinkPatterns(stored: Stored) []const []const u8 {
     return stored.linkPatterns orelse stored.envPatterns orelse &default_link_patterns;
 }
@@ -293,8 +234,6 @@ test "the defaults carry Claude Code's own files, not just secrets" {
     const defaults = resolveLinkPatterns(.{});
     try std.testing.expectEqual(@as(usize, 5), defaults.len);
 
-    // Secrets are the obvious half; these three are what a worktree needs to be the
-    // same working environment as the checkout it was cut from.
     try std.testing.expect(hasPattern(defaults, ".claude/settings.local.json"));
     try std.testing.expect(hasPattern(defaults, "CLAUDE.md"));
     try std.testing.expect(hasPattern(defaults, "CLAUDE.local.md"));

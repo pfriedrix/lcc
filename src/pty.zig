@@ -1,28 +1,5 @@
-//! A pseudo-terminal with a real session and controlling terminal behind it.
-//!
-//! `forkpty`, not `openpty` plus a spawn. `std.process.SpawnOptions.stdin`
-//! accepts an arbitrary fd, so handing a child the slave end would give it
-//! something `isatty` agrees is a terminal — but not a *controlling* terminal,
-//! because 0.16 offers no `setsid` option and no pre-exec hook. Without one the
-//! kernel never delivers SIGWINCH, and Claude Code is an Ink program: it
-//! repaints on resize and on nothing else. `forkpty` does fork, `setsid`,
-//! `TIOCSCTTY` and the three `dup2`s in one call, and the test at the bottom of
-//! this file is what keeps that true.
-//!
-//! Nothing here takes an `Io`. Every call is a libc call with no `Io` vtable
-//! entry behind it, and threading a fake one through would be a lie about what
-//! is being awaited. `oauth.zig`'s `waitReadable` sets the precedent.
-//!
-//! **The daemon that owns this must stay single-threaded.** `fork` in a process
-//! with a thread pool leaves the child holding locks no surviving thread will
-//! release, and libc's allocator lock is one of them — so everything between
-//! the fork and the `execve` below is async-signal-safe only, and every
-//! allocation happens before the fork.
-
 const std = @import("std");
 
-/// `<util.h>`. Not in std — grep it and you get nothing — but it lives in
-/// libSystem, so `link_libc` resolves it and `build.zig` needs no new linkage.
 extern "c" fn forkpty(
     amaster: *c_int,
     name: ?[*:0]u8,
@@ -30,17 +7,8 @@ extern "c" fn forkpty(
     winp: ?*const std.posix.winsize,
 ) c_int;
 
-/// Declared here rather than taken from `std.c.ioctl` for the request type:
-/// std types it `c_int`, and `TIOCSWINSZ` has bit 31 set. Same shape
-/// `prompt.zig` used for `TIOCGWINSZ`.
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
 
-/// `_IOW('t', 103, struct winsize)`, spelled out because Darwin's `std.c.T`
-/// defines only `IOCGWINSZ` — the `0x80087467` that turns up when grepping std
-/// is in the FreeBSD arm. It matches, since both come from the same BSD macro,
-/// but borrowing another platform's constant is not a thing to do quietly.
-///
-///   IOC_IN | ((sizeof(winsize) & IOCPARM_MASK) << 16) | ('t' << 8) | 103
 const TIOCSWINSZ: c_ulong = 0x80000000 | (@sizeOf(std.posix.winsize) << 16) | ('t' << 8) | 103;
 
 pub const Error = error{ PtyUnavailable, ForkFailed } || std.mem.Allocator.Error;
@@ -48,17 +16,8 @@ pub const Error = error{ PtyUnavailable, ForkFailed } || std.mem.Allocator.Error
 pub const Size = struct { rows: u16, cols: u16 };
 
 pub const Spec = struct {
-    /// Absolute. A `PATH` search must not happen on the child side of a fork,
-    /// so the caller resolves it first — `claude.resolvePath` exists for this.
     program: []const u8,
-    /// The arguments *after* `argv[0]`, which is `program`. Mirrors
-    /// `claude.launch`'s `extra_args`, so the one mistake that produces a
-    /// confusing failure — an argv missing its zeroth element, silently eating
-    /// the first real argument — cannot be made here.
     argv: []const []const u8,
-    /// `"K=V"` pairs, the whole environment. Must be the *client's*, never the
-    /// daemon's own: a daemon started days ago by one shell would otherwise
-    /// give every later session that shell's `PATH`.
     env: []const []const u8,
     cwd: []const u8,
     size: Size,
@@ -69,25 +28,9 @@ pub const Spawned = struct {
     pid: std.posix.pid_t,
 };
 
-/// The signals a parent may have set to `SIG_IGN`, which — unlike a handler —
-/// survives `execve`. A daemon that ignores these to stay detached would
-/// otherwise hand Claude Code a process that cannot be stopped with `^C`.
-///
-/// `KILL` and `STOP` are deliberately absent: `sigaction` on either is EINVAL,
-/// which `std.posix.sigaction` treats as `unreachable`.
 const reset_to_default = [_]std.c.SIG{ .HUP, .INT, .QUIT, .PIPE, .TSTP, .TTIN, .TTOU, .CHLD, .IO };
 
 pub fn spawn(gpa: std.mem.Allocator, spec: Spec) Error!Spawned {
-    // Everything the child needs is built here, before the fork, because after
-    // it an allocation can deadlock against a lock no thread is left to unlock.
-    //
-    // An arena, released on the way out: the child gets a copy-on-write image
-    // of all of this and reads it until `execve` replaces the address space, so
-    // freeing the parent's copy after the fork cannot reach it. The `defer`
-    // runs only in the parent — the child leaves this scope through `execve` or
-    // `_exit` and never reaches the end of it. Without this a daemon holding a
-    // process arena would keep one copy of every session's environment for as
-    // long as it lived.
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -114,13 +57,6 @@ pub fn spawn(gpa: std.mem.Allocator, spec: Spec) Error!Spawned {
     if (pid < 0) return Error.ForkFailed;
 
     if (pid == 0) {
-        // `login_tty` has already run inside forkpty: fds 0/1/2 are the slave,
-        // we lead a new session, and the pty is our controlling terminal.
-        // Async-signal-safe only from here to the execve.
-        //
-        // The mask is inherited across exec, so a daemon that blocks SIGCHLD
-        // around a critical section would otherwise start every agent with it
-        // blocked.
         var empty = std.posix.sigemptyset();
         std.posix.sigprocmask(std.c.SIG.SETMASK, &empty, null);
         const dfl: std.posix.Sigaction = .{
@@ -132,17 +68,10 @@ pub fn spawn(gpa: std.mem.Allocator, spec: Spec) Error!Spawned {
 
         if (std.c.chdir(cwd_z.ptr) != 0) std.c._exit(126);
         _ = std.c.execve(program_z.ptr, argv_z.ptr, envp_z.ptr);
-        // 127 is the shell's convention for "not found", and the caller reads
-        // it back through `reap` to tell a missing binary from a crash.
         std.c._exit(127);
     }
 
-    // CLOEXEC so a *later* session's fork cannot inherit this master and hold
-    // the pty device open past our own close — which would keep the slave from
-    // ever reporting EOF, and with it hide that the child had died.
     _ = std.c.fcntl(master, std.posix.F.SETFD, @as(c_int, std.posix.FD_CLOEXEC));
-    // NONBLOCK so one child that has stopped reading cannot stall the single
-    // poll loop every other session shares.
     const flags = std.c.fcntl(master, std.posix.F.GETFL, @as(c_int, 0));
     if (flags >= 0) {
         var o: std.posix.O = @bitCast(@as(u32, @intCast(flags)));
@@ -153,7 +82,6 @@ pub fn spawn(gpa: std.mem.Allocator, spec: Spec) Error!Spawned {
     return .{ .master = master, .pid = pid };
 }
 
-/// Best-effort: a resize is decoration on a session, never a reason to fail one.
 pub fn resize(master: std.posix.fd_t, size: Size) void {
     const ws: std.posix.winsize = .{
         .row = size.rows,
@@ -166,9 +94,7 @@ pub fn resize(master: std.posix.fd_t, size: Size) void {
 
 pub const Read = union(enum) {
     n: usize,
-    /// Nothing buffered right now. Not an error, and not a closed pty.
     again,
-    /// The slave is gone: the child has exited or closed its last handle.
     closed,
 };
 
@@ -178,14 +104,8 @@ pub fn read(master: std.posix.fd_t, buf: []u8) Read {
         if (rc > 0) return .{ .n = @intCast(rc) };
         if (rc == 0) return .closed;
         switch (std.posix.errno(rc)) {
-            // `Io.Threaded`'s SIGPIPE handler carries no SA_RESTART, so an
-            // interrupted read is ours to retry — nothing else will.
             .INTR => continue,
             .AGAIN => return .again,
-            // Darwin reports a hung-up pty master as EIO rather than EOF, and
-            // reads it as an error where every other platform reads it as the
-            // end. Treating it as anything but "closed" leaves dead sessions
-            // in the table forever.
             .IO => return .closed,
             else => return .closed,
         }
@@ -208,34 +128,24 @@ pub fn write(master: std.posix.fd_t, bytes: []const u8) Write {
 
 pub const Exit = union(enum) { code: u8, signal: u8 };
 
-/// `waitpid(WNOHANG)`. Null while the child is still running.
-///
-/// Only ever called with a pid this module produced. A wildcard `waitpid(-1, …)`
-/// would steal a status `std.process.Child.wait` is blocked on elsewhere in the
-/// process and hang it.
 pub fn reap(pid: std.posix.pid_t) ?Exit {
     var status: c_int = 0;
     while (true) {
-        const rc = std.c.waitpid(pid, &status, 1); // WNOHANG
-        if (rc == 0) return null; // still running
+        const rc = std.c.waitpid(pid, &status, 1);
+        if (rc == 0) return null;
         if (rc < 0) {
             if (std.posix.errno(rc) == .INTR) continue;
-            return null; // already reaped, or never ours
+            return null;
         }
         const raw: u32 = @bitCast(status);
         if (std.posix.W.IFEXITED(raw)) return .{ .code = std.posix.W.EXITSTATUS(raw) };
         if (std.posix.W.IFSIGNALED(raw)) {
             return .{ .signal = @intCast(@intFromEnum(std.posix.W.TERMSIG(raw))) };
         }
-        return null; // stopped or continued: not an exit
+        return null;
     }
 }
 
-/// Signals the child's whole process group, not just the child.
-///
-/// `login_tty` made it a process-group leader, so the negative pid reaches
-/// everything Claude Code spawned — the shells it ran, the builds they started
-/// — rather than leaving them orphaned and holding the pty open.
 pub fn signalGroup(pid: std.posix.pid_t, sig: std.c.SIG) void {
     _ = std.c.kill(-pid, sig);
 }
@@ -244,24 +154,12 @@ pub fn close(master: std.posix.fd_t) void {
     _ = std.c.close(master);
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-//
-// These fork real processes on a real pty inside the test runner, which is
-// multithreaded — precisely the hazard the module header is about. That makes
-// them a check on the between-fork-and-exec code as well as on the behaviour
-// each one names. Every wait carries a deadline, because the failure mode
-// without one is a CI job that hangs instead of a test that fails.
-// ---------------------------------------------------------------------------
-
 const test_deadline_ms: i32 = 10_000;
 
 fn testEnv() []const []const u8 {
     return &.{ "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "TERM=xterm-256color" };
 }
 
-/// Reads until the pty closes or the deadline passes. Test-only: the daemon
-/// never blocks on a session, it polls every fd at once.
 fn drain(gpa: std.mem.Allocator, master: std.posix.fd_t) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -284,7 +182,6 @@ fn drain(gpa: std.mem.Allocator, master: std.posix.fd_t) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-/// Polls `reap` to a deadline. Test-only, for the same reason as `drain`.
 fn waitExit(pid: std.posix.pid_t) ?Exit {
     var waited: i32 = 0;
     while (waited < test_deadline_ms) {
@@ -303,17 +200,6 @@ test "a child on the pty has a controlling terminal, not merely a tty fd" {
     const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(cwd);
 
-    // The two must name the *same* terminal, and asking whether /dev/tty merely
-    // opens is not enough to tell: a controlling terminal is inherited across
-    // fork, so a child handed a slave fd by `std.process.spawn` still has one —
-    // the terminal lcc itself was launched from. `tty` reports what is on
-    // stdin (our pty); `ps -o tty=` reports the controlling terminal. Equal
-    // means the pty was actually taken over; different is precisely the
-    // openpty-without-setsid arrangement in which the kernel sends SIGWINCH to
-    // some other session and Claude Code never repaints.
-    //
-    // This is the whole reason this module calls forkpty. If it stops holding,
-    // resize dies quietly and nothing else in the suite notices.
     const spawned = try spawn(gpa, .{
         .program = "/bin/sh",
         .argv = &.{ "-c", "printf 'STDIN=%s CTTY=%s\\n' \"$(tty)\" \"$(ps -o tty= -p $$ | tr -d ' ')\"" },
@@ -326,7 +212,6 @@ test "a child on the pty has a controlling terminal, not merely a tty fd" {
     const out = try drain(gpa, spawned.master);
     defer gpa.free(out);
 
-    // `tty` prints `/dev/ttys004`; `ps` prints `ttys004`. Compare on the leaf.
     const stdin_at = std.mem.indexOf(u8, out, "STDIN=/dev/") orelse {
         std.debug.print("child never reported its tty; got \"{f}\"\n", .{std.zig.fmtString(out)});
         return error.TestExpectedEqual;
@@ -357,8 +242,6 @@ test "the size we asked for is the size the child sees" {
     const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(cwd);
 
-    // Ink lays out against this. Getting it wrong renders Claude Code at 24x80
-    // inside a full-screen terminal, which looks like a Claude Code bug.
     const spawned = try spawn(gpa, .{
         .program = "/bin/sh",
         .argv = &.{ "-c", "stty size" },
@@ -380,8 +263,6 @@ test "the child starts in the cwd it was given, not the daemon's" {
     const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(cwd);
 
-    // The worktree is the entire point of `lcc start`. A session that came up
-    // in the daemon's cwd would be an agent editing the wrong checkout.
     const spawned = try spawn(gpa, .{
         .program = "/bin/sh",
         .argv = &.{ "-c", "pwd -P" },
@@ -393,8 +274,6 @@ test "the child starts in the cwd it was given, not the daemon's" {
 
     const out = try drain(gpa, spawned.master);
     defer gpa.free(out);
-    // `realPathFileAlloc` already resolved /var -> /private/var, and `pwd -P`
-    // resolves it the same way on the child's side.
     try std.testing.expect(std.mem.indexOf(u8, out, cwd) != null);
 }
 
@@ -405,13 +284,6 @@ test "a resize reaches the child as SIGWINCH" {
     const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(cwd);
 
-    // The payoff of the controlling terminal. If this breaks, Claude Code
-    // never repaints after a window resize and the pane stays the size it was
-    // when the session started.
-    //
-    // `sleep` in a loop rather than one long sleep: a non-interactive sh runs
-    // a pending trap only between commands, so the poll interval sets how
-    // quickly the handler fires.
     const spawned = try spawn(gpa, .{
         .program = "/bin/sh",
         .argv = &.{ "-c", "trap 'echo GOT_WINCH; exit 0' WINCH; echo READY; while :; do sleep 0.05; done" },
@@ -421,8 +293,6 @@ test "a resize reaches the child as SIGWINCH" {
     });
     defer close(spawned.master);
 
-    // Wait for READY before resizing: a SIGWINCH delivered before the trap is
-    // installed proves nothing and would make this flaky rather than wrong.
     var seen: std.ArrayList(u8) = .empty;
     defer seen.deinit(gpa);
     var buf: [1024]u8 = undefined;
@@ -465,9 +335,6 @@ test "a missing program is exit 127, not a session that hangs" {
     const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(cwd);
 
-    // forkpty succeeds even when the exec cannot: the fork happened. So a
-    // typo'd `claude` path shows up as an immediate 127, and the session state
-    // machine reads that as `failed` rather than sitting in `starting` forever.
     const spawned = try spawn(gpa, .{
         .program = "/nonexistent/claude",
         .argv = &.{},
@@ -484,9 +351,6 @@ test "a missing program is exit 127, not a session that hangs" {
 test "an unreachable cwd is 126, told apart from a missing program" {
     const gpa = std.testing.allocator;
 
-    // A worktree removed under a live session is a real case, and it must not
-    // report itself as a missing binary — the two send you looking in
-    // completely different places.
     const spawned = try spawn(gpa, .{
         .program = "/bin/sh",
         .argv = &.{ "-c", "echo hi" },
@@ -520,21 +384,15 @@ test "the master is close-on-exec and non-blocking" {
         close(spawned.master);
     }
 
-    // CLOEXEC: without it a later session's fork inherits this master, the pty
-    // never reports EOF, and a dead session stays `running` forever.
     const fd_flags = std.c.fcntl(spawned.master, std.posix.F.GETFD, @as(c_int, 0));
     try std.testing.expect(fd_flags >= 0);
     try std.testing.expect((fd_flags & std.posix.FD_CLOEXEC) != 0);
 
-    // NONBLOCK: without it one child that stopped reading blocks the single
-    // poll loop, and every other session stops with it.
     const fl = std.c.fcntl(spawned.master, std.posix.F.GETFL, @as(c_int, 0));
     try std.testing.expect(fl >= 0);
     const o: std.posix.O = @bitCast(@as(u32, @intCast(fl)));
     try std.testing.expect(o.NONBLOCK);
 
-    // And the consequence a caller depends on: reading an idle pty returns
-    // `.again` immediately rather than parking the thread.
     var buf: [64]u8 = undefined;
     try std.testing.expectEqual(Read.again, read(spawned.master, &buf));
 }
@@ -546,9 +404,6 @@ test "signalGroup reaches past the child into what it spawned" {
     const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(cwd);
 
-    // Claude Code runs builds and shells; killing only the node process would
-    // orphan them still holding the pty. The negative pid is what makes
-    // stopping a session actually stop it.
     const spawned = try spawn(gpa, .{
         .program = "/bin/sh",
         .argv = &.{ "-c", "sleep 30 & echo STARTED; wait" },
@@ -580,8 +435,6 @@ test "signalGroup reaches past the child into what it spawned" {
     const status = waitExit(spawned.pid) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(Exit{ .signal = 9 }, status);
 
-    // The pty reports the hangup rather than staying open on the backgrounded
-    // `sleep` — which is what it would do if only the leader had been killed.
     var drained: [4096]u8 = undefined;
     var closed = false;
     waited = 0;

@@ -1,5 +1,3 @@
-//! Shared context handed to every command, plus the bits two commands need.
-
 const std = @import("std");
 const Io = std.Io;
 const config = @import("config.zig");
@@ -17,18 +15,12 @@ pub const App = struct {
         return self.repoAt(null);
     }
 
-    /// The repository containing `cwd`, for `--repo`. The path is carried into
-    /// `Repo.cwd` as well: once a caller has named a repository, "the current
-    /// branch" means the one checked out *there*, not in the directory lcc
-    /// happens to have been run from.
     pub fn repoAt(self: App, cwd: ?[]const u8) !git.Repo {
         const root = try git.repoRoot(self.gpa, self.io, cwd);
         return .{ .gpa = self.gpa, .io = self.io, .root = root, .cwd = cwd };
     }
 };
 
-/// Cancelling a prompt exits 130, the conventional SIGINT status — the same
-/// thing the TypeScript version did with inquirer's ExitPromptError.
 pub const cancelled_exit_code: u8 = 130;
 
 pub const Choice = struct {
@@ -36,19 +28,15 @@ pub const Choice = struct {
     managed: bool,
 };
 
-/// The directory every worktree lcc creates for this repo sits under, per the
-/// configured template.
 pub fn managedPrefix(app: App, repo: git.Repo) ![]const u8 {
     const cfg = try config.load(app.gpa, app.io, app.environ);
     return git.worktreePathPrefix(app.gpa, cfg.worktreeTemplate, repo.root);
 }
 
-/// An empty prefix matches everything, which would tag every worktree.
 pub fn isManaged(prefix: []const u8, path: []const u8) bool {
     return prefix.len > 0 and std.mem.startsWith(u8, path, prefix);
 }
 
-/// Worktrees other than the main one, tagged with whether lcc created them.
 pub fn worktreeChoices(app: App, repo: git.Repo) ![]Choice {
     const entries = try repo.listWorktrees();
     const prefix = try managedPrefix(app, repo);
@@ -64,7 +52,6 @@ pub fn worktreeChoices(app: App, repo: git.Repo) ![]Choice {
     return out.toOwnedSlice(app.gpa);
 }
 
-/// Wall-clock seconds since the epoch, for the columns that render an age.
 pub fn nowSeconds(io: Io) i64 {
     const ts = Io.Timestamp.now(io, .real);
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
@@ -95,7 +82,6 @@ pub fn shortHead(head: []const u8) []const u8 {
     return head[0..@min(8, head.len)];
 }
 
-/// The picker used by both `lcc open` and `lcc remove`.
 pub fn pickWorktree(app: App, choices: []const Choice, message: []const u8) !?Choice {
     const items = try app.gpa.alloc(prompt.Item, choices.len);
     for (choices, 0..) |choice, i| {

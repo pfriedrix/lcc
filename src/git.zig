@@ -1,6 +1,3 @@
-//! Everything lcc does with git. Same shell-outs as the TypeScript version —
-//! `execa` becomes `std.process`, nothing else changes.
-
 const std = @import("std");
 const Io = std.Io;
 const exec = @import("exec.zig");
@@ -11,14 +8,6 @@ pub const Error = error{
     GitFailed,
 } || std.mem.Allocator.Error;
 
-/// Absolute path of the *main* worktree of the repository containing `cwd` (or
-/// the process cwd).
-///
-/// Deliberately not `--show-toplevel`: inside a linked worktree that answers the
-/// worktree itself, and everything lcc derives from the root — the worktree path
-/// template, `.git/info/exclude`, the repo-root `.env` files — has to hang off
-/// the main checkout. `--git-common-dir` is the shared `.git` either way, so its
-/// parent is the main worktree.
 pub fn repoRoot(gpa: std.mem.Allocator, io: Io, cwd: ?[]const u8) Error![]u8 {
     const toplevel = exec.capture(gpa, io, &.{ "git", "rev-parse", "--show-toplevel" }, cwd) catch
         return Error.NotAGitRepository;
@@ -28,8 +17,6 @@ pub fn repoRoot(gpa: std.mem.Allocator, io: Io, cwd: ?[]const u8) Error![]u8 {
     }, cwd) catch return toplevel;
     defer gpa.free(common);
 
-    // `<main-worktree>/.git` is the only shape whose parent is the checkout; a
-    // bare repo or `--separate-git-dir` puts the common dir somewhere unrelated.
     if (!std.mem.eql(u8, std.fs.path.basename(common), ".git")) return toplevel;
     const main_root = std.fs.path.dirname(common) orelse return toplevel;
     gpa.free(toplevel);
@@ -39,13 +26,8 @@ pub fn repoRoot(gpa: std.mem.Allocator, io: Io, cwd: ?[]const u8) Error![]u8 {
 pub const Repo = struct {
     gpa: std.mem.Allocator,
     io: Io,
-    /// Main worktree — the anchor for derived paths and `.git` writes.
     root: []const u8,
-    /// Where lcc was actually invoked, which is what "the current branch" means
-    /// when that place is a linked worktree. Null inherits the process cwd.
     cwd: ?[]const u8 = null,
-    /// stdout is carrying a machine-readable payload, so no child may write to it.
-    /// Set by `--json`, where a stray line of git progress would corrupt the output.
     stdout_reserved: bool = false,
 
     fn captureIn(self: Repo, cwd: ?[]const u8, argv: []const []const u8) ?[]u8 {
@@ -60,8 +42,6 @@ pub const Repo = struct {
         return exec.succeeds(self.gpa, self.io, argv, self.root);
     }
 
-    /// origin/HEAD when it is set, else a local `main`/`master`, else whatever
-    /// HEAD currently points at.
     pub fn defaultBranch(self: Repo) Error![]const u8 {
         if (self.capture(&.{ "git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD" })) |out| {
             if (std.mem.startsWith(u8, out, "origin/")) return out["origin/".len..];
@@ -75,9 +55,6 @@ pub const Repo = struct {
             return Error.GitFailed;
     }
 
-    /// The branch checked out where lcc was invoked — not `root`'s, which is a
-    /// different branch whenever the user is standing in a linked worktree.
-    /// Null when HEAD is detached.
     pub fn currentBranch(self: Repo) Error!?[]const u8 {
         const out = self.captureIn(self.cwd, &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" }) orelse
             return Error.GitFailed;
@@ -85,10 +62,9 @@ pub const Repo = struct {
         return out;
     }
 
-    /// Local and remote branches, `origin/` stripped, deduplicated, sorted.
     pub fn listBranches(self: Repo) Error![][]const u8 {
         const out = self.capture(&.{
-            "git",                     "for-each-ref",
+            "git",                       "for-each-ref",
             "--format=%(refname:short)", "refs/heads/",
             "refs/remotes/",
         }) orelse return Error.GitFailed;
@@ -107,9 +83,6 @@ pub const Repo = struct {
         return names;
     }
 
-    /// One `for-each-ref` for every local branch: its upstream, how far the two
-    /// have drifted, and when the tip was committed. A single call, so the cost
-    /// does not grow with the number of worktrees on screen.
     pub fn branchStatuses(self: Repo) Error![]BranchStatus {
         const out = self.capture(&.{
             "git",
@@ -144,12 +117,7 @@ pub const Repo = struct {
         return statuses.toOwnedSlice(self.gpa);
     }
 
-    /// Number of entries `git status --porcelain` reports in a worktree, or null
-    /// when the worktree cannot be inspected — a prunable one whose directory
-    /// has already been deleted, say.
     pub fn dirtyCount(self: Repo, worktree_path: []const u8) ?u32 {
-        // Not `capture`: that runs in `root`, the main worktree, which would report
-        // the same status for every row on the dashboard.
         const out = self.captureIn(worktree_path, &.{ "git", "status", "--porcelain" }) orelse
             return null;
 
@@ -205,9 +173,6 @@ pub const Repo = struct {
         return .{ .path = worktree_path, .branch = branch, .created = .new };
     }
 
-    /// git's progress belongs to the user, so its stdio is the terminal's — unless
-    /// stdout is spoken for, in which case the run is captured and only its failure
-    /// is passed on, through `last_error`.
     fn runInherit(self: Repo, argv: []const []const u8) Error!void {
         if (self.stdout_reserved) {
             const out = exec.run(self.gpa, self.io, argv, self.root) catch return Error.GitFailed;
@@ -221,8 +186,6 @@ pub const Repo = struct {
         if (code != 0) return Error.GitFailed;
     }
 
-    /// Adds the worktree's top-level directory to `.git/info/exclude`, so a
-    /// worktree nested inside the repo does not show up as untracked.
     fn ensureLocalIgnore(self: Repo, worktree_path: []const u8) !void {
         const rel = std.fs.path.relativePosix(self.gpa, self.root, self.root, worktree_path) catch return;
         if (rel.len == 0 or std.mem.startsWith(u8, rel, "..") or std.fs.path.isAbsolute(rel)) return;
@@ -304,17 +267,7 @@ pub const Repo = struct {
         return slice;
     }
 
-    /// Brings the remote-tracking refs up to date and drops the ones whose remote
-    /// branch is gone.
-    ///
-    /// Every signal a removal decision rests on is read out of those refs, and
-    /// none of them move on their own: `origin/master` only grows once something
-    /// fetches it, and `%(upstream:track)` cannot say `[gone]` until the pruning
-    /// happens. Without this, `lcc` is deciding what to delete from whatever the
-    /// last `git pull` happened to leave behind.
     pub fn fetchPrune(self: Repo) Error!void {
-        // Captured rather than inherited: this runs under a progress line, and
-        // fetch's own output would break it apart for no gain.
         const out = exec.run(self.gpa, self.io, &.{ "git", "fetch", "--prune" }, self.root) catch
             return Error.GitFailed;
         if (!out.ok()) {
@@ -323,16 +276,6 @@ pub const Repo = struct {
         }
     }
 
-    /// Decide whether a branch can be deleted along with its worktree.
-    ///
-    /// Being an ancestor of the default branch is the plain case. A *gone* upstream is
-    /// the other one: the branch was pushed and the remote branch has since been
-    /// deleted, which is what a squash-merged PR looks like locally — the commits are
-    /// in the default branch under different SHAs, so ancestry can never prove it.
-    ///
-    /// Both are read from local refs, so both are only as current as the last fetch,
-    /// and neither can speak for a squash-merged branch whose remote branch is still
-    /// there. `BranchDisposition.withMergedPr` covers that case from GitHub.
     pub fn branchDisposition(self: Repo, branch: []const u8) Error!BranchDisposition {
         const base = try self.defaultBranch();
         if (std.mem.eql(u8, branch, base)) {
@@ -360,12 +303,6 @@ pub const Repo = struct {
         return std.mem.eql(u8, out, "[gone]");
     }
 
-    /// Commits `to_ref` has that `from_ref` does not — `git rev-list --count A..B`.
-    ///
-    /// Null, not zero, when the range cannot be resolved. Zero is a real answer
-    /// meaning "nothing new", and the two are opposites wherever the *smallest*
-    /// count wins: a base whose ref is missing would otherwise come back as the
-    /// nearest one. Each caller states its own policy for the null.
     pub fn countAhead(self: Repo, from_ref: []const u8, to_ref: []const u8) ?u32 {
         const range = std.fmt.allocPrint(self.gpa, "{s}..{s}", .{ from_ref, to_ref }) catch return null;
         const out = self.capture(&.{ "git", "rev-list", "--count", range }) orelse return null;
@@ -377,33 +314,16 @@ pub const Repo = struct {
         for ([_][]const u8{ origin_base, base }) |ref| {
             if (self.countAhead(ref, branch)) |count| return count;
         }
-        // Deliberate, and now visibly so rather than hidden in an `orelse continue`
-        // chain that looked like an answer: this number goes into a confirmation
-        // line, where "unknown" and "nothing unmerged" both mean say nothing alarming.
         return 0;
     }
 
-    /// The commit HEAD points at *where lcc was invoked*, which is a different
-    /// commit from `root`'s HEAD whenever the user is standing in a linked
-    /// worktree. Resolved once so every count afterwards can name it explicitly
-    /// and still run in `root`.
-    ///
-    /// Null on an empty repository, or a worktree directory that is no longer there.
     pub fn headSha(self: Repo) ?[]const u8 {
         return self.captureIn(self.cwd, &.{ "git", "rev-parse", "HEAD" });
     }
 
-    /// The live `origin/release/*` branches with their tip dates, `origin/`
-    /// stripped.
-    ///
-    /// Remote only, and deliberately not `listBranches`: that merges local and
-    /// remote into one deduplicated set, so a stale local `release/2.4.1` left
-    /// behind by a shipped release is indistinguishable there from one still being
-    /// stabilised — and the release-project veto would read it as "trunk is past
-    /// v2.4.1", which is the one conclusion it must not draw.
     pub fn remoteReleaseBranches(self: Repo) Error![]RemoteBranch {
         const out = self.capture(&.{
-            "git",                                                 "for-each-ref",
+            "git",                                               "for-each-ref",
             "--format=%(refname:short)%09%(committerdate:unix)", "refs/remotes/origin/release/",
         }) orelse return Error.GitFailed;
 
@@ -424,12 +344,6 @@ pub const Repo = struct {
         return found.toOwnedSlice(self.gpa);
     }
 
-    /// Every tag, in git's own order — which is lexical, so `v2.10.0` comes before
-    /// `v2.9.0` and ordering them is the caller's job.
-    ///
-    /// `for-each-ref` rather than `git tag`, because `git tag` honours `column.ui`
-    /// and `tag.sort` from the user's config: the shape of its output is not lcc's
-    /// to depend on. This is one line per ref whatever the machine is configured like.
     pub fn listTags(self: Repo) Error![][]const u8 {
         const out = self.capture(&.{
             "git", "for-each-ref", "--format=%(refname:short)", "refs/tags/",
@@ -455,20 +369,8 @@ pub const Repo = struct {
         }
     }
 
-    /// Deletes a branch this repo has already vouched for, and does not take git's
-    /// "not fully merged" for an answer when lcc's own check says otherwise. True
-    /// when it took the force to do it.
-    ///
-    /// `-d` re-checks the merge against HEAD and the branch's upstream, and those two
-    /// are the whole of what it can see. A branch merged into `origin/<default>`
-    /// while local `<default>` is behind sits in neither — and `lcc remove`'s own
-    /// `fetch --prune` is what takes the upstream away, so the ordinary case (pull
-    /// request merged, remote branch deleted with it, nothing pulled since) is
-    /// refused. Ancestry against `origin/<default>` already proved those commits
-    /// survive, so the retry spends nothing but a second opinion that was blind.
     pub fn deleteVerified(self: Repo, d: BranchDisposition) Error!bool {
         self.deleteBranch(d.branch, d.needsForce()) catch |err| {
-            // Nothing left to escalate to: `-D` is what already failed.
             if (d.needsForce()) return err;
             try self.deleteBranch(d.branch, true);
             return true;
@@ -490,18 +392,12 @@ pub const Repo = struct {
     }
 };
 
-/// stderr of the last failed `removeWorktree`, so the caller can show git's own
-/// explanation before offering `--force`.
 pub var last_error: []const u8 = "";
 
 pub const Strategy = enum { reused_local, tracking_remote, new };
 
-/// A branch that exists on `origin`, named without the remote prefix.
 pub const RemoteBranch = struct {
-    /// `release/2.5.2` — `origin/` already stripped.
     branch: []const u8,
-    /// Tip commit date, Unix seconds. Not part of any decision; it lets a caller
-    /// say how stale its local view of `origin` is.
     committed_at: i64,
 };
 
@@ -520,9 +416,6 @@ pub const WorktreeEntry = struct {
     is_main: bool,
 };
 
-/// The worktree `branch` is checked out in, wherever it sits. Not derived from the
-/// path template: a worktree created before the template changed, or by hand, is
-/// still the one place that branch can be checked out — git allows only one.
 pub fn worktreeForBranch(entries: []const WorktreeEntry, branch: []const u8) ?WorktreeEntry {
     for (entries) |entry| {
         const name = entry.branch orelse continue;
@@ -533,22 +426,15 @@ pub fn worktreeForBranch(entries: []const WorktreeEntry, branch: []const u8) ?Wo
 
 pub const BranchStatus = struct {
     branch: []const u8,
-    /// `origin/feature/x`, or null when the branch was never pushed.
     upstream: ?[]const u8,
     ahead: u32,
     behind: u32,
-    /// The upstream existed and has since been deleted — what a squash-merged PR
-    /// looks like locally.
     gone: bool,
-    /// Commit timestamp of the branch tip, Unix seconds. 0 when unknown.
     committed_at: i64,
 };
 
 pub const Drift = struct { ahead: u32 = 0, behind: u32 = 0, gone: bool = false };
 
-/// `%(upstream:track)` renders as `[ahead 2]`, `[behind 3]`, `[ahead 2, behind 3]`,
-/// `[gone]`, or nothing at all — the last meaning either in sync or no upstream,
-/// which `%(upstream:short)` tells apart.
 pub fn parseTrack(track: []const u8) Drift {
     const body = std.mem.trim(u8, track, " \t[]");
     if (body.len == 0) return .{};
@@ -573,26 +459,11 @@ pub const DispositionReason = enum { merged, merged_pr, upstream_gone, unmerged,
 
 pub const BranchDisposition = struct {
     branch: []const u8,
-    /// True when the commits survive elsewhere, so deleting the branch loses nothing.
     safe: bool,
-    /// Commits on the branch that the default branch does not have.
     unmerged: u32,
     reason: DispositionReason,
-    /// The pull request that vouched for the branch, when that is what did.
     pr: u32 = 0,
 
-    /// The same verdict, with GitHub's answer folded in: it says the branch's pull
-    /// request is merged.
-    ///
-    /// That vouches for commits local ancestry never can. A squash merge rewrites
-    /// them, so `merge-base --is-ancestor` will keep failing however long you wait,
-    /// and the `[gone]` upstream that stands in for it only appears once the remote
-    /// branch has been deleted *and* pruned. A merged pull request is the state
-    /// both of those are trying to infer.
-    ///
-    /// Never overrides a verdict that already stands: the default branch stays
-    /// undeletable whatever a pull request says, and a plain merge is a better
-    /// reason than this one.
     pub fn withMergedPr(self: BranchDisposition, number: u32) BranchDisposition {
         if (self.safe or self.reason == .default_branch) return self;
         return .{
@@ -604,21 +475,11 @@ pub const BranchDisposition = struct {
         };
     }
 
-    /// Whether git has to be told not to re-check the merge itself.
-    ///
-    /// It re-checks against HEAD and the branch's own upstream, and that is the
-    /// whole of what it can see. `upstream_gone` and `merged_pr` are both ways of
-    /// surviving a rewrite those two cannot describe, so they need `-D` outright.
-    /// A plain merge asks for `-d` and keeps git's second opinion — which it can
-    /// still withhold, since ancestry here is judged against `origin/<default>` as
-    /// well, and that is a ref `-d` never consults. `deleteVerified` is where that
-    /// refusal is dealt with.
     pub fn needsForce(self: BranchDisposition) bool {
         return self.reason != .merged;
     }
 };
 
-/// `PE-42/some-title` from Linear becomes `feature/some-title`.
 pub fn rewriteBranchName(gpa: std.mem.Allocator, linear_branch: []const u8, prefix: []const u8) ![]u8 {
     const tail = if (std.mem.indexOfScalar(u8, linear_branch, '/')) |slash|
         linear_branch[slash + 1 ..]
@@ -647,12 +508,7 @@ pub fn renderWorktreePath(
             if (std.mem.indexOfScalarPos(u8, template, i, '}')) |close| {
                 const key = template[i + 1 .. close];
                 const value: ?[]const u8 =
-                    if (std.mem.eql(u8, key, "repoRoot")) repo_root
-                    else if (std.mem.eql(u8, key, "repoParent")) repo_parent
-                    else if (std.mem.eql(u8, key, "repoName")) repo_name
-                    else if (std.mem.eql(u8, key, "branch")) branch
-                    else if (std.mem.eql(u8, key, "branchLeaf")) branch_leaf
-                    else null;
+                    if (std.mem.eql(u8, key, "repoRoot")) repo_root else if (std.mem.eql(u8, key, "repoParent")) repo_parent else if (std.mem.eql(u8, key, "repoName")) repo_name else if (std.mem.eql(u8, key, "branch")) branch else if (std.mem.eql(u8, key, "branchLeaf")) branch_leaf else null;
                 if (value) |v| {
                     try out.appendSlice(gpa, v);
                     i = close + 1;
@@ -666,17 +522,11 @@ pub fn renderWorktreePath(
     return out.toOwnedSlice(gpa);
 }
 
-/// The leading part of `template` that does not depend on the branch, i.e. the
-/// prefix shared by every path it renders. Tells worktrees lcc created from ones
-/// added by hand. Comes back empty for a template that opens with a branch
-/// placeholder — such a template attributes nothing.
 pub fn worktreePathPrefix(
     gpa: std.mem.Allocator,
     template: []const u8,
     repo_root: []const u8,
 ) ![]u8 {
-    // NUL cannot appear in a path, so it cannot collide with whatever the
-    // repo placeholders expand to.
     const rendered = try renderWorktreePath(gpa, template, repo_root, "\x00");
     const cut = std.mem.indexOfScalar(u8, rendered, 0) orelse return rendered;
     defer gpa.free(rendered);
@@ -716,7 +566,6 @@ test "parseTrack covers every shape for-each-ref emits" {
         Drift{ .ahead = 5, .behind = 14 },
         parseTrack("[ahead 5, behind 14]"),
     );
-    // Junk must read as "no information", never as a bogus count.
     try std.testing.expectEqual(Drift{}, parseTrack("[ahead]"));
 }
 
@@ -731,12 +580,10 @@ test "worktreePathPrefix cuts the template at the branch" {
     defer gpa.free(nested);
     try std.testing.expectEqualStrings("/tmp/proj/.lcc/worktrees/", nested);
 
-    // A branch baked into the directory name, not just a segment of its own.
     const infix = try worktreePathPrefix(gpa, "{repoRoot}/wt-{branch}-x", "/tmp/proj");
     defer gpa.free(infix);
     try std.testing.expectEqualStrings("/tmp/proj/wt-", infix);
 
-    // No branch placeholder at all: the whole rendered path is the prefix.
     const fixed = try worktreePathPrefix(gpa, "{repoRoot}/wt", "/tmp/proj");
     defer gpa.free(fixed);
     try std.testing.expectEqualStrings("/tmp/proj/wt", fixed);
@@ -749,8 +596,6 @@ test "worktreePathPrefix cuts the template at the branch" {
 test "worktreeForBranch matches on the branch, not the path" {
     const entries = [_]WorktreeEntry{
         .{ .path = "/r", .branch = "main", .head = "a", .locked = false, .prunable = false, .is_main = true },
-        // The path is no longer what the template would render — a renamed issue,
-        // or a worktree added by hand. The branch is what settles it.
         .{ .path = "/elsewhere/old", .branch = "feature/pe-1-x", .head = "b", .locked = false, .prunable = false, .is_main = false },
         .{ .path = "/r/detached", .branch = null, .head = "c", .locked = false, .prunable = false, .is_main = false },
     };
@@ -758,7 +603,6 @@ test "worktreeForBranch matches on the branch, not the path" {
     try std.testing.expectEqualStrings("/elsewhere/old", worktreeForBranch(&entries, "feature/pe-1-x").?.path);
     try std.testing.expect(worktreeForBranch(&entries, "main").?.is_main);
     try std.testing.expect(worktreeForBranch(&entries, "feature/pe-2-y") == null);
-    // A prefix of a branch name is a different branch.
     try std.testing.expect(worktreeForBranch(&entries, "feature/pe-1") == null);
 }
 
@@ -786,17 +630,12 @@ test "repoRoot answers the main worktree from inside a linked worktree" {
     const from_linked = try repoRoot(gpa, io, linked);
     defer gpa.free(from_linked);
 
-    // The bug this pins: `--show-toplevel` answers the worktree, so a template
-    // like `{repoParent}/{repoName}.worktrees/…` nested itself one level deeper
-    // on every start from inside a worktree.
     const toplevel = try exec.capture(gpa, io, &.{ "git", "rev-parse", "--show-toplevel" }, linked);
     defer gpa.free(toplevel);
     try std.testing.expect(!std.mem.eql(u8, toplevel, from_linked));
 
     try std.testing.expectEqualStrings(from_main, from_linked);
 
-    // `root` anchors derived paths, but "the current branch" is still the one
-    // checked out where lcc was invoked — `start` offers it as the base.
     const repo: Repo = .{ .gpa = gpa, .io = io, .root = from_main, .cwd = linked };
     const branch = (try repo.currentBranch()).?;
     defer gpa.free(branch);
@@ -824,13 +663,10 @@ test "release branches are read off origin, and a stale local one does not count
     try runGit(gpa, io, proj, &.{ "remote", "add", "origin", origin });
     try runGit(gpa, io, proj, &.{ "push", "-q", "-u", "origin", "main" });
 
-    // One release still being stabilised, pushed.
     try runGit(gpa, io, proj, &.{ "checkout", "-q", "-b", "release/2.5.2" });
     try runGit(gpa, io, proj, &.{ "commit", "-q", "--allow-empty", "-m", "stabilise" });
     try runGit(gpa, io, proj, &.{ "push", "-q", "-u", "origin", "release/2.5.2" });
 
-    // …and one left behind locally after its release shipped. `listBranches`
-    // cannot tell these two apart, which is the whole reason for the new call.
     try runGit(gpa, io, proj, &.{ "checkout", "-q", "-b", "release/2.4.1", "main" });
     try runGit(gpa, io, proj, &.{ "checkout", "-q", "main" });
 
@@ -846,8 +682,6 @@ test "release branches are read off origin, and a stale local one does not count
     try std.testing.expectEqualStrings("release/2.5.2", live[0].branch);
     try std.testing.expect(live[0].committed_at > 0);
 
-    // The confusion this exists to avoid: the shipped release's branch is still
-    // sitting there locally, and `listBranches` reports it identically.
     const merged_view = try repo.listBranches();
     var saw_stale = false;
     for (merged_view) |name| {
@@ -855,16 +689,11 @@ test "release branches are read off origin, and a stale local one does not count
     }
     try std.testing.expect(saw_stale);
 
-    // Tags come back whole, in git's lexical order — ordering them is the caller's
-    // job, and `v2.10.0` before `v2.9.0` is why.
     const tags = try repo.listTags();
     try std.testing.expectEqual(@as(usize, 3), tags.len);
 
-    // Null, not zero, for a ref that is not there. Zero means "nothing new", and
-    // in a contest for the *smallest* count a missing ref would otherwise win.
     try std.testing.expect(repo.countAhead("origin/release/9.9.9", "HEAD") == null);
     try std.testing.expectEqual(@as(u32, 0), repo.countAhead("HEAD", "HEAD").?);
-    // main is one commit behind the release branch's tip.
     try std.testing.expectEqual(@as(u32, 1), repo.countAhead("origin/main", "origin/release/2.5.2").?);
 
     const head = repo.headSha().?;
@@ -896,8 +725,6 @@ test "a squash-merged branch reads as unmerged until a pull request vouches for 
     try runGit(gpa, io, proj, &.{ "commit", "-q", "--allow-empty", "-m", "the work" });
     try runGit(gpa, io, proj, &.{ "push", "-q", "-u", "origin", "feature/x" });
 
-    // The squash: master gains the same work under a different SHA, and the remote
-    // branch stays — the repo setting that deletes it on merge is off.
     try runGit(gpa, io, proj, &.{ "checkout", "-q", "master" });
     try runGit(gpa, io, proj, &.{ "commit", "-q", "--allow-empty", "-m", "squashed feature/x" });
     try runGit(gpa, io, proj, &.{ "push", "-q", "origin", "master" });
@@ -905,10 +732,6 @@ test "a squash-merged branch reads as unmerged until a pull request vouches for 
     const repo: Repo = .{ .gpa = arena, .io = io, .root = proj };
     try repo.fetchPrune();
 
-    // The bug this pins: the work is safely in master, and neither local signal can
-    // say so. Ancestry fails because the SHA changed, and the upstream is not gone
-    // because the remote branch is still there — so `lcc remove --merged` offered
-    // nothing right after the merge, which is exactly when it gets run.
     const local = try repo.branchDisposition("feature/x");
     try std.testing.expect(!local.safe);
     try std.testing.expectEqual(DispositionReason.unmerged, local.reason);
@@ -918,10 +741,7 @@ test "a squash-merged branch reads as unmerged until a pull request vouches for 
     try std.testing.expect(vouched.safe);
     try std.testing.expectEqual(DispositionReason.merged_pr, vouched.reason);
     try std.testing.expectEqual(@as(u32, 412), vouched.pr);
-    // `-d` would still refuse: the commits are not in master's ancestry and never
-    // will be.
     try std.testing.expect(vouched.needsForce());
-    // The count survives the upgrade — it is what the confirmation shows.
     try std.testing.expectEqual(@as(u32, 1), vouched.unmerged);
 }
 
@@ -952,11 +772,7 @@ test "a branch merged where only origin can see it still gets deleted" {
     try runGit(gpa, io, proj, &.{ "push", "-q", "-u", "origin", "feature/x" });
     try runGit(gpa, io, proj, &.{ "checkout", "-q", "master" });
 
-    // The merge happens elsewhere, the way it really does: on GitHub, followed by
-    // the remote branch being deleted. Nothing pulls master here afterwards.
     try runGit(gpa, io, base, &.{ "clone", "-q", origin, "other" });
-    // A bare repo's HEAD names whatever `init.defaultBranch` says, which need not be
-    // the branch that was pushed — so the clone is put on master explicitly.
     try runGit(gpa, io, other, &.{ "checkout", "-q", "-B", "master", "origin/master" });
     try runGit(gpa, io, other, &.{ "merge", "-q", "--no-ff", "origin/feature/x", "-m", "merge" });
     try runGit(gpa, io, other, &.{ "push", "-q", "origin", "HEAD:master" });
@@ -965,13 +781,10 @@ test "a branch merged where only origin can see it still gets deleted" {
     const repo: Repo = .{ .gpa = arena, .io = io, .root = proj };
     try repo.fetchPrune();
 
-    // lcc sees the merge, because it looks at origin/master too.
     const d = try repo.branchDisposition("feature/x");
     try std.testing.expect(d.safe);
     try std.testing.expectEqual(DispositionReason.merged, d.reason);
 
-    // git does not: local master is behind, and the upstream that could have
-    // vouched was pruned a moment ago by lcc's own fetch. `-d` alone refuses.
     try std.testing.expectError(Error.GitFailed, repo.deleteBranch("feature/x", false));
     try std.testing.expect(std.mem.indexOf(u8, last_error, "not fully merged") != null);
 
@@ -981,11 +794,9 @@ test "a branch merged where only origin can see it still gets deleted" {
 
 test "withMergedPr never overrides a verdict that already stands" {
     const merged: BranchDisposition = .{ .branch = "b", .safe = true, .unmerged = 0, .reason = .merged };
-    // A plain merge is the better reason, and it is the one `-d` accepts.
     try std.testing.expectEqual(DispositionReason.merged, merged.withMergedPr(1).reason);
     try std.testing.expect(!merged.needsForce());
 
-    // The default branch is not deletable, whatever pull request came off it.
     const base: BranchDisposition = .{ .branch = "master", .safe = false, .unmerged = 0, .reason = .default_branch };
     const still_base = base.withMergedPr(2);
     try std.testing.expectEqual(DispositionReason.default_branch, still_base.reason);
@@ -999,12 +810,14 @@ test "withMergedPr never overrides a verdict that already stands" {
 fn runGit(gpa: std.mem.Allocator, io: Io, cwd: []const u8, args: []const []const u8) !void {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
-    // The test repo must not depend on the developer's global git config.
     try argv.appendSlice(gpa, &.{
         "git",
-        "-c", "user.email=lcc@example.com",
-        "-c", "user.name=lcc",
-        "-c", "commit.gpgsign=false",
+        "-c",
+        "user.email=lcc@example.com",
+        "-c",
+        "user.name=lcc",
+        "-c",
+        "commit.gpgsign=false",
     });
     try argv.appendSlice(gpa, args);
 
@@ -1047,7 +860,7 @@ test "ensureLocalIgnore adds the worktree root once" {
     const arena_repo: Repo = .{ .gpa = arena_state.allocator(), .io = io, .root = root };
 
     try arena_repo.ensureLocalIgnore(worktree);
-    try arena_repo.ensureLocalIgnore(worktree); // second call must be a no-op
+    try arena_repo.ensureLocalIgnore(worktree);
 
     const exclude = try std.fs.path.join(gpa, &.{ root, ".git", "info", "exclude" });
     defer gpa.free(exclude);
