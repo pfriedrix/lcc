@@ -119,9 +119,18 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
 
 ## Style
 
-Comments here explain **why**, never what: a `//!` header stating what the module is for,
-`///` on public declarations, and inline notes that name the bug a line prevents or the
-constraint that forced a shape. Keep them and keep them accurate — they are the only
-rationale record this repo has. Do not add ones that restate the code.
+**The Zig sources carry no comments.** No `//!` module headers, no `///` on declarations,
+no inline notes. They were all removed deliberately; do not reintroduce them, and do not
+add one to explain a change you are making.
+
+That leaves three places for a "why", and something has to go in one of them or it is lost:
+the commit message, this file's **Traps** section (for anything that would bite the next
+person editing the file), or README (for anything a *user* of `lcc` would want). Reach for
+`git log -p` and `git blame` when a line looks arbitrary — that is now the rationale record.
+
+Test names carry the rest. A `test "…"` string is the one place left where a constraint is
+stated in words, so make it a sentence about the behaviour and not a label for the
+function: `test "a turn that went silent asks for a person, rather than claiming it
+finished"` survives the loss of its comment; `test "decay"` would not.
 
 Default branch is `master`. Branch prefixes: `feature/`, `fix/`, `docs/`, `chore/`.

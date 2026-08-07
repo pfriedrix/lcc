@@ -1,15 +1,6 @@
-//! Finding gitignored files in the repo and symlinking them into a worktree.
-//!
-//! A pattern is a relative path whose every segment may glob: `.env`, `.env.*`,
-//! `.claude/settings.local.json`, `*/credentials.plist`. `*` and `?` never cross
-//! a separator, so the walk only ever visits the directories a pattern names —
-//! it never descends the whole repository.
-
 const std = @import("std");
 const Io = std.Io;
 
-/// Single path segment: `*` matches any run of characters, `?` exactly one.
-/// Segments never contain a separator, so no path semantics are needed here.
 pub fn globMatch(pattern: []const u8, name: []const u8) bool {
     var p: usize = 0;
     var n: usize = 0;
@@ -36,8 +27,6 @@ pub fn globMatch(pattern: []const u8, name: []const u8) bool {
     return p == pattern.len;
 }
 
-/// Whole-path match: segment counts must agree and every segment must glob-match.
-/// `.env` therefore matches only a root-level `.env`, never `config/.env`.
 pub fn matchPath(pattern: []const u8, rel_path: []const u8) bool {
     var pattern_segments = std.mem.splitScalar(u8, pattern, '/');
     var path_segments = std.mem.splitScalar(u8, rel_path, '/');
@@ -51,15 +40,10 @@ pub fn matchPath(pattern: []const u8, rel_path: []const u8) bool {
 }
 
 pub const Found = struct {
-    /// Path relative to the repo root — the same path the symlink gets in the
-    /// worktree, so `.claude/settings.local.json` lands in `.claude/`.
     rel: []const u8,
-    /// Absolute path of the source file.
     abs: []const u8,
 };
 
-/// Every file in `repo_root` matched by `patterns` and not by `exclude`, sorted
-/// by relative path and deduplicated (two patterns may name the same file).
 pub fn findFiles(
     gpa: std.mem.Allocator,
     io: Io,
@@ -94,9 +78,6 @@ fn isExcluded(rel: []const u8, exclude: []const []const u8) bool {
     return false;
 }
 
-/// Splits a pattern into segments, or null when it is not a safe relative path.
-/// An absolute pattern, or one with a `.`/`..`/empty segment, is skipped rather
-/// than clamped: silently linking the wrong file is worse than linking nothing.
 fn splitPattern(gpa: std.mem.Allocator, pattern: []const u8) !?[]const []const u8 {
     if (pattern.len == 0 or std.fs.path.isAbsolute(pattern)) return null;
 
@@ -110,8 +91,6 @@ fn splitPattern(gpa: std.mem.Allocator, pattern: []const u8) !?[]const []const u
     return try segments.toOwnedSlice(gpa);
 }
 
-/// Walks one pattern segment by segment, collecting the relative paths of the
-/// files the last segment matches.
 fn resolve(
     gpa: std.mem.Allocator,
     io: Io,
@@ -119,7 +98,6 @@ fn resolve(
     segments: []const []const u8,
     out: *std.StringArrayHashMapUnmanaged(void),
 ) !void {
-    // Directories reached so far, relative to the repo root; "" is the root.
     var current: std.ArrayList([]const u8) = .empty;
     try current.append(gpa, "");
 
@@ -167,21 +145,16 @@ fn expandGlob(
             if (dirent.kind != .file and dirent.kind != .sym_link) continue;
         } else {
             if (dirent.kind != .directory and dirent.kind != .sym_link) continue;
-            // A glob must never wander into the object database.
             if (std.mem.eql(u8, dirent.name, ".git")) continue;
         }
         try out.append(gpa, try joinRel(gpa, base, dirent.name));
     }
 }
 
-/// Whether `rel` exists and is the kind this position in the pattern needs:
-/// a file (or a symlink to one) at the end, a directory anywhere before it.
 fn accepts(gpa: std.mem.Allocator, io: Io, repo_root: []const u8, rel: []const u8, last: bool) bool {
     const abs = std.fs.path.join(gpa, &.{ repo_root, rel }) catch return false;
 
     if (last) {
-        // Do not follow: a symlink to a file is itself worth linking, and the
-        // symlink is what the worktree should point at.
         const stat = Io.Dir.cwd().statFile(io, abs, .{ .follow_symlinks = false }) catch return false;
         return stat.kind == .file or stat.kind == .sym_link;
     }
@@ -206,15 +179,11 @@ pub const LinkStatus = enum { linked, skipped_exists };
 
 pub const LinkResult = struct {
     source: []const u8,
-    /// Path relative to the worktree — what the user is told was linked.
     rel: []const u8,
     target: []const u8,
     status: LinkStatus,
 };
 
-/// Symlinks each file into the worktree at the same relative path, creating the
-/// parent directories it needs. An existing entry of any kind is left alone —
-/// the worktree's own file wins.
 pub fn linkFiles(
     gpa: std.mem.Allocator,
     io: Io,
@@ -240,8 +209,6 @@ pub fn linkFiles(
             else => return err,
         }
 
-        // Only matters for nested patterns: `.claude/` may not exist in a fresh
-        // worktree, and `symLink` will not create it.
         if (std.fs.path.dirname(target)) |parent| {
             try cwd.createDirPath(io, parent);
         }
@@ -263,7 +230,6 @@ test "glob matches env patterns" {
 
 test "matchPath is segment-wise and a glob never crosses a separator" {
     try std.testing.expect(matchPath(".env", ".env"));
-    // A bare name is root-level only.
     try std.testing.expect(!matchPath(".env", "config/.env"));
     try std.testing.expect(!matchPath("*", ".claude/settings.local.json"));
 
@@ -331,7 +297,6 @@ test "findFiles resolves nested patterns and honours exclusions" {
         ".env.*",
         ".claude/settings.local.json",
         "*/credentials.plist",
-        // Must not reach into .git even though the glob would match the name.
         "*/config",
     }, &.{".env.example"});
 
@@ -371,7 +336,6 @@ test "linkFiles creates parent directories and never overwrites" {
         .sub_path = try std.fs.path.join(arena, &.{ repo, ".env" }),
         .data = "K=V",
     });
-    // Already present in the worktree — must be left alone.
     try cwd.writeFile(io, .{
         .sub_path = try std.fs.path.join(arena, &.{ worktree, ".env" }),
         .data = "MINE=1",
@@ -386,8 +350,6 @@ test "linkFiles creates parent directories and never overwrites" {
     try std.testing.expectEqualStrings(".env", results[1].rel);
     try std.testing.expectEqual(LinkStatus.skipped_exists, results[1].status);
 
-    // The nested link resolves to the repo's file, and .env still has the
-    // worktree's own contents.
     const linked = try cwd.readFileAlloc(
         io,
         try std.fs.path.join(arena, &.{ worktree, ".claude", "settings.local.json" }),

@@ -1,32 +1,21 @@
-//! Xcode DerivedData: locating it, matching folders to worktrees, and
-//! reclaiming the ones whose project is gone.
-
 const std = @import("std");
 const Io = std.Io;
 const disk = @import("disk.zig");
 const exec = @import("exec.zig");
 
 pub const Entry = struct {
-    /// Absolute path of the folder, e.g. `.../DerivedData/MyApp-abcdef…`.
     path: []const u8,
-    /// Folder name — the same string Xcode shows in its build locations.
     name: []const u8,
-    /// Project or workspace this folder was built for, from `info.plist`.
     workspace_path: []const u8,
 };
 
 pub const Sized = struct {
     entry: Entry,
-    /// Disk usage in bytes.
     size: u64,
 };
 
 pub const Error = error{RefusingToDelete} || std.mem.Allocator.Error;
 
-/// Where Xcode keeps DerivedData. Honours a custom *absolute* location from Xcode's
-/// preferences; a relative one ("Relative to Workspace") lives inside the project and
-/// is already removed along with the worktree, so the default root still applies.
-/// `LCC_DERIVED_DATA` overrides both.
 pub fn root(
     gpa: std.mem.Allocator,
     io: Io,
@@ -49,16 +38,11 @@ pub fn root(
         "defaults", "read", "com.apple.dt.Xcode", "IDECustomDerivedDataLocation",
     }, null)) |custom| {
         if (custom.len > 0 and std.fs.path.isAbsolute(custom)) return custom;
-    } else |_| {
-        // Key unset — Xcode is using the default location.
-    }
+    } else |_| {}
 
     return std.fs.path.join(gpa, &.{ home, "Library", "Developer", "Xcode", "DerivedData" });
 }
 
-/// Every per-project folder under `dir_path`. Xcode's own shared caches
-/// (`ModuleCache.noindex`, `SDKStatCaches.noindex`, …) carry no `info.plist` and are
-/// skipped — they belong to no project and must never be treated as removable.
 pub fn list(gpa: std.mem.Allocator, io: Io, dir_path: []const u8) ![]Entry {
     var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return &.{};
     defer dir.close(io);
@@ -81,21 +65,18 @@ fn readWorkspacePath(gpa: std.mem.Allocator, io: Io, dir_path: []const u8) !?[]c
 
     if (try matchWorkspacePath(gpa, raw)) |value| return value;
 
-    // Some Xcode versions write a binary plist — convert before matching.
     const converted = exec.capture(gpa, io, &.{
         "plutil", "-convert", "xml1", "-o", "-", plist,
     }, null) catch return null;
     return matchWorkspacePath(gpa, converted);
 }
 
-/// Pulls `<key>WorkspacePath</key><string>…</string>` out of the plist XML.
 fn matchWorkspacePath(gpa: std.mem.Allocator, xml: []const u8) !?[]const u8 {
     const key = "<key>WorkspacePath</key>";
     const key_at = std.mem.indexOf(u8, xml, key) orelse return null;
     const after = xml[key_at + key.len ..];
 
     const open_at = std.mem.indexOf(u8, after, "<string>") orelse return null;
-    // Only whitespace may sit between the key and its value.
     for (after[0..open_at]) |c| {
         if (!std.ascii.isWhitespace(c)) return null;
     }
@@ -133,15 +114,12 @@ fn decodeEntities(gpa: std.mem.Allocator, value: []const u8) ![]const u8 {
     return out.toOwnedSlice(gpa);
 }
 
-/// Folders whose project lives inside `worktree_path`. A worktree can own more than
-/// one (an `.xcodeproj` and a `Package.swift`, say), so all matches come back.
 pub fn forWorktree(
     gpa: std.mem.Allocator,
     io: Io,
     entries: []const Entry,
     worktree_path: []const u8,
 ) ![]Entry {
-    // Xcode records the resolved path; `git worktree list` does not resolve symlinks.
     const resolved = disk.realPath(gpa, io, worktree_path);
 
     var matched: std.ArrayList(Entry) = .empty;
@@ -151,7 +129,6 @@ pub fn forWorktree(
     return matched.toOwnedSlice(gpa);
 }
 
-/// Entries whose project is gone from disk — the worktree was removed long ago.
 pub fn orphans(gpa: std.mem.Allocator, io: Io, entries: []const Entry) ![]Entry {
     var dead: std.ArrayList(Entry) = .empty;
     for (entries) |entry| {
@@ -163,7 +140,6 @@ pub fn orphans(gpa: std.mem.Allocator, io: Io, entries: []const Entry) ![]Entry 
     return dead.toOwnedSlice(gpa);
 }
 
-/// Attaches disk usage to each entry.
 pub fn withSizes(gpa: std.mem.Allocator, io: Io, entries: []const Entry) ![]Sized {
     const paths = try gpa.alloc([]const u8, entries.len);
     for (entries, 0..) |entry, i| paths[i] = entry.path;
@@ -174,8 +150,6 @@ pub fn withSizes(gpa: std.mem.Allocator, io: Io, entries: []const Entry) ![]Size
     return sized;
 }
 
-/// Delete one DerivedData folder. Refuses anything that is not a direct child of
-/// `dir_path`, so the root itself and Xcode's shared caches can never be hit.
 pub fn remove(gpa: std.mem.Allocator, io: Io, entry: Entry, dir_path: []const u8) !void {
     _ = gpa;
     if (entry.name.len == 0) return Error.RefusingToDelete;

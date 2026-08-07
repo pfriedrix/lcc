@@ -129,8 +129,6 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn dispatch(app: app_mod.App, args: []const []const u8) !void {
-    // No arguments prints the command list. Every action is named explicitly —
-    // there is no default command, so `lcc` alone never touches a repository.
     if (args.len == 0) {
         app.ui.info("{s}", .{usage});
         return;
@@ -155,11 +153,6 @@ fn dispatch(app: app_mod.App, args: []const []const u8) !void {
     if (eq(first, "issue")) return issueCommand(app, args[1..]);
     if (eq(first, "start")) return startCommand(app, args[1..]);
     if (eq(first, "stats")) return statsCommand(app, args[1..]);
-    // Neither is in `usage`, and neither is an oversight. `watch-hook` is what a
-    // Claude Code hook execs, and `daemon` is what `watch_client` re-execs to
-    // bring the session host up — plumbing a user of lcc has no reason to type,
-    // and every reason not to have to reason about. Both stay dispatchable so
-    // that plumbing works and so there is something to run when debugging it.
     if (eq(first, "watch-hook")) return watchHookCommand(app, args[1..]);
     if (eq(first, "daemon")) return daemonCommand(app, args[1..]);
     if (std.mem.startsWith(u8, first, "-")) return error.UnknownOption;
@@ -214,8 +207,6 @@ fn startCommand(app: app_mod.App, args: []const []const u8) !void {
     opts.plan_mode = orConfig(plan_mode, cfg.planMode);
     opts.watch = orConfig(watch, cfg.watchByDefault);
 
-    // stdout belongs to the payload in machine mode; the progress lines still go
-    // somewhere a human can see them.
     var machine = app;
     machine.ui.divert = opts.json;
     return start_cmd.run(machine, opts);
@@ -230,7 +221,6 @@ fn issueCommand(app: app_mod.App, args: []const []const u8) !void {
     };
 
     var opts: issue_cmd.Opts = .{ .sub = issue_cmd.Sub.empty(verb) };
-    // Past the verb, the way `auth setup` starts at 1.
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -291,7 +281,6 @@ fn issueCommand(app: app_mod.App, args: []const []const u8) !void {
         if (opts.issue == null) {
             opts.issue = arg;
         } else switch (opts.sub) {
-            // The only verb with a second positional.
             .state => |*sub| {
                 if (sub.name != null) return error.TooManyArguments;
                 sub.name = arg;
@@ -313,7 +302,6 @@ fn issueCommand(app: app_mod.App, args: []const []const u8) !void {
         },
     }
 
-    // stdout belongs to the payload in machine mode, same as `start --json`.
     var machine = app;
     machine.ui.divert = opts.json;
     return issue_cmd.run(machine, opts);
@@ -376,20 +364,12 @@ fn openCommand(app: app_mod.App, args: []const []const u8) !void {
         std.process.exit(1);
     };
 
-    // Xcode keeps the old picker: it opens a worktree in an editor and has
-    // nothing to do with sessions. Claude Code is the dashboard now — a
-    // worktree and whether something is running in it are one question, and
-    // which half you got used to depend on which of two commands you typed.
     if (target == .claude) {
-        // stdout belongs to the payload in machine mode, same as `start --json`.
         var machine = app;
         machine.ui.divert = watch_opts.json;
         return watch_cmd.run(machine, watch_opts);
     }
 
-    // Session flags mean nothing to an editor, and silently ignoring one is how
-    // `lcc open xcode --stop-all` becomes a bug report about sessions that did
-    // not stop.
     if (watch_opts.json or watch_opts.stop_all or watch_opts.force) return error.UnknownOption;
 
     const cfg = try config.load(app.gpa, app.io, app.environ);
@@ -406,7 +386,6 @@ fn listCommand(app: app_mod.App, args: []const []const u8) !void {
         } else if (eq(arg, "--refresh")) {
             network = .refresh;
         } else if (eq(arg, "--cached")) {
-            // The way back from a stored `listNetwork` of local or refresh.
             network = .cached;
         } else if (eq(arg, "--no-tokens")) {
             tokens = false;
@@ -433,7 +412,6 @@ fn statsCommand(app: app_mod.App, args: []const []const u8) !void {
         } else return error.UnknownOption;
     }
 
-    // stdout belongs to the payload in machine mode, same as `start --json`.
     var machine = app;
     machine.ui.divert = opts.json;
     return stats_cmd.run(machine, opts);
@@ -501,8 +479,6 @@ fn configCommand(app: app_mod.App, args: []const []const u8) !void {
         } else if (opts.key == null) {
             opts.key = arg;
         } else if (opts.value == null) {
-            // Everything after the setting is its value, whitespace and all —
-            // `startTaskCommand` is a sentence, not a token.
             opts.value = arg;
         } else return error.TooManyArguments;
     }
@@ -526,9 +502,6 @@ fn watchHookCommand(app: app_mod.App, args: []const []const u8) !void {
             opts.event = args[i];
         } else return error.UnknownOption;
     }
-    // Never fails. A Claude Code hook runs on every turn of every watched
-    // session, and one that could report an error would be one that could
-    // disturb the work it exists only to observe.
     watch_cmd.hook(app, opts) catch {};
 }
 
@@ -549,12 +522,6 @@ fn daemonCommand(app: app_mod.App, args: []const []const u8) !void {
     return daemon_cmd.run(machine, opts);
 }
 
-/// A flag that may not have been given, resolved against what the file says.
-///
-/// Defaults live here rather than inside each command because this is the only
-/// layer that can tell "not passed" from "passed false" — an `Opts` field is a
-/// plain bool by the time a command sees it, which is what keeps the commands
-/// and their many helpers free of tri-state.
 fn orConfig(flag: ?bool, configured: bool) bool {
     return flag orelse configured;
 }
@@ -564,27 +531,12 @@ fn eq(a: []const u8, b: []const u8) bool {
 }
 
 test "the help text offers no daemon and no watch command" {
-    // The help text is the whole surface a new user reads, so it is the one
-    // place the vocabulary can regress without anyone noticing. Both words are
-    // banned for a reason:
-    //
-    // `daemon` — a process they neither started nor can act on. Every fact they
-    // need about it is a fact about their sessions, and is phrased that way.
-    // `lcc daemon` still dispatches; it is just not advertised.
-    //
-    // `watch` — the command is gone, absorbed by `lcc open`. A line here
-    // pointing at it would send someone to `error.UnknownCommand`.
     try std.testing.expect(std.mem.indexOf(u8, usage, "daemon") == null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "lcc watch") == null);
-    // Not `"watch"` outright: `--watch` and `--no-watch` are still how a session
-    // is put in the background or kept out of it, and `watchByDefault` is the
-    // setting behind them.
     try std.testing.expect(std.mem.indexOf(u8, usage, "  watch ") == null);
 }
 
 test {
-    // Zig only collects tests from files the root references during test
-    // analysis, so name every module here or `zig build test` runs nothing.
     _ = @import("ansi.zig");
     _ = @import("app.zig");
     _ = @import("claude.zig");

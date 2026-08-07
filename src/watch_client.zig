@@ -1,11 +1,3 @@
-//! The client half: find the daemon, start one when there is none, and speak
-//! the protocol.
-//!
-//! The client never touches the daemon's lock. Its only probe is `connect`,
-//! with a short backoff, and a wasted daemon spawn costs a few milliseconds.
-//! Probing the lock instead would introduce two races — a client holding it
-//! while a daemon starts, and the handoff between them — to save nothing.
-
 const std = @import("std");
 const Io = std.Io;
 const app_mod = @import("app.zig");
@@ -15,16 +7,11 @@ const watch_paths = @import("watch_paths.zig");
 const wire = @import("wire.zig");
 
 pub const Error = error{
-    /// Nothing is listening, and starting one did not help.
     DaemonUnreachable,
-    /// Nothing is listening and we were told not to start one.
     NotRunning,
     ProtocolMismatch,
     Refused,
     BadResponse,
-    // A daemon that framed something wrong is not a case any caller can act on
-    // differently from a daemon that answered nothing, but the distinction is
-    // worth keeping in the message rather than collapsing at the boundary.
 } || wire.Error || watch_paths.Error || std.mem.Allocator.Error;
 
 pub const Conn = struct {
@@ -52,8 +39,6 @@ pub const Conn = struct {
         try self.send(gpa, t, body);
     }
 
-    /// Blocking. Only ever used on the one-shot request/response paths — the
-    /// interactive loops poll and decode for themselves.
     pub fn recv(self: *Conn) !wire.Frame {
         while (true) {
             if (try self.dec.next()) |frame| return frame;
@@ -83,31 +68,11 @@ fn writeAll(fd: std.posix.fd_t, bytes: []const u8) !void {
     }
 }
 
-/// Connect to a daemon that is already running, or null.
-///
-/// Asked before connecting rather than after failing: std's
-/// `UnixAddress.ConnectError` has no `ConnectionRefused`, so a stale socket
-/// falls through to `error.Unexpected`, which prints a stack trace in a debug
-/// build. `prompt.zig` documents the same shape for `tcgetattr` on a pipe —
-/// ask first, do not make std report it.
 pub fn connectExisting(app: app_mod.App, role: wire.Role) Error!?Conn {
     return connectAt(app, role, try watch_paths.socket(app.gpa, app.environ));
 }
 
-/// The same, against a socket the caller names rather than one derived from the
-/// environment.
-///
-/// Exists for the hook handler, which is told its socket on the command line.
-/// That path is the daemon's own, resolved when the daemon started, and it is
-/// the only thing a hook can trust: a hook runs with the *session's*
-/// environment, which is the environment of whichever shell started the
-/// session, and an `LCC_WATCH_DIR` in there would point the report at a daemon
-/// that does not exist. Same reasoning as the absolute `exe` beside it in
-/// `watch_hooks.settingsJson`.
 pub fn connectAt(app: app_mod.App, role: wire.Role, socket_path: []const u8) Error!?Conn {
-    // std will not do this, and the path came off a command line rather than
-    // out of `watch_paths.socket` — so this is the last place it can be an
-    // error instead of a write past `sockaddr_un.path`.
     try watch_paths.checkSocketPath(socket_path);
     const info = Io.Dir.cwd().statFile(app.io, socket_path, .{}) catch return null;
     _ = info;
@@ -134,10 +99,6 @@ pub fn connectAt(app: app_mod.App, role: wire.Role, socket_path: []const u8) Err
     return conn;
 }
 
-/// Connect, starting a daemon if nothing answers.
-///
-/// Several `lcc start --watch` invocations may each spawn one; the lock inside
-/// the daemon means all but one exit immediately.
 pub fn connect(app: app_mod.App, role: wire.Role) Error!Conn {
     if (try connectExisting(app, role)) |conn| return conn;
 
@@ -148,9 +109,6 @@ pub fn connect(app: app_mod.App, role: wire.Role) Error!Conn {
     }
     exec.detached(app.io, &.{ exe, "daemon" }, log_path) catch return Error.DaemonUnreachable;
 
-    // 50, 100, 200, 400, 800 ms. A daemon that has not answered by then is not
-    // starting, and looping silently would hide a lock held by a daemon whose
-    // socket someone deleted.
     var delay_ms: u64 = 50;
     for (0..5) |_| {
         std.Io.Timestamp.now(app.io, .awake).addDuration(.fromMilliseconds(@intCast(delay_ms)))
@@ -178,8 +136,6 @@ pub const Handoff = struct {
     size: struct { rows: u16, cols: u16 } = .{ .rows = 40, .cols = 120 },
 };
 
-/// The whole `--watch` branch of `lcc start`, so `start.zig` gains one import
-/// and one `if`.
 pub fn startSession(app: app_mod.App, handoff: Handoff) Error!Started {
     var conn = try connect(app, .control);
     defer conn.close(app.io);
@@ -191,9 +147,6 @@ pub fn startSession(app: app_mod.App, handoff: Handoff) Error!Started {
         .repo_root = handoff.repo_root,
         .program = handoff.program,
         .argv = handoff.argv,
-        // The client's environment, never the daemon's: a daemon started days
-        // ago by another shell would otherwise hand this session that shell's
-        // PATH and every variable Claude Code reads.
         .env = try environSlice(app),
         .cols = handoff.size.cols,
         .rows = handoff.size.rows,
@@ -215,10 +168,6 @@ pub fn startSession(app: app_mod.App, handoff: Handoff) Error!Started {
     };
 }
 
-/// A snapshot from the daemon, or null when none is running.
-///
-/// Null rather than an error: no daemon is a legitimate answer — it means no
-/// sessions — and every caller has to render that anyway.
 pub fn snapshot(app: app_mod.App) Error!?[]const sessions_mod.Session {
     var conn = (try connectExisting(app, .control)) orelse return null;
     defer conn.close(app.io);
@@ -230,15 +179,6 @@ pub fn snapshot(app: app_mod.App) Error!?[]const sessions_mod.Session {
     return body.sessions;
 }
 
-/// The hook path: one connect, one frame, exit.
-///
-/// Never starts a daemon. A hook fires on every turn of every session lcc
-/// launched, and one that could spawn a process would turn a stopped daemon
-/// into a spawn storm.
-///
-/// `socket` is the path the daemon baked into the hook's command line. Null
-/// falls back to the environment, which is what a hand-run `lcc watch-hook`
-/// with no `--socket` gets.
 pub fn report(
     app: app_mod.App,
     socket: ?[]const u8,
