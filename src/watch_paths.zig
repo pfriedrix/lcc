@@ -41,6 +41,26 @@ pub fn hooksFor(
     return std.fs.path.join(gpa, &.{ base, name });
 }
 
+pub const state_prefix = "state-";
+pub const state_suffix = ".json";
+
+pub fn stateFor(
+    gpa: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    claude_session_id: []const u8,
+) ![]const u8 {
+    const base = try dir(gpa, environ);
+    const name = try std.fmt.allocPrint(gpa, state_prefix ++ "{s}" ++ state_suffix, .{claude_session_id});
+    return std.fs.path.join(gpa, &.{ base, name });
+}
+
+pub fn stateName(name: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, name, state_prefix)) return null;
+    if (!std.mem.endsWith(u8, name, state_suffix)) return null;
+    const id = name[state_prefix.len .. name.len - state_suffix.len];
+    return if (id.len == 0) null else id;
+}
+
 pub fn logFile(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
     if (environ.get("LCC_WATCH_DIR")) |raw| {
         const override = std.mem.trim(u8, raw, " \t");
@@ -91,6 +111,43 @@ test "each session gets a settings file of its own, named for it" {
         try hooksFor(arena, &environ, "s-00000001"),
         try hooksFor(arena, &environ, "s-00000002"),
     ));
+}
+
+test "a session's recovered state is filed under Claude Code's id, not the one lcc reissues" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("LCC_WATCH_DIR", "/tmp/lcc-test");
+
+    const uuid = "529ae132-1fc2-4cbd-a909-585f29f46f62";
+    try std.testing.expectEqualStrings(
+        "/tmp/lcc-test/state-" ++ uuid ++ ".json",
+        try stateFor(arena, &environ, uuid),
+    );
+
+    const first = try stateFor(arena, &environ, "s-00000001");
+    const hooks = try hooksFor(arena, &environ, "s-00000001");
+    if (std.mem.eql(u8, first, hooks)) {
+        std.debug.print(
+            "the state file and the hook settings collide on one name: writing a status " ++
+                "report would overwrite the settings the session was launched with.\n",
+            .{},
+        );
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "a state file names the session it came from, and nothing else in the directory does" {
+    try std.testing.expectEqualStrings("abc-123", stateName("state-abc-123.json").?);
+
+    try std.testing.expect(stateName("state-.json") == null);
+    try std.testing.expect(stateName("hooks-s-00000001.json") == null);
+    try std.testing.expect(stateName("sessions.json") == null);
+    try std.testing.expect(stateName("daemon.sock") == null);
+    try std.testing.expect(stateName("state-abc-123.json.tmp") == null);
 }
 
 test "an empty override is not an override" {
