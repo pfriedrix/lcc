@@ -18,7 +18,7 @@ pub const Row = struct {
     pub fn attachable(self: Row) bool {
         if (self.session_id == null) return false;
         return switch (self.status orelse return false) {
-            .starting, .active, .plan, .waiting, .idle, .orphan => true,
+            .starting, .active, .plan, .waiting, .idle => true,
             .exited, .unknown => false,
         };
     }
@@ -32,7 +32,6 @@ fn glyph(status: ?sessions.Status) []const u8 {
         .idle => "○",
         .starting => "◌",
         .exited => "✗",
-        .orphan => "⚠",
         .unknown => "?",
     };
 }
@@ -42,7 +41,6 @@ fn paint(status: ?sessions.Status, palette: ui.Palette) []const u8 {
         .waiting => palette.yellow,
         .active => palette.green,
         .plan => palette.cyan,
-        .orphan => palette.yellow,
         .exited => palette.red,
         .idle, .starting, .unknown => palette.dim,
     };
@@ -357,8 +355,6 @@ test "a row is attachable only when something is actually behind it" {
     try testing.expect(!row.attachable());
     row.status = .exited;
     try testing.expect(!row.attachable());
-    row.status = .orphan;
-    try testing.expect(row.attachable());
 
     row.status = .plan;
     try testing.expect(row.attachable());

@@ -33,7 +33,7 @@ pub fn present(current: Status, plan: bool) Status {
     if (!plan) return current;
     return switch (current) {
         .active, .idle => .plan,
-        .starting, .waiting, .exited, .orphan, .unknown, .plan => current,
+        .starting, .waiting, .exited, .unknown, .plan => current,
     };
 }
 
@@ -85,7 +85,6 @@ test "every hook event maps to a status a session can actually be in" {
     for ([_]Event{ .waiting, .active, .idle, .ended }) |event| {
         const status = apply(.starting, event);
         try testing.expect(status != .unknown);
-        try testing.expect(status != .orphan);
         try testing.expect(status != .plan);
     }
 }
@@ -97,13 +96,12 @@ test "plan mode replaces working, and never replaces being blocked" {
     try testing.expectEqual(Status.waiting, present(.waiting, true));
 
     try testing.expectEqual(Status.exited, present(.exited, true));
-    try testing.expectEqual(Status.orphan, present(.orphan, true));
     try testing.expectEqual(Status.unknown, present(.unknown, true));
     try testing.expectEqual(Status.starting, present(.starting, true));
 }
 
 test "without plan mode, present changes nothing at all" {
-    for ([_]Status{ .starting, .active, .waiting, .idle, .plan, .exited, .orphan, .unknown }) |status| {
+    for ([_]Status{ .starting, .active, .waiting, .idle, .plan, .exited, .unknown }) |status| {
         try testing.expectEqual(status, present(status, false));
     }
 }

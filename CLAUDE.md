@@ -12,7 +12,7 @@ library plus CoreFoundation/Security.
 Run from the repo root:
 
 ```bash
-zig build test --summary all       # unit tests (~3s, 289 at last count)
+zig build test --summary all       # unit tests (~3s, 293 at last count)
 zig build                          # debug binary → zig-out/bin/lcc
 zig build -Doptimize=ReleaseFast   # what PATH should be serving
 zig build run -- list              # run without installing
@@ -133,6 +133,21 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   improvement and turns every recovered row into an `unknown_session` error. The ids collide
   across daemons anyway — `next_id` restarts at 1 — which is also why the state file is named
   for Claude Code's session UUID rather than for either the lcc id or the worktree path.
+- **A dashboard row has to name a directory that still exists.** `sessions.visible` is that
+  rule, and *both* ways the rows are read have to go through it — the live snapshot in
+  `collect` / `snapshotOnce` and `sessions.resolved` — because the daemon never drops a
+  session from its own list and flushes that whole list once more as it exits, so its file
+  outlives it naming every worktree it ever ran in. `collect` puts the same predicate on
+  `app.worktreeChoices`, not inside it: git keeps listing a worktree whose directory was
+  deleted (`prunable`), and that is exactly the row `lcc list` shows in red and `lcc remove`
+  needs in order to clean the entry up.
+- **A registry row reading `unknown` is bookkeeping, not a session.** `collect` collapses it to
+  `null` through `liveMatch` before `rowFor` ever sees it. Leave it a match and the worktree's
+  hook-recovered status is never consulted — which after a daemon dies is every worktree it
+  touched, so `watch_state` recovers nothing and the column reads `unknown` with an age
+  measured from the epoch. Passing `rowFor` the recovered status *and* the dead session id
+  instead is worse than either: `attachable` goes true and enter asks the daemon for a session
+  nothing holds.
 - **A session's hook settings file is per session, not per daemon.** `watch_paths.hooksFor`
   names it `hooks-<session id>.json` and `watch_hooks.settingsJson` bakes that id into every
   hook command line, so a report says which session it came from. Collapsing them back into

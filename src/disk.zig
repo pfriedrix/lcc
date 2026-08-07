@@ -38,6 +38,12 @@ pub fn realPath(gpa: std.mem.Allocator, io: Io, target: []const u8) []const u8 {
     return Io.Dir.cwd().realPathFileAlloc(io, target, gpa) catch target;
 }
 
+pub fn isDirectory(io: Io, path: []const u8) bool {
+    if (path.len == 0) return false;
+    const info = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return info.kind == .directory;
+}
+
 pub fn removeChild(io: Io, parent: []const u8, path: []const u8) !void {
     const dirname = std.fs.path.dirname(path) orelse return error.RefusingToDelete;
     const trimmed = std.mem.trimEnd(u8, parent, "/");
@@ -52,6 +58,38 @@ pub fn abbreviate(gpa: std.mem.Allocator, environ: *const std.process.Environ.Ma
     if (path.len == home.len) return "~";
     if (path[home.len] != '/') return path;
     return std.fmt.allocPrint(gpa, "~{s}", .{path[home.len..]}) catch path;
+}
+
+test "a worktree is a directory that is there, not a name that used to be one" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    try std.testing.expect(isDirectory(io, base));
+
+    const gone = try std.fs.path.join(arena, &.{ base, "removed" });
+    try std.testing.expect(!isDirectory(io, gone));
+
+    const file = try std.fs.path.join(arena, &.{ base, "a-file" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = "" });
+    if (isDirectory(io, file)) {
+        std.debug.print(
+            "a plain file answered yes: a session whose worktree was replaced by a file of the " ++
+                "same name keeps its row, and enter on it starts an agent in a directory that " ++
+                "does not exist.\n",
+            .{},
+        );
+        return error.TestUnexpectedResult;
+    }
+
+    try std.testing.expect(!isDirectory(io, ""));
 }
 
 test "isInside distinguishes containment from a shared prefix" {

@@ -14,7 +14,6 @@ pub const Status = enum {
     idle,
     plan,
     exited,
-    orphan,
     unknown,
 
     pub fn label(self: Status) []const u8 {
@@ -128,37 +127,31 @@ pub fn daemonOutdated(state: State, binary_modified: ?i64) bool {
     return built > daemon.started_at;
 }
 
+pub fn visible(io: Io, session: Session, daemon_alive: bool) ?Status {
+    if (!disk.isDirectory(io, session.worktree)) return null;
+    return if (daemon_alive) session.parsedStatus() else .unknown;
+}
+
 pub fn resolved(
     gpa: std.mem.Allocator,
     io: Io,
     state: State,
     now: i64,
 ) ![]const Resolved {
-    const out = try gpa.alloc(Resolved, state.sessions.len);
     const daemon_alive = alive(state);
     const wrote_at = if (state.daemon) |d| d.wrote_at else 0;
     const age = @max(0, now - wrote_at);
 
-    for (state.sessions, 0..) |session, i| {
-        var status = session.parsedStatus();
-        if (!daemon_alive) {
-            status = .unknown;
-        } else if (status != .exited and !worktreeExists(io, session.worktree)) {
-            status = .orphan;
-        }
-        out[i] = .{
+    var out: std.ArrayList(Resolved) = .empty;
+    for (state.sessions) |session| {
+        const status = visible(io, session, daemon_alive) orelse continue;
+        try out.append(gpa, .{
             .session = session,
             .status = status,
             .stale = daemon_alive and age > stale_after_seconds,
-        };
+        });
     }
-    return out;
-}
-
-fn worktreeExists(io: Io, worktree: []const u8) bool {
-    if (worktree.len == 0) return false;
-    const info = Io.Dir.cwd().statFile(io, worktree, .{}) catch return false;
-    return info.kind == .directory;
+    return out.toOwnedSlice(gpa);
 }
 
 pub fn owning(gpa: std.mem.Allocator, state: State, target: []const u8) ?Session {
@@ -319,7 +312,7 @@ test "nothing is out of date when there is no daemon to be out of date" {
     try testing.expect(!daemonOutdated(.{ .daemon = .{ .pid = pid, .started_at = 0 } }, 5_000));
 }
 
-test "a worktree that is gone reads as orphan, and the row stays" {
+test "a session whose worktree was deleted stops being a row at all" {
     const gpa = testing.allocator;
     const io = testing.io;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -329,22 +322,62 @@ test "a worktree that is gone reads as orphan, and the row stays" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const removed = try std.fs.path.join(arena, &.{ base, "removed" });
 
     const state: State = .{
         .daemon = .{ .pid = 1, .wrote_at = 1000 },
         .sessions = &.{
             .{ .id = "s-here", .worktree = base, .status = "active" },
-            .{ .id = "s-gone", .worktree = try std.fs.path.join(arena, &.{ base, "removed" }), .status = "active" },
-            .{ .id = "s-done", .worktree = try std.fs.path.join(arena, &.{ base, "removed" }), .status = "exited" },
-            .{ .id = "s-plan", .worktree = try std.fs.path.join(arena, &.{ base, "removed" }), .status = "plan" },
+            .{ .id = "s-gone", .worktree = removed, .status = "active" },
+            .{ .id = "s-done", .worktree = removed, .status = "exited" },
+            .{ .id = "s-plan", .worktree = removed, .status = "plan" },
         },
     };
 
     const rows = try resolved(arena, io, state, 1001);
+    if (rows.len != 1) {
+        std.debug.print(
+            "{d} rows came back for one surviving worktree: every worktree ever removed keeps a " ++
+                "line on the dashboard, so the list stops being what is on disk and starts being " ++
+                "everything a daemon once ran.\n",
+            .{rows.len},
+        );
+        return error.TestExpectedEqual;
+    }
+    try testing.expectEqualStrings("s-here", rows[0].session.id);
     try testing.expectEqual(Status.active, rows[0].status);
-    try testing.expectEqual(Status.orphan, rows[1].status);
-    try testing.expectEqual(Status.exited, rows[2].status);
-    try testing.expectEqual(Status.orphan, rows[3].status);
+}
+
+test "a deleted worktree is gone from the list whether or not a daemon is still there" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const removed = try std.fs.path.join(arena, &.{ base, "removed" });
+
+    const dead: State = .{
+        .daemon = .{ .pid = 0x7fff_fffe, .wrote_at = 1000 },
+        .sessions = &.{
+            .{ .id = "s-gone", .worktree = removed, .status = "waiting" },
+            .{ .id = "s-here", .worktree = base, .status = "waiting" },
+        },
+    };
+    try testing.expect(!alive(dead));
+
+    const rows = try resolved(arena, io, dead, 1001);
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("s-here", rows[0].session.id);
+    try testing.expectEqual(Status.unknown, rows[0].status);
+
+    try testing.expect(visible(io, .{ .worktree = removed, .status = "waiting" }, true) == null);
+    try testing.expect(visible(io, .{ .worktree = removed, .status = "waiting" }, false) == null);
+    try testing.expect(visible(io, .{ .worktree = "", .status = "waiting" }, true) == null);
+    try testing.expectEqual(Status.waiting, visible(io, .{ .worktree = base, .status = "waiting" }, true).?);
 }
 
 test "plan round-trips as text, like every other status" {
