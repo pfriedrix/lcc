@@ -12,7 +12,7 @@ library plus CoreFoundation/Security.
 Run from the repo root:
 
 ```bash
-zig build test --summary all       # unit tests (~3s, 289 at last count)
+zig build test --summary all       # unit tests (~3s, 292 at last count)
 zig build                          # debug binary → zig-out/bin/lcc
 zig build -Doptimize=ReleaseFast   # what PATH should be serving
 zig build run -- list              # run without installing
@@ -110,7 +110,16 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
 - **Interactive commands need a tty.** `src/prompt.zig` puts the terminal in raw mode and
   returns `Error.NotATerminal` otherwise, so any path that reaches a picker fails when run
   from a tool call. Exercise the non-interactive paths instead: `lcc start PE-N --json`,
-  `lcc issue show PE-N --json`, `lcc list --local`, `--yes` on the destructive ones.
+  `lcc issue show PE-N --json`, `lcc list --local`, `--yes` on the destructive ones. A
+  picker's *rows* are still reachable: they are built by pure functions over a row struct
+  (`cellsFor` / `rowLine` / `headerLine` in `src/commands/remove.zig`), which is where a
+  layout is tested and where a throwaway `std.debug.print` can show you a frame.
+- **Every line a picker prints has to be paid for in `pageSize`.** `prompt.checkbox` and
+  `prompt.search` erase their frame by walking the cursor up `screen.lines`, so a frame taller
+  than the terminal scrolls and every later redraw eats a line of scrollback instead. The
+  `reserved` argument to `pageSize` is what keeps the two in step — `checkbox` passes 5 when
+  it has a column header and 4 when it does not. Add a line to a frame without raising it and
+  the list looks fine until the terminal is short.
 - **Keychain and code signing are coupled.** The Linear token's ACL is keyed on the binary's
   code signature, so `build.zig` signs the installed binary to keep one "Always Allow"
   valid across rebuilds. Removing or bypassing that (`-Dsign=none`) brings back a login

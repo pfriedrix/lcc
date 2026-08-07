@@ -512,9 +512,31 @@ Uses the same worktree picker, then launches Xcode instead of Claude. It looks f
 
 ## Branch cleanup
 
-`lcc remove` opens one checkbox list of every non-main worktree. Select any number with Space and press Enter; lcc inspects the whole selection, shows one combined confirmation, then removes it in one run. Nothing starts checked, so pressing Enter on an untouched list is a no-op. `-y` skips the combined confirmation but still lets you choose the worktrees. A failure or an unsaved Xcode document keeps that worktree without stopping the rest of the selection.
+`lcc remove` opens one checkbox list of every non-main worktree. Select any number with Space and press Enter; lcc shows one combined confirmation, then removes the lot in one run. Nothing starts checked, so pressing Enter on an untouched list is a no-op. `-y` skips the combined confirmation but still lets you choose the worktrees. A failure or an unsaved Xcode document keeps that worktree without stopping the rest of the selection.
 
-It deletes each selected branch along with its worktree — but only when the commits survive somewhere else. Three things count as safe:
+Every worktree is inspected *before* the list is drawn, not after you have picked, because which ones you want gone is the question the list is there to answer:
+
+```
+$ lcc remove
+? Select worktrees to remove (space toggles, enter confirms):
+    BRANCH                    MERGE        STATUS   AGE  FREES   SPENT  PATH
+❯ ◯ feature/pe-101-shipped    merged #412  clean    3d   1.1 GB  53M    ~/…/worktrees/pe-101-shipped  lcc
+  ◯ feature/pe-256-app-hangs  3 unmerged   2 dirty  2h   839 MB  18M    ~/…/worktrees/pe-256-app-hangs  lcc  — open in Xcode
+  ◯ 9f2c11ab (detached)       —            clean    —    —       —      ~/…/spike  prunable
+  0/3 selected · space toggles · enter confirms · esc cancel
+```
+
+- **MERGE** — the verdict below: `merged`, `merged #412`, `remote gone`, or the number of commits that only exist here. `--keep-branch` leaves the branch alone, so the column is `—`.
+- **STATUS** — uncommitted changes in the worktree, in `lcc list`'s words: `clean`, `2 dirty`, or `missing` when the directory is no longer there to ask.
+- **AGE** — how long ago the branch was last committed to.
+- **FREES** — disk the removal hands back: Xcode build data, plus the session transcripts when `--sessions` says they go too.
+- **SPENT** — what Claude Code has spent in that worktree, same number `lcc stats` reports.
+
+The path is followed by the same flags `lcc list` prints (`locked`, `prunable`, `lcc`) and by `— open in Xcode` / `— unsaved in Xcode`. That last one is the reason the inspection happens up front: a worktree with unsaved editor work is held back after you tick it, and it is better to know before.
+
+The confirmation that follows spells the same facts out per worktree, one line each, and adds `changes    2 uncommitted  (lost if the removal is forced)` for anything the `STATUS` column called dirty — git refuses to remove such a worktree, and the answer to that refusal is a prompt offering `--force`.
+
+`lcc remove` deletes each selected branch along with its worktree — but only when the commits survive somewhere else. Three things count as safe:
 
 - The branch is an ancestor of the default branch (an ordinary merge).
 - The branch was pushed and its upstream is now `[gone]` — what a squash-merged PR looks like locally, where ancestry can never prove the commits survived.
@@ -533,15 +555,16 @@ The delete itself goes through `git branch -d` for a plain merge, so git gets to
 ```
 $ lcc remove --merged
 ? Select what to remove (space toggles, enter confirms):
-❯ ◉ feature/pe-101-shipped  merged       2.4 GB   53M      ~/…/.lcc/worktrees/pe-101-shipped
-  ◉ feature/pe-102-squashed merged #412  1.1 GB   18M      ~/…/.lcc/worktrees/pe-102-squashed
-  ◉ feature/pe-103-squashed remote gone  —        —        branch only — no worktree left
+    BRANCH                     MERGE        STATUS  AGE  FREES   SPENT  PATH
+❯ ◉ feature/pe-101-shipped     merged       clean   3d   2.4 GB  53M    ~/…/worktrees/pe-101-shipped  lcc
+  ◉ feature/pe-102-squashed    merged #412  clean   5d   1.1 GB  18M    ~/…/worktrees/pe-102-squashed  lcc
+  ◉ feature/pe-103-squashed    remote gone  —       2w   —       —      branch only — no worktree left
   3/3 selected · space toggles · enter confirms · esc cancel
 ```
 
-The reason column says which of the three vouched for the row, so a branch deleted on GitHub's word names the pull request that gave it.
+The columns are the ones above. `MERGE` says which of the three vouched for the row, so a branch deleted on GitHub's word names the pull request that gave it, and a branch that outlived its worktree has nothing to report under `STATUS`.
 
-A branch checked out anywhere — including the main worktree — is never offered, and a worktree with uncommitted changes is reported and skipped rather than forced. A merged pull request whose branch has since been reopened is not a merge: an open PR shadows the old one, and the branch is left alone. A row Xcode still has open is marked `— open in Xcode`, and one with unsaved work in it `— unsaved in Xcode`; ticking that one holds it back rather than removing it. `-y` takes everything without asking; `--force`, `--keep-branch`, `--keep-derived-data` and `--keep-xcode` mean the same as they do for a single removal.
+A branch checked out anywhere — including the main worktree — is never offered, and a worktree with uncommitted changes is reported and skipped rather than forced. A merged pull request whose branch has since been reopened is not a merge: an open PR shadows the old one, and the branch is left alone. Ticking a row with unsaved Xcode work holds it back rather than removing it. `-y` takes everything without asking, and skips the list along with it; `--force`, `--keep-branch`, `--keep-derived-data` and `--keep-xcode` mean the same as they do for a single removal.
 
 ## Xcode build data
 
