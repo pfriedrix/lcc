@@ -1,13 +1,3 @@
-//! `lcc stats` — what every worktree in this repo has spent on Claude Code.
-//!
-//! One row per worktree, drawn from the transcripts whose cwd is that worktree.
-//! `--models` breaks each row down by the model that did the work, which is the
-//! dimension that explains a bill: the context tokens dominate the total, and
-//! they are priced per model.
-//!
-//! Worktrees with no transcripts are still listed. "This one has cost nothing
-//! yet" is an answer, and a row that silently vanished would look like a bug.
-
 const std = @import("std");
 const Io = std.Io;
 const app_mod = @import("../app.zig");
@@ -16,25 +6,17 @@ const ui = @import("../ui.zig");
 const usage = @import("../usage.zig");
 
 pub const Opts = struct {
-    /// Break every worktree down by model.
     models: bool = false,
-    /// Print the numbers as JSON instead of a table.
     json: bool = false,
 };
 
 const Row = struct {
-    /// Branch name, or the short head when detached.
     label: []const u8,
-    /// `main`, `lcc`, or nothing — where this worktree came from. Rendered under
-    /// the ORIGIN column, which is only drawn when some row has one to show.
     tag: []const u8,
     path: []const u8,
     totals: usage.Totals,
 };
 
-/// Whether the ORIGIN column is worth a header and its padding. A repo whose
-/// worktrees were all made by hand outside the managed prefix has nothing to put
-/// there, and an empty column would only cost every row a trailing space.
 fn anyTagged(rows: []const Row) bool {
     for (rows) |row| {
         if (row.tag.len > 0) return true;
@@ -47,9 +29,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     const entries = try repo.listWorktrees();
     const prefix = try app_mod.managedPrefix(app, repo);
 
-    // One pass over `~/.claude/projects` for every worktree, rather than one per
-    // worktree: `list` reads a prefix of a transcript per directory to learn
-    // which cwd it belongs to.
     const cp_root = try cp.root(app.gpa, app.environ);
     const projects = try cp.list(app.gpa, app.io, cp_root);
 
@@ -74,7 +53,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         };
     }
 
-    // Biggest spender first — the reason to run this command is to find it.
     std.mem.sort(Row, rows, {}, struct {
         fn lessThan(_: void, a: Row, b: Row) bool {
             return a.totals.counts.tokens() > b.totals.counts.tokens();
@@ -102,10 +80,6 @@ const Widths = struct {
     last: usize,
 };
 
-/// Column widths sized to the widest cell, header included. Model rows are
-/// measured too — they are indented under the label column, so a long model
-/// name can be what sets its width. `cells.models` is empty unless `--models`
-/// asked for the breakdown, so there is nothing to gate on here.
 fn measure(rows: []const Row, cells: []const Cells) Widths {
     var w: Widths = .{
         .label = "WORKTREE".len,
@@ -139,8 +113,6 @@ fn measure(rows: []const Row, cells: []const Cells) Widths {
 
 const model_indent = 2;
 
-/// A row's numbers as text. Formatted once, then measured and printed, so the
-/// widths and the cells can never disagree.
 const Cells = struct {
     sessions: []const u8,
     messages: []const u8,
@@ -210,8 +182,6 @@ fn format(app: app_mod.App, row: Row, opts: Opts, now: i64) !Cells {
     return cells;
 }
 
-/// A total that is missing an unpriced model's share is marked, not rounded off
-/// silently.
 fn formatCost(gpa: std.mem.Allocator, totals: usage.Totals) ![]const u8 {
     if (totals.unpriced) {
         return std.fmt.allocPrint(gpa, "{d:.2}+", .{totals.counts.cost_usd});
@@ -236,10 +206,6 @@ fn renderTable(app: app_mod.App, rows: []const Row, opts: Opts) !void {
 
     const w = measure(rows, cells);
 
-    // The rightmost cell of a line is never padded — padding it would leave
-    // trailing spaces on every row, which show up the moment output is piped or
-    // pasted somewhere. Which cell that is depends on whether ORIGIN is drawn,
-    // both in the header and in every row below it.
     const origin = anyTagged(rows);
     app.ui.hint("{f}  {f}  {f}  {f}  {f}  {f}  {f}  {f}{s}", .{
         ui.pad("WORKTREE", w.label),
@@ -347,8 +313,6 @@ fn renderJson(app: app_mod.App, rows: []const Row, skipped: usize) !void {
         }
         try out.appendSlice(w, "]}");
     }
-    // The idle gap travels with the numbers it defines: `active_seconds` is
-    // meaningless to a consumer that cannot see where the cut-off was put.
     try out.appendSlice(w, try std.fmt.allocPrint(
         w,
         "],\"skipped_transcripts\":{d},\"idle_gap_seconds\":{d}}}\n",
@@ -357,8 +321,6 @@ fn renderJson(app: app_mod.App, rows: []const Row, skipped: usize) !void {
     app.ui.payload("{s}", .{out.items});
 }
 
-/// `ui.pad` renders lazily, which colour wrapping cannot use — the escape has to
-/// go around text of a known length.
 fn pad(gpa: std.mem.Allocator, text: []const u8, width: usize) ![]const u8 {
     return std.fmt.allocPrint(gpa, "{f}", .{ui.pad(text, width)});
 }
@@ -367,8 +329,6 @@ fn testRow(label: []const u8, totals: usage.Totals) Row {
     return .{ .label = label, .tag = "", .path = "/x", .totals = totals };
 }
 
-/// A table rendered into memory, with colour off so the assertions are about
-/// the layout rather than the escape codes.
 fn renderToString(arena: std.mem.Allocator, rows: []const Row) ![]const u8 {
     const was_colour = ui.colorEnabled();
     ui.setColor(false);
@@ -394,7 +354,6 @@ test "the origin column is headed, and absent when no worktree has one" {
 
     const spent: usage.Totals = .{ .counts = .{ .messages = 4, .output = 900 }, .sessions = 1 };
 
-    // With a tag to show, LAST is padded so ORIGIN lines up under its header.
     const tagged = try renderToString(arena, &.{
         .{ .label = "main", .tag = "main", .path = "/x", .totals = spent },
         .{ .label = "feature/pe-1", .tag = "lcc", .path = "/y", .totals = spent },
@@ -404,8 +363,6 @@ test "the origin column is headed, and absent when no worktree has one" {
     try std.testing.expect(std.mem.endsWith(u8, lines.next().?, "  main"));
     try std.testing.expect(std.mem.endsWith(u8, lines.next().?, "  lcc"));
 
-    // With nothing to show, the column is gone entirely — header included, and
-    // no row picks up a trailing space where it used to be.
     const untagged = try renderToString(arena, &.{testRow("feature/pe-1", spent)});
     var plain = std.mem.splitScalar(u8, untagged, '\n');
     try std.testing.expect(std.mem.endsWith(u8, plain.next().?, "LAST"));
@@ -432,11 +389,8 @@ test "the active column reports time worked, between ~USD and LAST" {
     const last_at = std.mem.indexOf(u8, header, "LAST").?;
     try std.testing.expect(cost_at < active_at and active_at < last_at);
 
-    // Four minutes then six, no break between them.
     try std.testing.expect(std.mem.indexOf(u8, lines.next().?, "10m") != null);
 
-    // A worktree nobody has opened has no time worked, and says so with the
-    // same dash as every other column rather than a misleading 0m.
     const untouched = try renderToString(arena, &.{testRow("feature/pe-2", .{})});
     var idle = std.mem.splitScalar(u8, untouched, '\n');
     _ = idle.next();
@@ -466,11 +420,9 @@ test "measure sizes every column to its widest cell, header included" {
     try std.testing.expectEqual(@as(usize, "feature/pe-256-app-hangs-on-launch".len), w.label);
     try std.testing.expectEqual(@as(usize, "1165".len), w.messages);
     try std.testing.expectEqual(@as(usize, "169.84".len), w.cost);
-    // Headers are the floor: both of these are wider than the cell under them.
     try std.testing.expectEqual(@as(usize, "SESS".len), w.sessions);
     try std.testing.expectEqual(@as(usize, "CONTEXT".len), w.input);
 
-    // A cell wider than its header pushes the column out.
     var wide = cells;
     wide[0].input = "1238.8M";
     const grown = measure(&rows, &wide);

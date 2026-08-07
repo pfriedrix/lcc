@@ -19,43 +19,18 @@ const watch_cmd = @import("watch.zig");
 const priority_label = [_][]const u8{ "   ", "U  ", "H  ", "M  ", "L  " };
 
 pub const Opts = struct {
-    /// Show every assigned issue in the picker, not just `activeStates`.
     all: bool = false,
-    /// `PE-256` — resolve that issue directly and skip the picker.
     issue: ?[]const u8 = null,
     json: bool = false,
-    /// Base for a branch that does not exist yet. Interactive mode asks when it
-    /// cannot tell; `--json` has nobody to ask, so it takes this or the default branch.
     base: ?[]const u8 = null,
-    /// The repository the issue's code lives in, when neither what lcc remembers nor
-    /// where the work already is can answer that — see `resolveRepo`.
     repo: ?[]const u8 = null,
-    /// A plan the agent should start from, reachable through `{plan}` in
-    /// `startTaskCommand`. Only the path travels — see `expandCommand`.
     plan: ?[]const u8 = null,
-    /// Open in Claude Code's plan mode. A `--plan` file turns it off regardless,
-    /// since the session already has one. Resolved against `planMode` by the
-    /// argv layer.
     plan_mode: bool = true,
-    /// Hand the session to the daemon instead of taking over this terminal, so
-    /// it survives the terminal closing. Everything above the launch is
-    /// unchanged — this only replaces the last step.
-    ///
-    /// Resolved against `watchByDefault`, which is on, by the argv layer.
     watch: bool = true,
-    /// With `--watch`, print the session id and return instead of showing the
-    /// dashboard. What a slash command or a script uses.
     no_attach: bool = false,
-    /// Cancelling a picker returns instead of exiting 130.
-    ///
-    /// Set only when this runs *inside* something else — the dashboard's `n`.
-    /// There, changing your mind about which issue to take should put you back
-    /// where you were, not quit lcc out from under the sessions you were
-    /// watching. Standalone, 130 is the conventional answer and stays.
     cancel_returns: bool = false,
 };
 
-/// What a cancelled picker does, which depends on who is asking.
 fn cancel(opts: Opts) error{Cancelled} {
     if (opts.cancel_returns) return error.Cancelled;
     std.process.exit(app_mod.cancelled_exit_code);
@@ -68,15 +43,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     if (opts.json and opts.all) {
         bail(app, opts.json, "usage", "--all only affects the picker, which --json does not use.", .{});
     }
-    // Resolved first, and to an absolute path: the agent is launched with the
-    // worktree as its cwd, so a relative path would be read against the wrong
-    // directory. A plan that is not there costs a lookup to find out here, and a
-    // created worktree to find out later.
-    //
-    // `realPathFileAlloc` resolves any path that exists, directories included, and
-    // an absent file is only one of the ways this fails — so "not found" is a claim
-    // to make once it is true, not a catch-all. Told a plan is missing when it is
-    // sitting there unreadable, you go looking for the wrong thing.
     const plan_path: ?[]const u8 = if (opts.plan) |raw| blk: {
         const resolved = Io.Dir.cwd().realPathFileAlloc(app.io, raw, app.gpa) catch |err| switch (err) {
             error.FileNotFound => bail(app, opts.json, "plan_not_found", "No plan file at {s}.", .{raw}),
@@ -89,11 +55,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         }
         break :blk resolved;
     } else null;
-    // Said before the read, not after: the Keychain grants access to a binary by its
-    // code signature, so a freshly built lcc can block here on a system dialog for
-    // the login password. Announced, that is a wait with a reason; unannounced, it
-    // is a process sitting silently with no output and no child, which is
-    // indistinguishable from a hang in lcc itself.
     app.ui.hint("Reading the Linear token from the Keychain...", .{});
     app.ui.flush();
     if (oauth.getToken(app.gpa) == null) {
@@ -102,17 +63,8 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
 
     const cfg = try config.load(app.gpa, app.io, app.environ);
 
-    // Either the work is planned here or a plan was brought to it. One name, so the
-    // banner and the launch cannot come to different conclusions about which.
     const plan_mode = plan_path == null and opts.plan_mode;
 
-    // `{plan}` is the only thing that carries a plan to the agent, and
-    // `startTaskCommand` is empty by default — so without the placeholder, `--plan`
-    // has one remaining effect: switching plan mode off. That leaves the session
-    // neither planning here nor holding a plan from elsewhere, which is the one
-    // state this design says cannot exist. The template alone answers it, so it is
-    // answered here: a command that refuses must not first cut a branch and a
-    // worktree it then abandons.
     if (plan_path != null and !templateCarriesPlan(cfg.startTaskCommand)) {
         bail(
             app,
@@ -135,14 +87,11 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     const suggested = try git.rewriteBranchName(app.gpa, selected.branch_name, "feature");
     if (!opts.json) app.ui.hint("Selected {s} — branch {s}", .{ selected.identifier, suggested });
 
-    // Which repository, before anything is created in one. Resolved after the issue
-    // is known, because the issue is what the answer is remembered against.
     var repo = try resolveRepo(app, opts, selected.identifier);
     repo.stdout_reserved = opts.json;
 
     const wt = try bootstrap(app, opts, cfg, repo, suggested);
 
-    // Written down only now: an answer is worth keeping once it produced a worktree.
     const learned = try repos.remember(
         app.gpa,
         repos.load(app.gpa, app.io, app.environ),
@@ -151,8 +100,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     );
     repos.save(app.gpa, app.io, app.environ, learned) catch {};
 
-    // The main checkout already *is* the directory those servers are keyed on, so
-    // handing them back would only duplicate what the agent loads by itself.
     const claude_carried = if (wt.is_main_checkout)
         null
     else
@@ -160,8 +107,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     const carried: ?McpFact =
         if (claude_carried) |value| .{ .path = value.path, .names = value.names } else null;
 
-    // Expanded once, above the split: `--json` reports the very string a launch
-    // would send, and cannot drift from it by being built twice.
     const trimmed_command = std.mem.trim(u8, cfg.startTaskCommand, " \t");
     const expanded = if (trimmed_command.len > 0)
         try expandCommand(app.gpa, cfg.startTaskCommand, selected, wt.branch, plan_path)
@@ -183,8 +128,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     app.ui.info("{f} in {f}", .{ ui.bold(launch_label), ui.dim(wt.path) });
     app.ui.hint("Linear: {s}", .{selected.url});
     if (plan_path) |path| app.ui.hint("Plan: {s}", .{path});
-    // Only says anything when this issue has been worked on before — picking up
-    // a task should show what it has already cost.
     const spent = usage.forWorktree(app.gpa, app.io, app.environ, wt.path);
     if (!spent.empty()) {
         app.ui.hint("Spent here: {f}", .{usage.brief(spent, app_mod.nowSeconds(app.io))});
@@ -206,9 +149,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         plan_mode,
     );
 
-    // The only branch `--watch` adds. Everything above — the token, the issue,
-    // the repository, the worktree, the links, the argv — is shared, so the two
-    // launch paths cannot come to different conclusions about what to run.
     if (opts.watch) {
         if (watch_client.startSession(app, .{
             .worktree = wt.path,
@@ -226,16 +166,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
             app.ui.flush();
             return watch_cmd.run(app, .{});
         } else |err| {
-            // Falls through to the foreground launch rather than failing.
-            //
-            // This is the path *every* start takes now, so a daemon that cannot
-            // be reached must not be able to take `lcc start` down with it. Said
-            // out loud, though: a silent fallback would hide a broken daemon
-            // until someone noticed their sessions had stopped surviving.
-            //
-            // The error name is kept and the daemon is not: `{s}` is the part
-            // that tells anyone debugging this what actually went wrong, while
-            // which process failed to answer is not a fact the reader can act on.
             app.ui.warn("Could not start this in the background ({s}) — running in this terminal instead.", .{@errorName(err)});
             app.ui.hint("The session will not survive this terminal closing.", .{});
         }
@@ -245,7 +175,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     std.process.exit(code);
 }
 
-/// The one issue an identifier names.
 fn fetchNamed(
     app: app_mod.App,
     opts: Opts,
@@ -276,8 +205,6 @@ fn fetchNamed(
     return found orelse bail(app, opts.json, "issue_not_found", "No issue {s} in Linear.", .{trimmed});
 }
 
-/// The picker over everything assigned, filtered by `activeStates`. Null when
-/// there was nothing to choose from — the reason is already on screen.
 fn pickFromActive(
     app: app_mod.App,
     opts: Opts,
@@ -337,20 +264,12 @@ fn pickFromActive(
 const MatchedBy = enum { branch, issue };
 
 const Bootstrapped = struct {
-    /// The branch actually checked out there. Not always the one Linear suggests
-    /// today — see `matched_by`.
     branch: []const u8,
     path: []const u8,
-    /// Whether this run made it, or found it already there.
     status: enum { created, existing },
-    /// How an existing worktree was recognised: `branch` for an exact name match,
-    /// `issue` when only the `PE-N` in it matched. Null for one this run created.
     matched_by: ?MatchedBy,
-    /// How the branch came to be, for a worktree this run created.
     created: ?git.Strategy,
-    /// What a new branch was cut from.
     base: ?[]const u8,
-    /// The main checkout has the branch checked out, so no worktree was involved.
     is_main_checkout: bool,
     linked: []const []const u8,
     skipped: []const []const u8,
@@ -361,11 +280,6 @@ const Match = struct {
     by: MatchedBy,
 };
 
-/// The worktree an issue's work lives in. The exact branch name first, so a repo
-/// holding both the old and the new name resolves to the new one; then the `PE-N`
-/// ref, which is the half that survives the issue being renamed in Linear —
-/// otherwise a renamed issue looks like untouched work and gets a second, empty
-/// worktree while the real one sits next to it.
 fn findWorktree(entries: []const git.WorktreeEntry, branch: []const u8) ?Match {
     if (git.worktreeForBranch(entries, branch)) |entry| return .{ .entry = entry, .by = .branch };
     for (entries) |entry| {
@@ -375,10 +289,6 @@ fn findWorktree(entries: []const git.WorktreeEntry, branch: []const u8) ?Match {
     return null;
 }
 
-/// A local branch carrying the same issue as `suggested` under a different name —
-/// what a rename in Linear leaves behind, since `branchName` is derived from the
-/// title while the commits stay where they were. The most recently committed one when
-/// there are several: renames can happen more than once, and the newest is the work.
 fn newestBranchForIssue(statuses: []const git.BranchStatus, suggested: []const u8) ?[]const u8 {
     var best: ?git.BranchStatus = null;
     for (statuses) |status| {
@@ -389,9 +299,6 @@ fn newestBranchForIssue(statuses: []const git.BranchStatus, suggested: []const u
     return if (best) |status| status.branch else null;
 }
 
-/// The worktree for `suggested`, made if the issue has none yet. Finding one is a
-/// normal outcome, not a failure: `lcc start PE-256` twice, or once from inside the
-/// worktree it made the first time, both land here.
 fn bootstrap(
     app: app_mod.App,
     opts: Opts,
@@ -409,8 +316,6 @@ fn bootstrap(
 
     const entries = try repo.listWorktrees();
     if (findWorktree(entries, suggested)) |match| {
-        // git checks a branch out in one place at a time, so this is *the* place.
-        // The branch there wins over the suggestion: it is where the commits are.
         branch = match.entry.branch.?;
         path = match.entry.path;
         status = .existing;
@@ -430,9 +335,6 @@ fn bootstrap(
             }
         }
     } else {
-        // No worktree, but the branch may still be there under an older name — the
-        // same rename that `findWorktree` deals with, one step earlier. Cutting a
-        // second branch beside it would leave the commits behind.
         if (repo.resolveStrategy(branch) == .new) {
             if (newestBranchForIssue(try repo.branchStatuses(), branch)) |existing| {
                 if (!opts.json) app.ui.warn(
@@ -463,7 +365,6 @@ fn bootstrap(
                 "Worktree path already exists but no worktree is registered there: {s}\nRemove it first with: git worktree remove {s}  (or delete the directory).",
                 .{ path, path },
             ),
-            // Captured in `--json` mode, already on the terminal otherwise.
             git.Error.GitFailed => if (git.last_error.len > 0)
                 bail(app, opts.json, "git_failed", "git worktree add failed: {s}", .{git.last_error})
             else
@@ -515,13 +416,6 @@ fn bootstrap(
     };
 }
 
-/// Which repository the issue's work belongs in — the question `git` cannot answer
-/// and Linear does not carry, so getting it wrong builds a branch and a worktree that
-/// look entirely correct in a repo that has nothing to do with the issue.
-///
-/// Answered in order of how much it can be trusted: what lcc was told before, then
-/// work that already exists, then a question. Never a guess from the issue text —
-/// the words in a title are exactly the words that turn up in unrelated repos.
 fn resolveRepo(app: app_mod.App, opts: Opts, identifier: []const u8) !git.Repo {
     if (opts.repo) |given| return app.repoAt(given) catch bail(
         app,
@@ -533,8 +427,6 @@ fn resolveRepo(app: app_mod.App, opts: Opts, identifier: []const u8) !git.Repo {
 
     const state = repos.load(app.gpa, app.io, app.environ);
 
-    // The answer from last time. This is what makes `lcc start PE-236` work from
-    // anywhere, including a directory that is not a repository at all.
     if (repos.recall(state, identifier)) |remembered| {
         if (app.repoAt(remembered)) |found| {
             if (!opts.json) app.ui.hint("{s} lives in {f}", .{
@@ -542,18 +434,12 @@ fn resolveRepo(app: app_mod.App, opts: Opts, identifier: []const u8) !git.Repo {
                 ui.bold(std.fs.path.basename(found.root)),
             });
             return found;
-        } else |_| {
-            // The repo moved or was deleted; fall through and ask again.
-        }
+        } else |_| {}
     }
 
-    // Standing in a repository is the ordinary way of saying which one is meant, so
-    // it leads the shortlist and is checked for existing work first.
     const here: ?[]const u8 = if (app.repo()) |found| found.root else |_| null;
     const known = try repos.candidates(app.gpa, app.io, state, here, here);
 
-    // A branch for this issue somewhere is the answer, without anyone being asked:
-    // that is where the commits are.
     const started = try repos.withIssueBranch(app.gpa, app.io, known, identifier);
     if (started.len == 1) {
         const found = try app.repoAt(started[0]);
@@ -566,8 +452,6 @@ fn resolveRepo(app: app_mod.App, opts: Opts, identifier: []const u8) !git.Repo {
         return found;
     }
 
-    // Nothing knows, and `--json` has nobody to ask. Refusing beats creating a
-    // worktree in whichever repository the caller happened to be standing in.
     if (opts.json) bail(
         app,
         opts.json,
@@ -578,8 +462,6 @@ fn resolveRepo(app: app_mod.App, opts: Opts, identifier: []const u8) !git.Repo {
         .{ identifier, if (here) |root| root else "" },
     );
 
-    // Several repositories hold a branch for this issue — rare, and exactly when the
-    // shortlist is worth more than the full list.
     const offer = if (started.len > 1) started else known;
     if (offer.len == 0) return error.NotAGitRepository;
     return app.repoAt(try pickRepo(app, opts, identifier, offer));
@@ -609,20 +491,15 @@ fn pickRepo(app: app_mod.App, opts: Opts, identifier: []const u8, roots: []const
     return roots[index];
 }
 
-/// What a branch that does not exist yet gets cut from. An explicit `--base` wins;
-/// otherwise the default branch, unless standing somewhere else is worth asking about.
 fn resolveBase(app: app_mod.App, opts: Opts, repo: git.Repo, branch: []const u8) ![]const u8 {
     if (opts.base) |explicit| return explicit;
 
     const def = try repo.defaultBranch();
-    // An existing branch is checked out as it is; nothing is cut from anything.
     if (repo.resolveStrategy(branch) != .new) return def;
 
     const cur = try repo.currentBranch();
     if (cur == null or std.mem.eql(u8, cur.?, def)) return def;
 
-    // Nobody to ask in machine mode, and silently cutting from whatever branch the
-    // caller happens to stand on would be the wrong kind of guess.
     if (opts.json) return def;
 
     app.ui.flush();
@@ -635,10 +512,6 @@ fn resolveBase(app: app_mod.App, opts: Opts, repo: git.Repo, branch: []const u8)
         return cancel(opts);
 }
 
-/// What `--json` promises: where the issue lives, and the git facts a caller would
-/// otherwise have to shell out for. A declared type rather than a literal inside
-/// the printer, because it is a contract another program parses — the test at the
-/// bottom of this file is what keeps the field names from drifting.
 const Report = struct {
     issue: ReportIssue,
     branch: ReportBranch,
@@ -646,11 +519,6 @@ const Report = struct {
     repo: ReportRepo,
     links: ReportLinks,
     start_task_command: ?[]const u8,
-    /// The local-scope MCP servers lcc would carry into the worktree, and the file
-    /// it would pass as `--mcp-config`. Null when there are none to carry, including
-    /// when `mcpCarry` filters them all. A caller that is *already* running cannot be
-    /// given servers retroactively — this is here so it can say what a session
-    /// launched through lcc would have.
     mcp: ?ReportMcp,
 };
 
@@ -671,14 +539,10 @@ const ReportIssue = struct {
 };
 
 const ReportBranch = struct {
-    /// The branch to use — the one checked out where the work is.
     name: []const u8,
-    /// What Linear's `branchName` implies today, which differs from `name` when the
-    /// issue was renamed after the branch was cut.
     suggested: []const u8,
     renamed: bool,
     upstream: ?[]const u8,
-    /// No upstream means the Linear GitHub integration cannot have seen the branch.
     pushed: bool,
     ahead: u32,
     behind: u32,
@@ -692,8 +556,6 @@ const ReportWorktree = struct {
     created: ?[]const u8,
     base: ?[]const u8,
     is_main_checkout: bool,
-    /// Whether this very process is running inside it, which is what tells a caller
-    /// already in Claude Code that there is nothing left to open.
     is_cwd: bool,
 };
 
@@ -712,8 +574,6 @@ const ReportMcp = struct {
     servers: []const []const u8,
 };
 
-/// The git and config facts a report needs, gathered by the caller so that shaping
-/// them stays pure and testable.
 const Facts = struct {
     current_branch: ?[]const u8,
     branch_status: ?git.BranchStatus,
@@ -785,8 +645,6 @@ fn report(
     carried: ?McpFact,
     start_task_command: ?[]const u8,
 ) !void {
-    // The branch that exists, not the one Linear suggests: a renamed issue has its
-    // upstream and its drift on the branch the commits are actually on.
     var branch_status: ?git.BranchStatus = null;
     for (try repo.branchStatuses()) |status| {
         if (!std.mem.eql(u8, status.branch, wt.branch)) continue;
@@ -809,16 +667,12 @@ fn report(
     app.ui.flush();
 }
 
-/// Whether the process is standing in `path`, or below it. Both sides are resolved:
-/// `git worktree list` reports the path as it was given, symlinks and all.
 fn isCwd(app: app_mod.App, path: []const u8) bool {
     const here = Io.Dir.cwd().realPathFileAlloc(app.io, ".", app.gpa) catch return false;
     const there = disk.realPath(app.gpa, app.io, path);
     return std.mem.eql(u8, here, there) or disk.isInside(app.gpa, there, here);
 }
 
-/// The exits a caller has to be able to react to, in the shape it asked for. JSON
-/// goes to stdout and the human line to stderr, so both readers get served.
 fn bail(
     app: app_mod.App,
     json: bool,
@@ -890,7 +744,6 @@ fn pickBaseBranch(app: app_mod.App, repo: git.Repo) !?[]const u8 {
 test "findWorktree prefers the exact branch, then the issue behind it" {
     const entries = [_]git.WorktreeEntry{
         .{ .path = "/r", .branch = "main", .head = "a", .locked = false, .prunable = false, .is_main = true },
-        // Cut when PE-250 had a different title; the work is here.
         .{
             .path = "/wt/old",
             .branch = "feature/pe-250-fix-clvisit-handling-dedupe-arrivaldeparture-double-writes",
@@ -902,17 +755,14 @@ test "findWorktree prefers the exact branch, then the issue behind it" {
         .{ .path = "/wt/other", .branch = "feature/pe-9-unrelated", .head = "c", .locked = false, .prunable = false, .is_main = false },
     };
 
-    // What Linear suggests for PE-250 after the rename finds the old worktree anyway.
     const renamed = findWorktree(&entries, "feature/pe-250-fix-clvisit-capture-dropped-visits").?;
     try std.testing.expectEqualStrings("/wt/old", renamed.entry.path);
     try std.testing.expectEqual(MatchedBy.issue, renamed.by);
 
-    // An exact name is an exact match, and reported as one.
     const exact = findWorktree(&entries, "feature/pe-250-fix-clvisit-handling-dedupe-arrivaldeparture-double-writes").?;
     try std.testing.expectEqualStrings("/wt/old", exact.entry.path);
     try std.testing.expectEqual(MatchedBy.branch, exact.by);
 
-    // With both names present the current one wins over the ref match.
     const both = entries ++ [_]git.WorktreeEntry{.{
         .path = "/wt/new",
         .branch = "feature/pe-250-fix-clvisit-capture-dropped-visits",
@@ -926,14 +776,12 @@ test "findWorktree prefers the exact branch, then the issue behind it" {
     try std.testing.expectEqual(MatchedBy.branch, preferred.by);
 
     try std.testing.expect(findWorktree(&entries, "feature/pe-251-nothing-here") == null);
-    // The main checkout on `main` must not soak up an issue branch.
     try std.testing.expect(findWorktree(entries[0..1], "feature/pe-250-x") == null);
 }
 
 test "newestBranchForIssue reuses the renamed branch, and only the right issue's" {
     const statuses = [_]git.BranchStatus{
         .{ .branch = "main", .upstream = null, .ahead = 0, .behind = 0, .gone = false, .committed_at = 900 },
-        // Two names for PE-250, from two renames; the newer one holds the work.
         .{ .branch = "feature/pe-250-first-name", .upstream = null, .ahead = 0, .behind = 0, .gone = false, .committed_at = 100 },
         .{ .branch = "feature/pe-250-second-name", .upstream = null, .ahead = 0, .behind = 0, .gone = false, .committed_at = 200 },
         .{ .branch = "feature/pe-25-different-issue", .upstream = null, .ahead = 0, .behind = 0, .gone = false, .committed_at = 999 },
@@ -942,7 +790,6 @@ test "newestBranchForIssue reuses the renamed branch, and only the right issue's
     const found = newestBranchForIssue(&statuses, "feature/pe-250-what-linear-suggests-now").?;
     try std.testing.expectEqualStrings("feature/pe-250-second-name", found);
 
-    // PE-25 must not soak up PE-250, and the suggestion itself is not a rename of itself.
     try std.testing.expect(newestBranchForIssue(&statuses, "feature/pe-9-nothing-here") == null);
     try std.testing.expect(newestBranchForIssue(&statuses, "feature/pe-25-different-issue") == null);
 }
@@ -995,9 +842,6 @@ test "the --json payload keeps the shape a caller parses" {
     const body = try std.json.Stringify.valueAlloc(gpa, value, .{ .whitespace = .indent_2 });
     defer gpa.free(body);
 
-    // The shape the caller relies on, spelled out independently of `Report`. Parsing
-    // rejects unknown fields, so renaming, dropping *or* adding one fails here rather
-    // than in whatever is reading the JSON.
     const Schema = struct {
         issue: struct {
             id: []const u8,
@@ -1039,7 +883,6 @@ test "the --json payload keeps the shape a caller parses" {
     const parsed = try std.json.parseFromSliceLeaky(Schema, arena_state.allocator(), body, .{});
 
     try std.testing.expectEqualStrings("PE-250", parsed.issue.identifier);
-    // The branch to use is the one with the commits; the rename is stated, not hidden.
     try std.testing.expectEqualStrings("feature/pe-250-fix-clvisit-handling-dedupe", parsed.branch.name);
     try std.testing.expectEqualStrings(issue.branch_name, parsed.branch.suggested);
     try std.testing.expect(parsed.branch.renamed);
@@ -1052,8 +895,6 @@ test "the --json payload keeps the shape a caller parses" {
     try std.testing.expect(parsed.worktree.is_cwd);
     try std.testing.expectEqualStrings(".env", parsed.links.linked[0]);
     try std.testing.expectEqualStrings("/start-task PE-250", parsed.start_task_command.?);
-    // The servers a session launched through lcc would get, named so a caller that
-    // is missing one can tell whether lcc would have supplied it.
     try std.testing.expectEqualStrings("/cfg/mcp/-r.json", parsed.mcp.?.config);
     try std.testing.expectEqualStrings("linear-server", parsed.mcp.?.servers[0]);
 }
@@ -1088,7 +929,6 @@ test "a created worktree reports no match and its base" {
 
     const value = buildReport(issue, issue.branch_name, wt, .{
         .current_branch = "main",
-        // A branch that has just been cut has no `for-each-ref` row to find.
         .branch_status = null,
         .repo_root = "/r",
         .default_branch = "main",
@@ -1107,8 +947,6 @@ test "a created worktree reports no match and its base" {
     try std.testing.expectEqualStrings("main", value.worktree.base.?);
     try std.testing.expect(value.start_task_command == null);
 
-    // Null optionals must be present as nulls, not dropped: a caller reading
-    // `worktree.created` should find the key whatever the outcome was.
     const body = try std.json.Stringify.valueAlloc(gpa, value, .{});
     defer gpa.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"matched_by\":null") != null);
@@ -1117,17 +955,6 @@ test "a created worktree reports no match and its base" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"mcp\":null") != null);
 }
 
-/// What `claude` is launched with, in order.
-///
-/// `plan_mode` opens the session in Claude Code's own plan mode, which is where a
-/// task should start: recon and questions before edits, and an explicit approval
-/// before any of it becomes code. Taking a worktree is the moment that decision is
-/// cheapest, so it is the default rather than something to remember.
-///
-/// The `--` is load-bearing and unconditional. The prompt is a positional, and one
-/// that opens with `-` — a markdown bullet, `---` front matter — is read as an
-/// option without it. It used to be appended only alongside `--mcp-config`, which
-/// made that depend on whether the repo happened to carry MCP servers.
 fn launchArgs(
     gpa: std.mem.Allocator,
     mcp_config: ?[]const u8,
@@ -1146,23 +973,16 @@ fn launchArgs(
 
 pub const Expanded = struct {
     text: []u8,
-    /// Whether `{plan}` was in the template at all. `--plan` has no other channel to
-    /// the agent, so a false here means the path reached nobody — which the caller
-    /// refuses rather than launches.
     used_plan: bool,
 };
 
 const Placeholder = enum { identifier, branch, url, plan };
 
-/// One placeholder, and where the template resumes after it.
 const Recognized = struct {
     key: Placeholder,
     end: usize,
 };
 
-/// The whole of the placeholder syntax, stated once. Anything this declines —
-/// an unclosed brace, an unknown key — is template text, which is why both scans
-/// step a single byte and keep looking rather than giving up on the rest.
 fn placeholderAt(template: []const u8, i: usize) ?Recognized {
     if (template[i] != '{') return null;
     const close = std.mem.indexOfScalarPos(u8, template, i, '}') orelse return null;
@@ -1170,10 +990,6 @@ fn placeholderAt(template: []const u8, i: usize) ?Recognized {
     return .{ .key = key, .end = close + 1 };
 }
 
-/// Whether `startTaskCommand` has a `{plan}` for a plan path to travel through —
-/// asked of the template on its own, before there is an issue, a branch or a
-/// worktree to ask it against. `expandCommand` answers the same question as
-/// `used_plan`, and both read `placeholderAt`, so the two cannot drift.
 pub fn templateCarriesPlan(template: []const u8) bool {
     var i: usize = 0;
     while (i < template.len) {
@@ -1187,10 +1003,6 @@ pub fn templateCarriesPlan(template: []const u8) bool {
     return false;
 }
 
-/// `{plan}` is the absolute path to a plan file, never its contents: the result
-/// becomes one `argv` element and, in `--json`, one field of a payload a caller
-/// parses. A 20KB plan inlined there would bloat both for bytes the agent can
-/// read off disk itself. Absent `--plan`, it expands to nothing.
 pub fn expandCommand(
     gpa: std.mem.Allocator,
     template: []const u8,
@@ -1242,30 +1054,23 @@ test "expandCommand fills the placeholders and leaves anything else alone" {
         template: []const u8,
         plan: ?[]const u8,
         want: []const u8,
-        /// `--plan` is refused when this comes back false, so it is asserted, not incidental.
         want_used_plan: bool = false,
     }{
         .{ .template = "/start-task {identifier}", .plan = null, .want = "/start-task PE-250" },
         .{ .template = "{branch} {url}", .plan = null, .want = "feature/pe-250-actual https://linear.app/x/issue/PE-250/fix" },
-        // A plan travels as its path, so the expansion stays one short argv element
-        // however long the plan itself is.
         .{
             .template = "/start-task {identifier} --plan {plan}",
             .plan = "/Users/me/.claude/plans/x.md",
             .want = "/start-task PE-250 --plan /Users/me/.claude/plans/x.md",
             .want_used_plan = true,
         },
-        // Without --plan the key disappears rather than expanding to a literal — but
-        // the template still owns a channel, so `used_plan` is true.
         .{ .template = "read {plan} then go", .plan = null, .want = "read  then go", .want_used_plan = true },
-        // The case the bug was: a template with no `{plan}` at all silently drops it.
         .{
             .template = "/start-task {identifier}",
             .plan = "/Users/me/.claude/plans/x.md",
             .want = "/start-task PE-250",
             .want_used_plan = false,
         },
-        // Unknown keys and an unclosed brace are template text, not an error.
         .{ .template = "{nope} {identifier}", .plan = null, .want = "{nope} PE-250" },
         .{ .template = "{unclosed", .plan = null, .want = "{unclosed" },
     };
@@ -1281,8 +1086,6 @@ test "expandCommand fills the placeholders and leaves anything else alone" {
 test "launchArgs always separates the prompt from the options with --" {
     const gpa = std.testing.allocator;
 
-    // A plan file opens with `---` front matter or a `-` bullet often enough that
-    // this is the common case, not the exotic one.
     const opens_with_dash = "--- \n- step one";
 
     const carried = try launchArgs(gpa, "/cfg/mcp.json", opens_with_dash, false);
@@ -1293,15 +1096,12 @@ test "launchArgs always separates the prompt from the options with --" {
     try std.testing.expectEqualStrings("--", carried[2]);
     try std.testing.expectEqualStrings(opens_with_dash, carried[3]);
 
-    // The regression: with no MCP config to carry there was no `--` either, and
-    // the prompt reached `claude` as an option.
     const bare = try launchArgs(gpa, null, opens_with_dash, false);
     defer gpa.free(bare);
     try std.testing.expectEqual(@as(usize, 2), bare.len);
     try std.testing.expectEqualStrings("--", bare[0]);
     try std.testing.expectEqualStrings(opens_with_dash, bare[1]);
 
-    // Nothing to say, nothing to separate.
     const empty = try launchArgs(gpa, null, null, false);
     defer gpa.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
@@ -1314,7 +1114,6 @@ test "launchArgs always separates the prompt from the options with --" {
 test "launchArgs opens in plan mode, and the mode stays ahead of the separator" {
     const gpa = std.testing.allocator;
 
-    // The default: nothing was brought, so the session starts by planning.
     const planning = try launchArgs(gpa, null, "/start-task PE-250", true);
     defer gpa.free(planning);
     try std.testing.expectEqual(@as(usize, 4), planning.len);
@@ -1323,8 +1122,6 @@ test "launchArgs opens in plan mode, and the mode stays ahead of the separator" 
     try std.testing.expectEqualStrings("--", planning[2]);
     try std.testing.expectEqualStrings("/start-task PE-250", planning[3]);
 
-    // Everything the mode adds is an option, so it has to land before the `--`
-    // or it becomes part of the prompt.
     const with_mcp = try launchArgs(gpa, "/cfg/mcp.json", "/start-task PE-250", true);
     defer gpa.free(with_mcp);
     try std.testing.expectEqual(@as(usize, 6), with_mcp.len);
@@ -1333,8 +1130,6 @@ test "launchArgs opens in plan mode, and the mode stays ahead of the separator" 
     try std.testing.expectEqualStrings("--mcp-config", with_mcp[2]);
     try std.testing.expectEqualStrings("--", with_mcp[4]);
 
-    // No prompt is no reason to skip the mode: an empty startTaskCommand still
-    // opens a session, and it should still open it planning.
     const no_prompt = try launchArgs(gpa, null, null, true);
     defer gpa.free(no_prompt);
     try std.testing.expectEqual(@as(usize, 2), no_prompt.len);

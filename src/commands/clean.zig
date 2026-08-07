@@ -1,6 +1,3 @@
-//! `lcc clean` — reclaim what worktrees leave behind after they are gone:
-//! Xcode build data and Claude Code session transcripts.
-
 const std = @import("std");
 const app_mod = @import("../app.zig");
 const cp = @import("../claude_projects.zig");
@@ -11,7 +8,6 @@ const ui = @import("../ui.zig");
 
 pub const Opts = struct {
     yes: bool = false,
-    /// Which categories to consider. Neither flag means both.
     build_data: bool = false,
     sessions: bool = false,
 
@@ -26,8 +22,6 @@ pub const Opts = struct {
 
 const Kind = enum { build_data, sessions };
 
-/// One removable thing, whichever category it came from. The two roots differ,
-/// so each variant carries the entry its own module knows how to delete safely.
 const Target = union(Kind) {
     build_data: dd.Entry,
     sessions: cp.Entry,
@@ -37,7 +31,6 @@ const Candidate = struct {
     target: Target,
     size: u64,
 
-    /// The folder name, as Xcode or Claude Code chose it.
     fn name(self: Candidate) []const u8 {
         return switch (self.target) {
             .build_data => |e| e.name,
@@ -52,7 +45,6 @@ const Candidate = struct {
         };
     }
 
-    /// The project or worktree that no longer exists.
     fn origin(self: Candidate) []const u8 {
         return switch (self.target) {
             .build_data => |e| e.workspace_path,
@@ -152,7 +144,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     });
 }
 
-/// One `du` across both categories, so the wait does not double when cleaning both.
 fn measure(app: app_mod.App, targets: []const Target) ![]Candidate {
     const paths = try app.gpa.alloc([]const u8, targets.len);
     for (targets, 0..) |target, i| {

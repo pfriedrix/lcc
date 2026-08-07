@@ -1,12 +1,3 @@
-//! Reading and writing one Linear issue, named by its identifier.
-//!
-//! `lcc start --json` resolves an issue too, but it is not a read-only probe: it
-//! cuts a branch and a worktree on the way, and a caller that only wanted to look
-//! has to undo them. This is the command that only looks.
-//!
-//! Nothing here needs a repository. `show` answers the same from anywhere, which
-//! is what lets a caller ask about an issue before deciding where its code lives.
-
 const std = @import("std");
 const Io = std.Io;
 const app_mod = @import("../app.zig");
@@ -20,9 +11,6 @@ const semver = @import("../semver.zig");
 
 pub const Verb = enum { show, state, comment, project };
 
-/// The subcommand `raw` names, case-insensitively — the shape `open.resolveTarget`
-/// uses. Null is "not one of ours", which the caller turns into a message naming
-/// the ones that are.
 pub fn resolveVerb(raw: []const u8) ?Verb {
     if (std.ascii.eqlIgnoreCase(raw, "show")) return .show;
     if (std.ascii.eqlIgnoreCase(raw, "state")) return .state;
@@ -31,9 +19,6 @@ pub fn resolveVerb(raw: []const u8) ?Verb {
     return null;
 }
 
-/// The flags a verb takes, and only those. A union rather than one flat struct
-/// carrying every flag: an option a verb has no use for should not be a thing that
-/// parses and is then ignored.
 pub const Sub = union(enum) {
     show: Show,
     state: SetState,
@@ -43,42 +28,23 @@ pub const Sub = union(enum) {
     pub const Show = struct {};
 
     pub const SetState = struct {
-        /// The state as it is written on the board — resolved against that team's
-        /// own workflow states, never against a status type.
         name: ?[]const u8 = null,
-        /// `--type` — narrows a name two states share, by Linear's `statusType`.
-        /// It may only narrow: a type that matches no name is still no such state.
         type: ?[]const u8 = null,
     };
 
     pub const AddComment = struct {
-        /// `-m` — the body outright.
         body: ?[]const u8 = null,
-        /// `-f` — the body read off disk. Mutually exclusive with `body`.
         file: ?[]const u8 = null,
     };
 
     pub const SetProject = struct {
-        /// `--assign vX.Y.Z` — the version said outright. There is no inference
-        /// here and no resolver: a command that writes to Linear names what it is
-        /// writing.
         assign: ?[]const u8 = null,
-        /// `--resolve` — work out which release this issue targets and say so.
-        /// Read-only, always exits 0. Mutually exclusive with `--assign`.
         resolve: bool = false,
-        /// `--fetch` — refresh the view of `origin` first. Off by default because
-        /// this runs on a hot path, and a stale view degrades to a conservative
-        /// answer rather than a wrong one.
         fetch: bool = false,
-        /// Create the project when it does not exist. The flag **is** the consent,
-        /// moved out of a prompt so a non-interactive caller can give it.
         create: bool = false,
-        /// Reassign an issue that is already in a project. Moving between releases
-        /// is a deliberate "cut", so it does not happen by accident.
         force: bool = false,
     };
 
-    /// The defaults for `verb`, so the parser has somewhere to put its flags.
     pub fn empty(verb: Verb) Sub {
         return switch (verb) {
             .show => .{ .show = .{} },
@@ -90,8 +56,6 @@ pub const Sub = union(enum) {
 };
 
 pub const Opts = struct {
-    /// `PE-42`, exactly as typed. Parsed into a `linear.Ref` inside `run`, so a bad
-    /// identifier is one refusal in one place however many subcommands there are.
     issue: ?[]const u8 = null,
     json: bool = false,
     sub: Sub = .{ .show = .{} },
@@ -118,12 +82,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     }
 }
 
-/// The Keychain read, the config, and a token that has not expired.
-///
-/// The hint comes before the read, not after: the Keychain grants access to a
-/// binary by its code signature, so a freshly built lcc can block here on a system
-/// dialog asking for the login password. Announced, that is a wait with a reason;
-/// unannounced, it is a process sitting silently with no output and no child.
 fn authorize(app: app_mod.App, opts: Opts) !oauth.Token {
     app.ui.hint("Reading the Linear token from the Keychain...", .{});
     app.ui.flush();
@@ -194,9 +152,6 @@ fn setState(
 
     const target = switch (try linear.resolveState(app.gpa, ctx.states, wanted, sub.type)) {
         .found => |state| state,
-        // The full board, in its own order, so "no such state" says what there is
-        // instead of only what there is not. When the state list was capped, that
-        // is a different claim and the message makes it.
         .unknown => bail(
             app,
             opts.json,
@@ -209,11 +164,6 @@ fn setState(
                 stateNames(app, ctx.states),
             },
         ),
-        // Refused in both modes, not just the machine one: two modes disagreeing
-        // about which state an issue landed in is worse than either refusing. The
-        // escape is `--type`, because `(name, type)` is the pair that is unique —
-        // and it is the same string in both modes, so a caller can retry without
-        // a human.
         .ambiguous => |hits| bail(
             app,
             opts.json,
@@ -223,9 +173,6 @@ fn setState(
         ),
     };
 
-    // Linear's GitHub integration moves an issue on a branch push, so arriving to
-    // find it already there is the normal case, not a race. Writing anyway would
-    // bump `updatedAt` and put a state change in the activity feed nobody made.
     const changed = !std.mem.eql(u8, ctx.current.id, target.id);
     const landed: linear.WorkflowState = if (!changed) ctx.current else blk: {
         const updated = linear.setIssueState(app.gpa, app.io, token, ctx.issue_id, target.id) catch |err| bail(
@@ -265,8 +212,6 @@ fn stateNames(app: app_mod.App, states: []const linear.WorkflowState) []const u8
     return std.mem.join(app.gpa, ", ", names) catch "";
 }
 
-/// The types that tell two same-named states apart, which is the only thing a
-/// caller can use to narrow them.
 fn stateTypes(app: app_mod.App, states: []const linear.WorkflowState) []const u8 {
     const types = app.gpa.alloc([]const u8, states.len) catch return "";
     for (states, 0..) |state, i| types[i] = state.type;
@@ -281,12 +226,8 @@ const ReportState = struct {
 
 const StateReport = struct {
     issue: ReportRef,
-    /// False when the issue was already there. The write is skipped, not faked —
-    /// `from` and `to` are then the same value.
     changed: bool,
     from: ReportState,
-    /// What Linear ended up with, re-read out of the mutation's own payload rather
-    /// than echoed back from the request.
     to: ReportState,
 };
 
@@ -307,8 +248,6 @@ fn project(
         "'{s}' is not a release version — expected something like v2.6.0.",
         .{sub.assign.?},
     );
-    // Normalised, so `2.6.0` and `v2.6.0` name the same project and a created one
-    // is always spelled the way the board spells it.
     const name = try semver.render(app.gpa, wanted);
 
     const found = linear.fetchIssueDetail(app.gpa, app.io, token, ref) catch |err| bail(
@@ -320,9 +259,6 @@ fn project(
     );
     const detail = found orelse bail(app, opts.json, "issue_not_found", "No issue {s} in Linear.", .{named});
 
-    // Moving an issue between releases is a deliberate cut, and this is where that
-    // is enforced rather than merely written down. The refusal names the flag, so
-    // a caller that meant it can say so without going and reading the docs.
     if (detail.project) |current| {
         if (!sub.force and !std.mem.eql(u8, current.name, name)) {
             bail(
@@ -378,8 +314,6 @@ fn project(
         break :blk made;
     };
 
-    // Already in the right project: reported, not rewritten, for the same reason
-    // `state` skips a no-op — an activity-feed entry nobody made is noise.
     const changed = if (detail.project) |current| !std.mem.eql(u8, current.id, target.id) else true;
     if (changed) {
         _ = linear.setIssueProject(app.gpa, app.io, token, detail.issue.id, target.id) catch |err| bail(
@@ -413,12 +347,6 @@ fn project(
     app.ui.flush();
 }
 
-/// Which release this issue targets, worked out rather than named.
-///
-/// Read-only and **always exits 0**, even when only a human can settle it: an
-/// unresolved case comes back as a proposal with the whole computation already
-/// done, so the caller's question is a formatting job rather than a re-derivation.
-/// The write is `--assign`, which infers nothing.
 fn resolveProject(
     app: app_mod.App,
     opts: Opts,
@@ -447,8 +375,6 @@ fn resolveProject(
         }
     }
 
-    // Rule 2 is the common case in a start-task flow, and it needs neither git nor
-    // the project board. Asking here is what keeps those two off the hot path.
     var git_facts: ?GitFacts = null;
     const outcome = release.resolveLocal(facts) orelse blk: {
         git_facts = gatherGit(app, sub, &facts, &notes);
@@ -467,8 +393,6 @@ fn resolveProject(
     renderResolve(app, value);
 }
 
-/// The git half of `Facts`, kept for the report so a reader can see what the rule
-/// was decided against. Null when there is no repository here at all.
 const GitFacts = struct {
     root: []const u8,
     head: ?[]const u8,
@@ -499,9 +423,6 @@ fn gatherGit(
     facts.current_branch = repo.currentBranch() catch null;
     facts.default_branch = repo.defaultBranch() catch "main";
 
-    // Every count is measured from a resolved sha rather than the literal `HEAD`:
-    // the counts run in the main checkout, so `HEAD` there would be a different
-    // commit whenever the user is standing in a linked worktree.
     const head = repo.headSha();
 
     var branches: std.ArrayList(release.ReleaseBranch) = .empty;
@@ -534,8 +455,6 @@ fn gatherGit(
 
     var tags: std.ArrayList(semver.Version) = .empty;
     if (repo.listTags()) |names| {
-        // Tags are noisy — `build-4471` lives beside `v2.6.0` — so the ones that
-        // are not versions are skipped silently rather than noted one by one.
         for (names) |name| {
             if (semver.parse(name)) |version| tags.append(app.gpa, version) catch {};
         }
@@ -543,9 +462,6 @@ fn gatherGit(
     semver.sortAsc(tags.items);
     facts.tags = tags.items;
 
-    // The base rides on a request lcc already makes for this branch, so there is
-    // no second process and no second network hop. `gh` is optional throughout:
-    // its absence costs a note, and the commit-distance contest still answers.
     var pr_base: ?[]const u8 = null;
     if (facts.current_branch) |branch| {
         if (github.forBranches(app.gpa, app.io, repo.root, &.{branch})) |prs| {
@@ -593,9 +509,6 @@ fn gatherBoard(
     std.mem.sort(release.Project, completed, {}, projectAsc);
     facts.completed_projects = completed;
 
-    // Everything already cut, from the two sources that mean *shipped* — tags and
-    // completed projects. A live release branch means stabilising, which is the
-    // veto's job below, not this ceiling's.
     var ceiling: ?semver.Version = null;
     if (facts.tags.len > 0) ceiling = facts.tags[facts.tags.len - 1];
     if (completed.len > 0) {
@@ -621,8 +534,6 @@ fn gatherBoard(
     }
 }
 
-/// The projects whose names really are versions. A `v2.6.0-rc1` on the board is
-/// invisible to the resolver rather than standing in for the release.
 fn versioned(app: app_mod.App, projects: []const linear.ReleaseProject) []release.Project {
     var out: std.ArrayList(release.Project) = .empty;
     for (projects) |candidate| {
@@ -640,11 +551,6 @@ fn projectAsc(_: void, a: release.Project, b: release.Project) bool {
     return a.version.order(b.version) == .lt;
 }
 
-/// The project called `name`, looked for in both halves of the board.
-///
-/// A completed project is a legitimate target for an explicit `--assign`: dropping
-/// shipped releases is about what the *resolver* may propose, not about what a
-/// human may name outright.
 fn findProject(board: linear.ReleaseProjects, name: []const u8) ?linear.Project {
     for ([_][]const linear.ReleaseProject{ board.open, board.completed }) |half| {
         for (half) |candidate| {
@@ -659,9 +565,7 @@ fn findProject(board: linear.ReleaseProjects, name: []const u8) ?linear.Project 
 const ProjectReport = struct {
     issue: ReportRef,
     project: ReportProject,
-    /// Whether this run attached it. False when the issue was already there.
     changed: bool,
-    /// Whether this run had to create the project first.
     created: bool,
 };
 
@@ -698,36 +602,20 @@ const ReportGit = struct {
     release_branches: []const ReportReleaseBranch,
 };
 
-/// What `--resolve` promises.
-///
-/// Every status exits 0 — an unresolved case is an answer, not a failure, and the
-/// point of moving this into lcc is that the computation survives the human gate
-/// instead of being defeated by it. `question` and `command` are pre-worded so the
-/// caller quotes rather than re-derives them.
 const ResolveReport = struct {
     issue: ReportRef,
-    /// `resolved`, `already_set`, `needs_confirmation` or `needs_choice`.
     status: []const u8,
     rule: u8,
     rule_name: []const u8,
-    /// The version. Present for `resolved`, for `already_set` unless the project's
-    /// name is not a version, and for `needs_confirmation` as the candidate.
     version: ?[]const u8,
     evidence: ?ReportEvidence,
-    /// The Linear project carrying that name, when one exists.
     project: ?ReportProject,
-    /// Whether a human has to agree before the project is created — false for the
-    /// rules that read a version off a fact, true for the one that infers it.
     confirm_before_create: bool,
     baseline: ?ReportBaseline,
     choices: []const ReportChoice,
-    /// A project already on the issue that this answer disagrees with. Non-null
-    /// means `--assign` will refuse without `--force`.
     conflict: ?ReportProject,
     question: ?[]const u8,
     command: ?[]const u8,
-    /// Null when the answer never needed git — not an empty object, because "not
-    /// gathered" and "gathered and empty" are different facts.
     git: ?ReportGit,
     notes: []const []const u8,
 };
@@ -789,13 +677,9 @@ fn buildResolveReport(
             value.rule_name = @tagName(hit.rule);
             value.version = name;
             value.evidence = .{ .kind = @tagName(hit.evidence.kind), .text = hit.evidence.text };
-            // Rules 1 and 3 to 5 read a version off a fact, so a project created
-            // for one needs no further agreement.
             value.confirm_before_create = false;
             if (hit.project) |p| value.project = .{ .id = p.id, .name = p.name };
             if (hit.project == null) {
-                // Only the board having been read makes "there is none" a claim
-                // worth acting on, so say which of the two nulls this is.
                 if (facts.projects_asked) {
                     value.project = findProjectNamed(facts, name);
                 }
@@ -897,9 +781,6 @@ fn renderResolve(app: app_mod.App, value: ResolveReport) void {
     app.ui.flush();
 }
 
-/// A markdown plan is the largest thing anyone reasonably comments with. A
-/// megabyte is headroom over that; past it the caller has pointed at the wrong
-/// file, and saying so beats sending it.
 const max_body = 1 << 20;
 
 fn comment(
@@ -915,8 +796,6 @@ fn comment(
         bail(app, opts.json, "body_empty", "Refusing to post an empty comment to {s}.", .{named});
     }
 
-    // The issue's own UUID is what `commentCreate` writes against, and the read
-    // that fetches it is also what proves the issue exists before anything is sent.
     const found = linear.fetchIssueDetail(app.gpa, app.io, token, ref) catch |err| bail(
         app,
         opts.json,
@@ -959,13 +838,6 @@ fn comment(
     app.ui.flush();
 }
 
-/// The comment body, from `-m` outright or from a file.
-///
-/// The path is resolved before it is read, and the ways that can fail are kept
-/// apart: `realPathFileAlloc` resolves anything that exists, directories included,
-/// so "no such file" is a claim to make once it is true rather than a catch-all.
-/// Told a file is missing when it is sitting there unreadable, you go looking for
-/// the wrong thing.
 fn commentBody(app: app_mod.App, opts: Opts, sub: Sub.AddComment) []const u8 {
     if (sub.body) |text| return text;
     const raw = sub.file.?;
@@ -987,9 +859,6 @@ fn commentBody(app: app_mod.App, opts: Opts, sub: Sub.AddComment) []const u8 {
         bail(app, opts.json, "body_unreadable", "Cannot read {s}: {s}", .{ raw, @errorName(err) });
 }
 
-/// The three fields a write's report needs to identify what it wrote to. A subset
-/// of `ReportIssue` rather than the whole of it, because a write should not have
-/// to have read the description in order to report itself.
 const ReportRef = struct {
     id: []const u8,
     identifier: []const u8,
@@ -1003,14 +872,9 @@ const CommentReport = struct {
         url: []const u8,
         created_at: []const u8,
     },
-    /// Bytes as sent, so a caller that fed a file can tell a truncated read from a
-    /// whole one without re-stat-ing it.
     body_bytes: usize,
 };
 
-/// Shared by every subcommand, and field-for-field the `issue` block of
-/// `lcc start --json` where the two overlap, plus the ids a write needs and the
-/// fields only a detail read pays for. A caller parses one shape, not two.
 const ReportIssue = struct {
     id: []const u8,
     identifier: []const u8,
@@ -1032,16 +896,9 @@ const ReportProject = struct {
     name: []const u8,
 };
 
-/// What `show --json` promises. A declared type rather than a literal inside the
-/// printer, because it is a contract another program parses — the test at the
-/// bottom of this file is what keeps the field names from drifting.
 const ShowReport = struct {
     issue: ReportIssue,
-    /// Null is "in no project", which for an issue past Todo is the invariant a
-    /// caller is checking for.
     project: ?ReportProject,
-    /// Every label, flat. Which one picks a pipeline is the caller's taxonomy, and
-    /// grouping them here would be lcc taking a view on one it does not own.
     labels: []const []const u8,
     description: ?[]const u8,
 };
@@ -1072,9 +929,6 @@ fn buildShowReport(detail: linear.Detail) ShowReport {
 fn renderShow(app: app_mod.App, value: ShowReport) void {
     app.ui.info("{s}  {s}", .{ value.issue.identifier, value.issue.title });
     app.ui.info("  State     {s}", .{value.issue.state});
-    // Stated even when there is none: an issue past Todo with no project is
-    // invisible on the release board, and a line that disappears when it is
-    // missing is the one a reader stops looking for.
     if (value.project) |attached| {
         app.ui.info("  Project   {s}", .{attached.name});
     } else {
@@ -1090,8 +944,6 @@ fn renderShow(app: app_mod.App, value: ShowReport) void {
     app.ui.flush();
 }
 
-/// The exits a caller has to be able to react to, in the shape it asked for. JSON
-/// goes to stdout and the human line to stderr, so both readers get served.
 fn bail(
     app: app_mod.App,
     json: bool,
@@ -1119,9 +971,7 @@ test "resolveVerb takes the subcommand however it is cased, and nothing else" {
     try std.testing.expectEqual(Verb.project, resolveVerb("project").?);
     try std.testing.expect(resolveVerb("") == null);
     try std.testing.expect(resolveVerb("frobnicate") == null);
-    // An identifier in the verb's place is a missing subcommand, not a verb.
     try std.testing.expect(resolveVerb("PE-42") == null);
-    // Nor is a flag: `lcc issue --json PE-42` names no subcommand at all.
     try std.testing.expect(resolveVerb("--json") == null);
 }
 
@@ -1155,10 +1005,6 @@ test "the state payload reports what landed, and says when nothing was written" 
     try std.testing.expectEqualStrings("Todo", parsed.from.name);
     try std.testing.expectEqualStrings("In Progress", parsed.to.name);
 
-    // Already there: Linear's GitHub integration moves an issue on a branch push,
-    // so this is the normal case. The write is skipped rather than faked, and
-    // `from` and `to` are the same value — which is how a caller tells a no-op
-    // from a move without comparing names itself.
     const untouched: StateReport = .{ .issue = issue, .changed = false, .from = progress, .to = progress };
     const idle = try std.json.Stringify.valueAlloc(gpa, untouched, .{ .whitespace = .indent_2 });
     defer gpa.free(idle);
@@ -1194,8 +1040,6 @@ test "an unresolved release comes back as a proposal, not as a failure" {
         .description = null,
     };
 
-    // Rule 6: nothing open left, so lcc proposes a minor above what shipped and
-    // hands the question over already worded.
     const outcome: release.Outcome = .{ .needs_confirmation = .{
         .candidate = semver.parse("v2.6.0").?,
         .baseline = semver.parse("v2.5.2").?,
@@ -1240,15 +1084,10 @@ test "an unresolved release comes back as a proposal, not as a failure" {
     try std.testing.expectEqualStrings("v2.6.0", parsed.version.?);
     try std.testing.expectEqualStrings("v2.5.2", parsed.baseline.?.version);
     try std.testing.expectEqualStrings("tag", parsed.baseline.?.source);
-    // The one rule that infers rather than reads: creating this project needs a
-    // human to agree first, and the flag that says so is in the command.
     try std.testing.expect(parsed.confirm_before_create);
     try std.testing.expect(std.mem.endsWith(u8, parsed.command.?, "--assign v2.6.0 --create"));
-    // Already worded, so the caller's hard gate is a formatting job.
     try std.testing.expect(std.mem.indexOf(u8, parsed.question.?, "v2.5.2") != null);
 
-    // `git: null` is the staging contract: rule 2 and this path never paid for it,
-    // and an empty object would claim it was gathered and came back bare.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"git\": null") != null);
 }
 
@@ -1290,11 +1129,7 @@ test "a resolved release names the rule that found it and needs no confirmation"
     try std.testing.expectEqualStrings("resolved", value.status);
     try std.testing.expectEqual(@as(u8, 3), value.rule);
     try std.testing.expectEqualStrings("v2.7.0", value.version.?);
-    // Rule 3 read the version off a branch that exists, so there is nothing left
-    // for a human to agree to — only rule 6 infers.
     try std.testing.expect(!value.confirm_before_create);
-    // The board was never asked, so no project was found, and the command says so
-    // by carrying `--create`.
     try std.testing.expect(std.mem.endsWith(u8, value.command.?, "--create"));
 }
 
@@ -1310,9 +1145,6 @@ test "findProject takes a shipped release too, because an explicit name is not a
     };
 
     try std.testing.expectEqualStrings("p-260", findProject(board, "v2.6.0").?.id);
-    // Dropping shipped releases governs what the resolver may *propose*. A human
-    // naming one outright — backfilling an issue onto a release that already went
-    // out — is a different act, and refusing it here would be lcc overruling them.
     try std.testing.expectEqualStrings("p-252", findProject(board, "v2.5.2").?.id);
     try std.testing.expect(findProject(board, "v9.9.9") == null);
 }
@@ -1334,9 +1166,6 @@ test "the project payload keeps the shape a caller parses" {
         issue: struct { id: []const u8, identifier: []const u8, url: []const u8 },
         project: struct { id: []const u8, name: []const u8 },
         changed: bool,
-        /// Separate from `changed` on purpose: a caller has to be able to tell an
-        /// issue being filed into an existing release from one that brought a new
-        /// release board into existence.
         created: bool,
     };
 
@@ -1380,8 +1209,6 @@ test "the comment payload keeps the shape a caller parses" {
     const parsed = try std.json.parseFromSliceLeaky(Schema, arena_state.allocator(), body, .{});
 
     try std.testing.expectEqualStrings("PE-250", parsed.issue.identifier);
-    // The comment's own URL, not the issue's: a caller that reports "commented"
-    // should be able to link to the comment it made.
     try std.testing.expectEqualStrings("comment-uuid", parsed.comment.id);
     try std.testing.expectEqual(@as(usize, 42), parsed.body_bytes);
 }
@@ -1413,9 +1240,6 @@ test "the show payload keeps the shape a caller parses" {
     const body = try std.json.Stringify.valueAlloc(gpa, buildShowReport(detail), .{ .whitespace = .indent_2 });
     defer gpa.free(body);
 
-    // The shape the caller relies on, spelled out independently of `ShowReport`.
-    // Parsing rejects unknown fields, so renaming, dropping *or* adding one fails
-    // here rather than in whatever is reading the JSON.
     const Schema = struct {
         issue: struct {
             id: []const u8,
@@ -1442,8 +1266,6 @@ test "the show payload keeps the shape a caller parses" {
     const parsed = try std.json.parseFromSliceLeaky(Schema, arena_state.allocator(), body, .{});
 
     try std.testing.expectEqualStrings("PE-250", parsed.issue.identifier);
-    // The two ids a write needs, so setting a state or creating a project never
-    // has to send the human key `PE` where Linear wants a UUID.
     try std.testing.expectEqualStrings("state-uuid", parsed.issue.state_id);
     try std.testing.expectEqualStrings("team-uuid", parsed.issue.team_id.?);
     try std.testing.expectEqualStrings("v2.6.0", parsed.project.?.name);
@@ -1477,9 +1299,6 @@ test "an issue in no project says so, rather than leaving the key out" {
     const body = try std.json.Stringify.valueAlloc(gpa, buildShowReport(detail), .{ .whitespace = .indent_2 });
     defer gpa.free(body);
 
-    // A missing project is the invariant violation a caller is looking for, so the
-    // key is present and null rather than absent — an absent key reads as "lcc did
-    // not check", which is a different answer.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"project\": null") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"description\": null") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"assignee\": null") != null);

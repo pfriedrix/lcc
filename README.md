@@ -128,6 +128,14 @@ prompt or a question. `◐ active` is a turn in flight, `○ idle` is finished.
 Those come from Claude Code's own hooks rather than from reading its screen, so
 a new Claude Code release cannot quietly make them wrong.
 
+A session also reads `● waiting` when it has been `active` for a quarter of an
+hour with nothing reported at all. That is not a turn Claude Code said anything
+about — it is one lcc has lost track of, because the turn wedged or because it
+is blocked on something whose notification never arrived. Either way it wants a
+person, and `○ idle` would be a claim only a finished turn earns: a session that
+had stopped and needed opening used to be painted the same dim circle as the
+ones that had nothing left to do.
+
 `◈ plan` is a turn in flight too, in Claude Code's plan mode — it is researching
 and writing a plan, and has not been approved to touch any files yet. Since
 `planMode` defaults to on, every session starts there and leaves when you

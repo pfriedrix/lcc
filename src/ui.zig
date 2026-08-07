@@ -1,11 +1,8 @@
-//! Terminal output — the `picocolors` replacement plus lcc's log prefixes.
-
 const std = @import("std");
 const Io = std.Io;
 
 var color_enabled: bool = true;
 
-/// Honours `NO_COLOR` and a non-tty stdout, like picocolors does.
 pub fn detectColor(io: Io, environ: *const std.process.Environ.Map) void {
     if (environ.get("NO_COLOR")) |v| {
         if (v.len > 0) {
@@ -24,8 +21,6 @@ pub fn colorEnabled() bool {
     return color_enabled;
 }
 
-/// Escape sequences for code that builds its own frames (the prompts), so they
-/// honour `NO_COLOR` and non-tty output like everything else.
 pub const Palette = struct {
     reset: []const u8,
     bold: []const u8,
@@ -67,15 +62,11 @@ const Code = struct {
     const cyan = "\x1b[36m";
 };
 
-/// A string plus the escape it should be wrapped in. Rendered with `{f}`, so
-/// nothing is allocated and disabling colour is a single branch at write time.
 pub const Painted = struct {
     code: []const u8,
     text: []const u8,
 
     pub fn format(self: Painted, w: *Io.Writer) Io.Writer.Error!void {
-        // Empty text writes nothing at all, so callers can pass conditional
-        // fragments without emitting stray escape sequences.
         if (self.text.len == 0) return;
         if (!color_enabled) return w.writeAll(self.text);
         try w.writeAll(self.code);
@@ -103,16 +94,10 @@ pub fn cyan(text: []const u8) Painted {
     return .{ .code = Code.cyan, .text = text };
 }
 
-/// Buffered stdout/stderr with lcc's log vocabulary. Writes are best-effort:
-/// a CLI that fails because its own logging failed is worse than a lost line.
 pub const Ui = struct {
     io: Io,
     out: *Io.Writer,
     err: *Io.Writer,
-    /// Send the log vocabulary to stderr instead of stdout, leaving stdout for
-    /// `payload` alone. What `--json` turns on: a caller parsing stdout must not
-    /// have to filter progress lines out of it, and a human running the same
-    /// command still sees them.
     divert: bool = false,
 
     fn log(self: Ui) *Io.Writer {
@@ -136,7 +121,6 @@ pub const Ui = struct {
     }
 
     pub fn hint(self: Ui, comptime fmt: []const u8, args: anytype) void {
-        // `log.dim` in the TypeScript version.
         const w = self.log();
         if (color_enabled) w.writeAll(Code.dim) catch {};
         w.print(fmt, args) catch {};
@@ -150,8 +134,6 @@ pub const Ui = struct {
         self.err.flush() catch {};
     }
 
-    /// Machine-readable output — never coloured, never diverted, always the only
-    /// thing on stdout when `divert` is set.
     pub fn payload(self: Ui, comptime fmt: []const u8, args: anytype) void {
         self.out.print(fmt, args) catch {};
     }
@@ -162,8 +144,6 @@ pub const Ui = struct {
     }
 };
 
-/// Pads `text` to `width` *display* columns, counting codepoints rather than
-/// bytes so non-ASCII issue titles do not shift the columns.
 pub const Padded = struct {
     text: []const u8,
     width: usize,
@@ -179,8 +159,6 @@ pub fn pad(text: []const u8, width: usize) Padded {
     return .{ .text = text, .width = width };
 }
 
-/// Codepoint count — close enough to display width for the Latin/Cyrillic text
-/// that shows up in Linear titles and branch names.
 pub fn displayWidth(text: []const u8) usize {
     var cols: usize = 0;
     var i: usize = 0;
@@ -192,7 +170,6 @@ pub fn displayWidth(text: []const u8) usize {
     return cols;
 }
 
-/// Human-readable byte count, matching `formatBytes` in derived-data.ts.
 pub const Bytes = struct {
     value: u64,
 
@@ -217,8 +194,6 @@ pub fn bytes(value: u64) Bytes {
     return .{ .value = value };
 }
 
-/// Human-readable count — `812`, `3.7k`, `62.2M`. Token counts reach nine
-/// digits, which no table column can carry and no reader wants to parse.
 pub const Count = struct {
     value: u64,
 
@@ -243,14 +218,10 @@ pub fn count(value: u64) Count {
     return .{ .value = value };
 }
 
-/// Coarse elapsed time in one or two characters plus a unit — `2h`, `6d`, `3w`.
-/// A dashboard column wants "roughly how stale", not a duration.
 pub const Age = struct {
     seconds: i64,
 
     pub fn format(self: Age, w: *Io.Writer) Io.Writer.Error!void {
-        // A tip committed in the future (clock skew, a rebase with an old date)
-        // is not worth a negative number.
         if (self.seconds <= 0) return w.writeAll("now");
         const s: u64 = @intCast(self.seconds);
         const minute = 60;
@@ -274,12 +245,6 @@ pub fn age(seconds: i64) Age {
     return .{ .seconds = seconds };
 }
 
-/// A worked length of time, in two units at most — `0m`, `12m`, `9h40m`, `2d3h`.
-///
-/// Deliberately not `Age`, which rounds to one unit because "roughly how stale"
-/// is all a staleness column can honestly claim. This is a duration someone is
-/// meant to weigh against a working day, and there `9h` and `9h40m` are
-/// different answers.
 pub const Duration = struct {
     seconds: i64,
 
@@ -313,13 +278,10 @@ test "duration keeps the second unit that age rounds away" {
     const cases = [_]struct { seconds: i64, want: []const u8 }{
         .{ .seconds = -1, .want = "0m" },
         .{ .seconds = 0, .want = "0m" },
-        // Under a minute is real time worked, but there is no unit below `m`
-        // worth a column — it rounds down rather than inventing one.
         .{ .seconds = 59, .want = "0m" },
         .{ .seconds = 12 * 60, .want = "12m" },
         .{ .seconds = 3600, .want = "1h" },
         .{ .seconds = 9 * 3600 + 40 * 60, .want = "9h40m" },
-        // Seconds never surface: the trailing 30 is dropped, not rounded up.
         .{ .seconds = 9 * 3600 + 40 * 60 + 30, .want = "9h40m" },
         .{ .seconds = 24 * 3600, .want = "1d" },
         .{ .seconds = 2 * 24 * 3600 + 3 * 3600, .want = "2d3h" },

@@ -1,44 +1,12 @@
-//! What the transcripts said, distilled, so a second run does not read them again.
-//!
-//! Counting tokens means parsing every line of every transcript, and the pile
-//! only grows: transcripts are append-only and Claude Code never prunes them.
-//! On a repo worked in daily that is hundreds of megabytes of JSON re-parsed to
-//! redraw a table, and almost none of it changed since the last run — a session
-//! in progress appends to one file, and the other two hundred are frozen.
-//!
-//! So each transcript is reduced to the assistant messages that carried usage,
-//! and that is what is kept. It is two orders of magnitude smaller than the
-//! transcript, and a file is reused whenever its size and mtime still match —
-//! append-only means either one moving is enough to notice.
-//!
-//! What is *not* stored is anything derived. Cost is recomputed from the token
-//! counts on every read, so correcting the price table takes effect at once
-//! instead of being frozen into a file nobody would think to delete. And
-//! deduplication is not applied here: entries are deduplicated within their own
-//! transcript only, which keeps a file's entry a pure function of that file.
-//! The cross-file pass belongs to the scanner, which is the only thing that
-//! knows which transcripts a given question spans.
-//!
-//! Every failure is silent. This is a cache — losing it costs one slow run, and
-//! nothing it can do is worth failing the command that wanted a number.
-
 const std = @import("std");
 const Io = std.Io;
 const config = @import("config.zig");
 
-/// Bumped when the stored shape changes. An older file is dropped rather than
-/// migrated: rebuilding costs one slow run.
 const version: u32 = 1;
 
-/// A ceiling, so a corrupt or hostile file cannot be read into memory unbounded.
 const file_limit = 128 * 1024 * 1024;
 
-/// One assistant message that reported usage — the whole of what a transcript
-/// contributes. Raw token counts only; see the note on derived values above.
 pub const Message = struct {
-    /// `message.id`, or empty when the transcript recorded none. An empty id is
-    /// not deduplicated against anything: there is nothing to match it on, and
-    /// treating them all as one message would lose real spend.
     id: []const u8 = "",
     model: []const u8 = "",
     input: u64 = 0,
@@ -46,28 +14,16 @@ pub const Message = struct {
     cache_write_5m: u64 = 0,
     cache_write_1h: u64 = 0,
     cache_read: u64 = 0,
-    /// Verbatim ISO 8601, the form `Totals.last` compares and renders.
     timestamp: []const u8 = "",
 };
 
-/// One transcript's distilled contents, plus what identifies the version of it
-/// that produced them.
 pub const Entry = struct {
     size: u64 = 0,
-    /// Modification time in nanoseconds. Together with `size` this is the whole
-    /// test: for a file only ever appended to, either one moving means new
-    /// content, and a rewrite that lands on the same size within the same
-    /// nanosecond is not a thing that happens.
     mtime: i64 = 0,
-    /// The transcript was past the scanner's ceiling and never read. Worth
-    /// remembering — otherwise every run pays to rediscover that it cannot read it.
     skipped: bool = false,
     messages: []const Message = &.{},
 };
 
-/// An entry as stored, which is `Entry` plus the path it belongs to. The file
-/// is a flat list rather than an object so it round-trips through a plain
-/// struct with no dynamic keys.
 const Stored = struct {
     path: []const u8 = "",
     size: u64 = 0,
@@ -84,26 +40,15 @@ const Wire = struct {
 pub const Cache = struct {
     gpa: std.mem.Allocator,
     io: Io,
-    /// Where it lives, or null when lcc could not work that out. A null path is
-    /// a working cache that remembers nothing: every lookup misses, nothing is
-    /// written, and the scan simply pays full price.
     path: ?[]const u8 = null,
     entries: std.StringHashMapUnmanaged(Entry) = .empty,
-    /// Paths this run looked at. An entry nobody asked about is still kept —
-    /// another repository's transcripts must survive a run that never mentions
-    /// them — but only the ones asked about are known to still exist.
     used: std.StringHashMapUnmanaged(void) = .empty,
-    /// Something was learned that the file does not already hold. A run that
-    /// changed nothing writes nothing.
     dirty: bool = false,
 
-    /// A cache that remembers nothing, for callers that must not touch the disk.
     pub fn none(gpa: std.mem.Allocator, io: Io) Cache {
         return .{ .gpa = gpa, .io = io };
     }
 
-    /// The cache on disk, loaded. Never fails: an unreadable, corrupt, or
-    /// older-version file is the same as an empty one.
     pub fn open(
         gpa: std.mem.Allocator,
         io: Io,
@@ -132,8 +77,6 @@ pub const Cache = struct {
         return self;
     }
 
-    /// What is known about `file_path`, if what is known is about the file that
-    /// is there now.
     pub fn lookup(self: *Cache, file_path: []const u8, size: u64, mtime: i64) ?Entry {
         const entry = self.entries.get(file_path) orelse return null;
         if (entry.size != size or entry.mtime != mtime) return null;
@@ -153,8 +96,6 @@ pub const Cache = struct {
         self.used.put(self.gpa, file_path, {}) catch {};
     }
 
-    /// Writes back what was learned. A run that learned nothing writes nothing,
-    /// which is the common case and keeps a repeat run free of disk writes.
     pub fn save(self: *Cache) void {
         if (!self.dirty) return;
         const file_path = self.path orelse return;
@@ -162,10 +103,6 @@ pub const Cache = struct {
         var files: std.ArrayList(Stored) = .empty;
         var it = self.entries.iterator();
         while (it.next()) |kv| {
-            // A transcript nobody asked about this run is kept only while it is
-            // still on disk — otherwise a deleted worktree's sessions would sit
-            // in here forever, and `lcc clean` would have reclaimed the space
-            // for nothing.
             if (self.used.get(kv.key_ptr.*) == null) {
                 Io.Dir.cwd().access(self.io, kv.key_ptr.*, .{}) catch continue;
             }
@@ -191,10 +128,6 @@ pub const Cache = struct {
     }
 };
 
-/// `LCC_USAGE_CACHE` overrides it. Otherwise `~/.cache/lcc`, not the
-/// `~/.config/lcc` the rest of lcc's state uses: this file is regenerable,
-/// rewritten constantly, and the size of the transcripts behind it. Config
-/// directories get committed to dotfile repos, and this does not belong in one.
 pub fn path(
     gpa: std.mem.Allocator,
     environ: *const std.process.Environ.Map,
@@ -203,7 +136,7 @@ pub fn path(
         const override = std.mem.trim(u8, raw, " \t");
         if (override.len > 0) return gpa.dupe(u8, override);
     }
-    _ = try config.dir(gpa, environ); // Fails the same way when HOME is unset.
+    _ = try config.dir(gpa, environ);
     const home = environ.get("HOME").?;
     return std.fs.path.join(gpa, &.{ home, ".cache", "lcc", "usage.json" });
 }
@@ -244,8 +177,6 @@ test "a cache round-trips through the file and notices a changed transcript" {
     try std.testing.expectEqualStrings("msg_a", hit.messages[0].id);
     try std.testing.expectEqual(@as(u64, 7), hit.messages[0].output);
 
-    // Either half of the fingerprint moving is a miss — an appended transcript
-    // grows, and a rewritten one changes mtime.
     try std.testing.expect(reopened.lookup(transcript, 4, 100) == null);
     try std.testing.expect(reopened.lookup(transcript, 3, 101) == null);
     try std.testing.expect(reopened.lookup("/nowhere.jsonl", 3, 100) == null);
@@ -267,8 +198,6 @@ test "saving drops entries whose transcript is gone, and keeps the untouched" {
     var environ: std.process.Environ.Map = .init(arena);
     try environ.put("LCC_USAGE_CACHE", try std.fs.path.join(arena, &.{ base, "usage.json" }));
 
-    // `alive` belongs to another repository this run never asks about; `dead`
-    // was reclaimed by `lcc clean` since the run that recorded it.
     const alive = try std.fs.path.join(arena, &.{ base, "alive.jsonl" });
     const dead = try std.fs.path.join(arena, &.{ base, "dead.jsonl" });
     try cwd.writeFile(io, .{ .sub_path = alive, .data = "{}\n" });
@@ -281,11 +210,10 @@ test "saving drops entries whose transcript is gone, and keeps the untouched" {
         cache.save();
     }
 
-    // A fresh run that touches neither still keeps the one that exists.
     {
         var cache: Cache = .open(arena, io, &environ);
         try std.testing.expectEqual(@as(u32, 2), cache.entries.size);
-        cache.dirty = true; // Stand in for a run that learned something else.
+        cache.dirty = true;
         cache.save();
     }
 
@@ -302,8 +230,6 @@ test "a cache with nowhere to live is a cache that remembers nothing" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // No HOME and no override: `path` cannot be resolved, and nothing may touch
-    // the disk on the way to finding that out.
     var environ: std.process.Environ.Map = .init(arena);
     var cache: Cache = .open(arena, io, &environ);
     try std.testing.expect(cache.path == null);
@@ -339,7 +265,6 @@ test "a file from another version is ignored rather than misread" {
     const stale: Cache = .open(arena, io, &environ);
     try std.testing.expectEqual(@as(u32, 0), stale.entries.size);
 
-    // And so is a file that is not the shape at all.
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = file_path, .data = "not json" });
     const broken: Cache = .open(arena, io, &environ);
     try std.testing.expectEqual(@as(u32, 0), broken.entries.size);

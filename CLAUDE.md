@@ -116,12 +116,29 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
 - **`src/keychain.zig` imports five narrow C headers on purpose.** The umbrella
   `CoreFoundation.h` / `Security.h` do not translate on this SDK. Do not tidy them into one
   import.
+- **A session's hook settings file is per session, not per daemon.** `watch_paths.hooksFor`
+  names it `hooks-<session id>.json` and `watch_hooks.settingsJson` bakes that id into every
+  hook command line, so a report says which session it came from. Collapsing them back into
+  one shared `hooks.json` compiles and looks tidier, and it silently routes every session's
+  hooks to whichever session in that worktree was registered first — including a dead one,
+  which then eats the live sessions' updates while they sit frozen on whatever their first
+  byte of output set. The worktree path is *not* a unique key: `lcc open` will happily start
+  a second session in a worktree that already has one.
 
 ## Style
 
-Comments here explain **why**, never what: a `//!` header stating what the module is for,
-`///` on public declarations, and inline notes that name the bug a line prevents or the
-constraint that forced a shape. Keep them and keep them accurate — they are the only
-rationale record this repo has. Do not add ones that restate the code.
+**The Zig sources carry no comments.** No `//!` module headers, no `///` on declarations,
+no inline notes. They were all removed deliberately; do not reintroduce them, and do not
+add one to explain a change you are making.
+
+That leaves three places for a "why", and something has to go in one of them or it is lost:
+the commit message, this file's **Traps** section (for anything that would bite the next
+person editing the file), or README (for anything a *user* of `lcc` would want). Reach for
+`git log -p` and `git blame` when a line looks arbitrary — that is now the rationale record.
+
+Test names carry the rest. A `test "…"` string is the one place left where a constraint is
+stated in words, so make it a sentence about the behaviour and not a label for the
+function: `test "a turn that went silent asks for a person, rather than claiming it
+finished"` survives the loss of its comment; `test "decay"` would not.
 
 Default branch is `master`. Branch prefixes: `feature/`, `fix/`, `docs/`, `chore/`.

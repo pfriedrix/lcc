@@ -1,28 +1,14 @@
-//! Raw-mode terminal prompts — the `@inquirer/prompts` replacement.
-//!
-//! Covers the four widgets lcc uses: `search`, `confirm`, `checkbox`, `input`.
-//! Cancelling (Ctrl-C or Esc) returns null; callers exit 130, as the
-//! TypeScript version did on inquirer's ExitPromptError.
-
 const std = @import("std");
 const Io = std.Io;
 const fold = @import("fold.zig");
 const term_mod = @import("term.zig");
 const ui = @import("ui.zig");
 
-/// Named here as well as in `term.zig` because it is what `main.zig`'s
-/// `describe` maps and what every caller catches. The terminal mechanics moved;
-/// the error a caller sees did not.
 pub const Error = term_mod.Error || std.mem.Allocator.Error;
 
 pub const Item = struct {
-    /// Rendered as-is. Must be plain text: the prompt pads and truncates it,
-    /// which ANSI escapes would throw off.
     label: []const u8,
-    /// Matched against the query in `search`. Ignored by the other widgets.
     haystack: []const u8 = "",
-    /// Shown dimmed beneath the list while this row is highlighted, the way
-    /// inquirer's `search` renders a choice description.
     description: []const u8 = "",
 };
 
@@ -31,18 +17,11 @@ const Terminal = term_mod.Terminal;
 const readKey = term_mod.readKey;
 const truncate = term_mod.truncate;
 
-/// How many rows of choices a picker shows. Stays here rather than moving to
-/// `term.zig` with the rest: `rows - 4` is this widget's chrome budget — the
-/// prompt line, the description and the footer — not a fact about the terminal.
 fn pageSize(term: Terminal) usize {
     const rows = term.size().rows;
     return @max(@as(usize, 5), @min(@as(usize, 30), rows -| 4));
 }
 
-/// Every whitespace-separated token must appear, as in the TypeScript version.
-/// The score then orders the survivors: a token landing at the very start of
-/// the haystack (the issue identifier) outranks one starting a word, which
-/// outranks one buried mid-word.
 fn score(haystack: []const u8, query: []const u8) ?i32 {
     var total: i32 = 0;
     var tokens = std.mem.tokenizeAny(u8, query, " \t");
@@ -58,7 +37,6 @@ fn score(haystack: []const u8, query: []const u8) ?i32 {
     return total;
 }
 
-/// True when the byte before `at` is a separator rather than part of a word.
 fn startsWord(haystack: []const u8, at: usize) bool {
     if (at == 0) return true;
     return switch (haystack[at - 1]) {
@@ -71,8 +49,6 @@ const Ranked = struct {
     index: usize,
     score: i32,
 
-    /// Best score first; ties keep the order the caller supplied, which is the
-    /// state-then-recency ordering the issue list arrives in.
     fn better(_: void, a: Ranked, b: Ranked) bool {
         if (a.score != b.score) return a.score > b.score;
         return a.index < b.index;
@@ -80,14 +56,10 @@ const Ranked = struct {
 };
 
 test "a confirmation answers to the key, not to the letter it printed" {
-    // `lcc remove` gates a deletion behind this. On a Ukrainian layout `y` and
-    // `n` print `н` and `т`, so reading the character left no way to answer at
-    // all — not yes, not no.
     try std.testing.expectEqual(@as(u8, 'y'), term_mod.layoutKey(firstCodepoint("н")).?);
     try std.testing.expectEqual(@as(u8, 'n'), term_mod.layoutKey(firstCodepoint("т")).?);
     try std.testing.expectEqual(@as(u8, 'y'), term_mod.layoutKey(firstCodepoint("y")).?);
     try std.testing.expectEqual(@as(u8, 'n'), term_mod.layoutKey(firstCodepoint("N")).?);
-    // And something that is neither is still neither.
     try std.testing.expect(term_mod.layoutKey(firstCodepoint("ю")) != 'y');
 }
 
@@ -95,7 +67,6 @@ test "every token must match" {
     const hay = "PE-247 Fix EXC_BAD_ACCESS data race feature/pe-247 Todo";
     try std.testing.expect(score(hay, "fix race") != null);
     try std.testing.expect(score(hay, "fix nonsense") == null);
-    // An empty query keeps everything, at a neutral score.
     try std.testing.expectEqual(@as(?i32, 0), score(hay, ""));
 }
 
@@ -111,11 +82,8 @@ test "identifier beats word start beats mid-word" {
     const word_start = "PE-100 Something pe-ish here";
     const mid_word = "PE-100 Nope typewriter";
 
-    // Leading match on the identifier.
     try std.testing.expectEqual(@as(?i32, 100), score(identifier, "PE-247"));
-    // "pe-ish" starts a word.
     try std.testing.expectEqual(@as(?i32, 50), score(word_start, "pe-i"));
-    // "pe" inside "typewriter" is buried.
     try std.testing.expectEqual(@as(?i32, 10), score(mid_word, "pew"));
 }
 
@@ -129,12 +97,10 @@ test "ranking puts the identifier match first and is stable otherwise" {
     std.mem.sort(Ranked, &items, {}, Ranked.better);
     try std.testing.expectEqual(@as(usize, 1), items[0].index);
     try std.testing.expectEqual(@as(usize, 3), items[1].index);
-    // Equal scores keep their original relative order.
     try std.testing.expectEqual(@as(usize, 0), items[2].index);
     try std.testing.expectEqual(@as(usize, 2), items[3].index);
 }
 
-/// Drops one whole codepoint from the end of a growable buffer.
 fn popCodepoint(buf: *std.ArrayList(u8)) void {
     if (buf.items.len == 0) return;
     var i = buf.items.len - 1;
@@ -279,7 +245,6 @@ pub fn search(
     }
 }
 
-/// `message` may span several lines; the y/n hint goes after the last one.
 pub fn confirm(
     gpa: std.mem.Allocator,
     io: Io,
@@ -304,8 +269,6 @@ pub fn confirm(
 
     const hint = if (default_yes) "(Y/n)" else "(y/N)";
     var key_buf: [8]u8 = undefined;
-    // Typed, then submitted with Enter — the same two-step inquirer's confirm
-    // uses, so muscle memory of "y⏎" does not leak a stray newline.
     var typed: std.ArrayList(u8) = .empty;
 
     while (true) {
@@ -336,12 +299,8 @@ pub fn confirm(
                 if (typed.items.len == 0) {
                     answer = default_yes;
                 } else switch (term_mod.layoutKey(firstCodepoint(typed.items)) orelse 0) {
-                    // By key position: `y` and `n` print `н` and `т` on a
-                    // Cyrillic layout, which left no way at all to answer the
-                    // confirmation `lcc remove` puts in front of a deletion.
                     'y' => answer = true,
                     'n' => answer = false,
-                    // Anything else is not an answer: clear and ask again.
                     else => typed.clearRetainingCapacity(),
                 }
             },
@@ -353,8 +312,8 @@ pub fn confirm(
         if (answer) |value| {
             screen.eraseFrame();
             out.print("{s}✓{s} {s} {s}{s}{s}\n", .{
-                p.green,                          p.reset, firstLine(message),
-                p.cyan, if (value) "yes" else "no", p.reset,
+                p.green, p.reset,                    firstLine(message),
+                p.cyan,  if (value) "yes" else "no", p.reset,
             }) catch {};
             out.flush() catch {};
             return value;
@@ -362,8 +321,6 @@ pub fn confirm(
     }
 }
 
-/// The first whole codepoint, so a two-byte Cyrillic letter is matched as one
-/// character rather than by its leading byte.
 fn firstCodepoint(text: []const u8) []const u8 {
     if (text.len == 0) return text;
     const len = std.unicode.utf8ByteSequenceLength(text[0]) catch 1;
@@ -375,7 +332,6 @@ fn firstLine(message: []const u8) []const u8 {
     return message[0..nl];
 }
 
-/// Multi-select. Returns the indices that were checked when Enter was pressed.
 pub fn checkbox(
     gpa: std.mem.Allocator,
     io: Io,
@@ -474,7 +430,6 @@ pub fn checkbox(
     }
 }
 
-/// Single-line text entry. Enter on an untouched field keeps `default_value`.
 pub fn input(
     gpa: std.mem.Allocator,
     io: Io,
@@ -498,7 +453,6 @@ pub fn input(
     while (true) {
         const width: usize = @max(@as(usize, 20), term.size().cols);
 
-        // Single line — clearing and redrawing in place needs no line counting.
         out.writeAll("\r" ++ csi ++ "2K") catch {};
         if (touched) {
             const shown = truncate(value.items, width -| (ui.displayWidth(message) + 4));
@@ -525,8 +479,6 @@ pub fn input(
             },
             .backspace => {
                 if (!touched) {
-                    // First edit starts from an empty field, like inquirer's
-                    // default handling.
                     touched = true;
                     value.clearRetainingCapacity();
                 } else {

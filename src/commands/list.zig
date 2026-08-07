@@ -1,21 +1,3 @@
-//! `lcc list` — a dashboard of the worktrees in the current repo. Working-tree
-//! state, drift from the upstream, and how the work is tracked, in one screen.
-//!
-//! Everything local comes from two git calls plus one `git status` per worktree.
-//! The PR and Linear columns are one batched request each, and both degrade to a
-//! dash when they cannot be answered — an unauthenticated shell still gets the
-//! rest of the table.
-//!
-//! None of that work depends on any of the rest of it, so none of it waits: the
-//! two hosts, the `git status` calls and the transcript scan all go out at once
-//! and the table is assembled from whatever comes back. Done in sequence the
-//! network alone was most of the command's runtime, and the slower of the two
-//! round trips is now the whole of it.
-//!
-//! What that still cannot fix is that a round trip is half a second no matter
-//! how little is being asked. So the two answers are cached for a few minutes —
-//! see `remote_cache` — and `--refresh` is how you say you want them asked again.
-
 const std = @import("std");
 const Io = std.Io;
 const app_mod = @import("../app.zig");
@@ -31,15 +13,8 @@ const ui = @import("../ui.zig");
 const usage = @import("../usage.zig");
 
 pub const Opts = struct {
-    /// Skip the two network columns.
     local: bool = false,
-    /// Show what each worktree has spent on Claude Code. On by default: the
-    /// question "how much has this task cost" comes up every time the dashboard
-    /// does. Off is for when reading the transcripts is not worth the wait.
     tokens: bool = true,
-    /// Ask GitHub and Linear again instead of reusing a recent answer. For the
-    /// moment right after merging a PR, when the cached state is the one thing
-    /// you know to be wrong.
     refresh: bool = false,
 };
 
@@ -51,11 +26,8 @@ const Row = struct {
     tree: Tree,
     status: []const u8,
     sync: []const u8,
-    /// True once the remote branch the worktree tracked has been deleted.
     remote_gone: bool,
     age: []const u8,
-    /// Context tokens this worktree's Claude Code sessions have read, or a dash
-    /// when it has none and when the column is off.
     tokens: []const u8,
     pr: []const u8,
     pr_state: ?github.State,
@@ -73,16 +45,10 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
 
     const now = app_mod.nowSeconds(app.io);
 
-    // Both remote columns are asked per branch, so both need the list of them —
-    // and that list is also what says whether a cached answer covered this set of
-    // worktrees. Only the branches that name an issue go to Linear.
     const branches = try branchNames(app, choices);
     const refs = try issueRefs(app, choices);
     const asked = try identifiers(app, refs);
 
-    // The cache is read here, before anything is spawned, and written after
-    // everything has been joined. A task never touches it, so there is nothing
-    // for two of them to race over.
     var cache: rc.Cache = if (opts.local)
         .none(app.gpa, app.io)
     else
@@ -107,9 +73,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     const spend = try app.gpa.alloc([]const u8, choices.len);
     @memset(spend, "—");
 
-    // Everything slow, at once. `git status` walks each worktree, the two columns
-    // wait on two different hosts, and the token scan reads `~/.claude` — four
-    // kinds of waiting with nothing to say to each other.
     {
         var group: Io.Group = .init;
         group.async(app.io, branchStatusTask, .{ repo, &statuses });
@@ -145,8 +108,6 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     }
 }
 
-/// The branch of every worktree on screen. A detached one contributes nothing:
-/// there is no head ref to match a pull request against.
 fn branchNames(app: app_mod.App, choices: []const app_mod.Choice) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for (choices) |choice| {
@@ -158,9 +119,6 @@ fn branchNames(app: app_mod.App, choices: []const app_mod.Choice) ![]const []con
     return out.toOwnedSlice(app.gpa);
 }
 
-/// The issues the worktrees on screen belong to, in the order the branches give
-/// them. Duplicates are left in: `fetchIssueStatuses` folds them itself, and
-/// `identifiers` is what the cache is keyed on.
 fn issueRefs(app: app_mod.App, choices: []const app_mod.Choice) ![]const linear.Ref {
     var refs: std.ArrayList(linear.Ref) = .empty;
     for (choices) |choice| {
@@ -171,8 +129,6 @@ fn issueRefs(app: app_mod.App, choices: []const app_mod.Choice) ![]const linear.
     return refs.toOwnedSlice(app.gpa);
 }
 
-/// `PE-224` for each distinct ref, uppercased the way Linear stores keys and
-/// sorted, so the same set of worktrees always produces the same list.
 fn identifiers(app: app_mod.App, refs: []const linear.Ref) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for (refs) |ref| {
@@ -191,13 +147,10 @@ fn lessThan(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.lessThan(u8, a, b);
 }
 
-/// One column's worth of pull requests, and why it is missing when it is.
 const PrColumn = struct {
     list: []const github.PullRequest = &.{},
     note: ?[]const u8 = null,
-    /// How old the cached answer is, when that is where these came from.
     cached_age: ?i64 = null,
-    /// Came off the network this run, so it is worth storing.
     fetched: bool = false,
 };
 
@@ -208,11 +161,7 @@ const IssueColumn = struct {
     fetched: bool = false,
 };
 
-/// The tasks below run on the thread pool, which is why none of them return an
-/// error and none of them touch `app.ui`: a column that cannot be answered
-/// reports that in its own result, and the caller decides what to print.
 fn branchStatusTask(repo: git.Repo, out: *[]const git.BranchStatus) void {
-    // One call for every branch's upstream, drift and tip date.
     out.* = repo.branchStatuses() catch &.{};
 }
 
@@ -220,9 +169,6 @@ fn dirtyTask(repo: git.Repo, worktree_path: []const u8, out: *?u32) void {
     out.* = repo.dirtyCount(worktree_path);
 }
 
-/// The TOKENS cell for each worktree, in the order given. Reading transcripts is
-/// the one part of this dashboard that scales with how much Claude Code has been
-/// used rather than with the size of the repo, so `--no-tokens` turns it off.
 fn tokenTask(app: app_mod.App, choices: []const app_mod.Choice, cells: [][]const u8) void {
     const cp_root = cp.root(app.gpa, app.environ) catch return;
     const projects = cp.list(app.gpa, app.io, cp_root) catch return;
@@ -270,8 +216,6 @@ fn issueTask(app: app_mod.App, refs: []const linear.Ref, out: *IssueColumn) void
     out.fetched = true;
 }
 
-/// Says which columns were answered from the cache and how stale they are. A
-/// cache nobody can see is a cache that gets blamed for showing the wrong thing.
 fn cacheNote(gpa: std.mem.Allocator, prs: PrColumn, issues: IssueColumn) !?[]const u8 {
     const which: []const u8 = if (prs.cached_age != null and issues.cached_age != null)
         "PR and LINEAR"
@@ -282,10 +226,7 @@ fn cacheNote(gpa: std.mem.Allocator, prs: PrColumn, issues: IssueColumn) !?[]con
     else
         return null;
 
-    // The older of the two is the honest number to show for both.
     const age = @max(prs.cached_age orelse 0, issues.cached_age orelse 0);
-    // `ui.age` renders anything under a minute as "now", which does not take an
-    // "ago" — and inside a five-minute TTL that is the common case.
     const when: []const u8 = if (age < 60)
         "just now"
     else
@@ -362,7 +303,6 @@ fn buildRow(
         .sync = sync,
         .remote_gone = remote_gone,
         .age = age,
-        // Filled in by the caller — the token scan is one pass for every row.
         .tokens = "—",
         .pr = pr,
         .pr_state = pr_state,
@@ -472,8 +412,6 @@ fn paintStatus(row: Row, text: []const u8) ui.Painted {
     };
 }
 
-/// Drift is context, not a verdict — only a deleted upstream is worth an alarm,
-/// because it means the branch has nowhere left to push.
 fn paintSync(row: Row, text: []const u8) ui.Painted {
     return if (row.remote_gone) ui.yellow(text) else ui.dim(text);
 }
@@ -487,8 +425,6 @@ fn paintPr(row: Row, text: []const u8) ui.Painted {
     };
 }
 
-/// `ui.pad` renders lazily, which colour wrapping cannot use — the escape has to
-/// go around text of a known length.
 fn pad(gpa: std.mem.Allocator, text: []const u8, width: usize) ![]const u8 {
     return std.fmt.allocPrint(gpa, "{f}", .{ui.pad(text, width)});
 }
@@ -500,12 +436,10 @@ test "cacheNote names only the columns that came from the cache" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Nothing cached — nothing to say.
     try std.testing.expect(try cacheNote(arena, .{}, .{}) == null);
 
     const both = (try cacheNote(arena, .{ .cached_age = 120 }, .{ .cached_age = 200 })).?;
     try std.testing.expect(std.mem.startsWith(u8, both, "PR and LINEAR from cache"));
-    // The older of the two is what gets shown, not whichever was checked first.
     try std.testing.expect(std.mem.indexOf(u8, both, "3m ago") != null);
 
     const pr_only = (try cacheNote(arena, .{ .cached_age = 90 }, .{})).?;
@@ -515,8 +449,6 @@ test "cacheNote names only the columns that came from the cache" {
     const issue_only = (try cacheNote(arena, .{}, .{ .cached_age = 90 })).?;
     try std.testing.expect(std.mem.startsWith(u8, issue_only, "LINEAR from cache"));
 
-    // Under a minute reads as "just now": `ui.age` says "now", which cannot take
-    // an "ago" after it.
     const fresh = (try cacheNote(arena, .{ .cached_age = 3 }, .{ .cached_age = 3 })).?;
     try std.testing.expect(std.mem.indexOf(u8, fresh, "asked just now") != null);
     try std.testing.expect(std.mem.indexOf(u8, fresh, "now ago") == null);
@@ -536,8 +468,6 @@ test "identifiers dedupes, uppercases and sorts what Linear will be asked" {
         .ui = undefined,
     };
 
-    // Two worktrees on the same issue ask about it once, and a branch carrying
-    // the key lowercased must land on the same identifier as one that does not.
     const refs = [_]linear.Ref{
         .{ .team = "pe", .number = 270 },
         .{ .team = "PE", .number = 7 },
@@ -578,19 +508,16 @@ test "measure sizes every column to its widest cell, header included" {
     const full = measure(&rows, .{});
     try std.testing.expectEqual(@as(usize, "feature/pe-256-app-hangs".len), full.branch);
     try std.testing.expectEqual(@as(usize, "3 dirty".len), full.status);
-    // Codepoints, not bytes: the arrows are multi-byte.
     try std.testing.expectEqual(@as(usize, 5), full.sync);
     try std.testing.expectEqual(@as(usize, "AGE".len), full.age);
     try std.testing.expectEqual(@as(usize, "#412 open".len), full.pr);
     try std.testing.expectEqual(@as(usize, "In Progress".len), full.issue);
     try std.testing.expectEqual(@as(usize, "TOKENS".len), full.tokens);
 
-    // --local drops the two network columns entirely.
     const local = measure(&rows, .{ .local = true });
     try std.testing.expectEqual(@as(usize, 0), local.pr);
     try std.testing.expectEqual(@as(usize, 0), local.issue);
 
-    // --no-tokens drops its column, and nothing else moves.
     const quiet = measure(&rows, .{ .tokens = false });
     try std.testing.expectEqual(@as(usize, 0), quiet.tokens);
     try std.testing.expectEqual(full.branch, quiet.branch);

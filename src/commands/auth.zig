@@ -1,5 +1,3 @@
-//! `lcc auth` — OAuth browser flow, status, logout, and the PAT fallback.
-
 const std = @import("std");
 const app_mod = @import("../app.zig");
 const config = @import("../config.zig");
@@ -48,7 +46,6 @@ fn login(app: app_mod.App) !void {
     app.ui.hint("If the browser doesn't open, visit:\n  {s}", .{url});
     app.ui.flush();
 
-    // Non-fatal: the user can still use the printed URL.
     _ = exec.run(app.gpa, app.io, &.{ "open", url }, null) catch null;
 
     const callback = oauth.awaitCallback(app.gpa, app.io, state) catch |err| {
@@ -144,8 +141,6 @@ const c = @cImport({
     @cInclude("time.h");
 });
 
-/// Local wall-clock time. libc does the timezone work that `toLocaleString()`
-/// did in Node; the layout is ISO-ish rather than locale-specific.
 fn formatTime(gpa: std.mem.Allocator, unix_seconds: i64) ![]u8 {
     var t: c.time_t = @intCast(unix_seconds);
     var tm: c.struct_tm = undefined;
