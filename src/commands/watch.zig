@@ -9,6 +9,8 @@ const watch_client = @import("../watch_client.zig");
 const term = @import("../term.zig");
 const watch_attach = @import("../watch_attach.zig");
 const watch_hooks = @import("../watch_hooks.zig");
+const watch_state = @import("../watch_state.zig");
+const disk = @import("../disk.zig");
 const claude = @import("../claude.zig");
 const claude_projects = @import("../claude_projects.zig");
 const linear = @import("../linear.zig");
@@ -379,21 +381,20 @@ fn collect(app: app_mod.App, arena: std.mem.Allocator, now: i64) ![]watch_table.
         live = carried;
     }
 
+    var states: ?[]const watch_state.Record = null;
+
     if (app.repo()) |repo| {
         for (try app_mod.worktreeChoices(app, repo)) |choice| {
             const branch = choice.entry.branch orelse app_mod.shortHead(choice.entry.head);
             const match = findSession(live, choice.entry.path);
-            try rows.append(arena, .{
-                .key = choice.entry.path,
-                .session_id = if (match) |m| m.id else null,
-                .status = if (match) |m| m.parsedStatus() else null,
-                .issue = if (match) |m| m.issue else issueOf(arena, branch),
-                .branch = branch,
-                .worktree = choice.entry.path,
-                .last_activity_at = if (match) |m| m.last_activity_at else 0,
-                .exit_code = if (match) |m| m.exit_code else null,
-                .stale = stale and match != null,
-            });
+            const recovered: ?watch_state.Resolved = if (match != null) null else recover: {
+                if (states == null) states = watch_state.load(arena, app.io, app.environ);
+                break :recover watch_state.statusFor(
+                    states.?,
+                    disk.realPath(arena, app.io, choice.entry.path),
+                );
+            };
+            try rows.append(arena, rowFor(arena, choice.entry.path, branch, match, recovered, stale));
         }
     } else |_| {}
 
@@ -417,6 +418,32 @@ fn collect(app: app_mod.App, arena: std.mem.Allocator, now: i64) ![]watch_table.
     }
 
     return rows.toOwnedSlice(arena);
+}
+
+pub fn rowFor(
+    arena: std.mem.Allocator,
+    path: []const u8,
+    branch: []const u8,
+    match: ?sessions.Session,
+    recovered: ?watch_state.Resolved,
+    stale: bool,
+) watch_table.Row {
+    return .{
+        .key = path,
+        .session_id = if (match) |m| m.id else null,
+        .status = if (match) |m| m.parsedStatus() else if (recovered) |r| r.status else null,
+        .issue = if (match) |m| m.issue else issueOf(arena, branch),
+        .branch = branch,
+        .worktree = path,
+        .last_activity_at = if (match) |m|
+            m.last_activity_at
+        else if (recovered) |r|
+            r.last_activity_at
+        else
+            0,
+        .exit_code = if (match) |m| m.exit_code else null,
+        .stale = stale and match != null,
+    };
 }
 
 pub fn findSession(list: []const sessions.Session, worktree: []const u8) ?sessions.Session {
@@ -498,6 +525,8 @@ pub fn hook(app: app_mod.App, opts: HookOpts) !void {
     const payload = watch_hooks.parsePayload(app.gpa, raw) orelse return;
     if (payload.cwd.len == 0) return;
 
+    recordState(app, opts, payload, event);
+
     watch_client.report(
         app,
         opts.socket,
@@ -507,6 +536,27 @@ pub fn hook(app: app_mod.App, opts: HookOpts) !void {
         payload.permission_mode,
         opts.session orelse "",
     );
+}
+
+fn recordState(
+    app: app_mod.App,
+    opts: HookOpts,
+    payload: watch_hooks.Payload,
+    event: []const u8,
+) void {
+    const parsed = watch_hooks.Event.parse(event) orelse return;
+    if (parsed == .ended) {
+        watch_state.clear(app.gpa, app.io, app.environ, payload.session_id);
+        return;
+    }
+    watch_state.write(app.gpa, app.io, app.environ, .{
+        .event = event,
+        .cwd = payload.cwd,
+        .claude_session = payload.session_id,
+        .lcc_session = opts.session orelse "",
+        .permission_mode = payload.permission_mode,
+        .at = app_mod.nowSeconds(app.io),
+    });
 }
 
 test "the --json keys name sessions, never the process behind them" {
@@ -530,6 +580,75 @@ test "an empty snapshot still carries both flags, rather than dropping them" {
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"sessions_live\": false") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"outdated_build\": false") != null);
+}
+
+test "a worktree the daemon lost still wears the status its hooks last reported" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const row = rowFor(
+        arena,
+        "/w/pe-290",
+        "feature/pe-290-relocate-chat-thread-state",
+        null,
+        .{ .status = .waiting, .last_activity_at = 1700 },
+        false,
+    );
+
+    if (row.status == null) {
+        std.debug.print(
+            "the row came back with no status even though a hook report for that worktree " ++
+                "was on disk: every worktree the daemon outlived reads `no session`, which " ++
+                "is the whole failure this recovers from.\n",
+            .{},
+        );
+        return error.TestExpectedEqual;
+    }
+    try std.testing.expectEqual(sessions.Status.waiting, row.status.?);
+    try std.testing.expectEqual(@as(i64, 1700), row.last_activity_at);
+
+    try std.testing.expect(row.session_id == null);
+    try std.testing.expect(!row.attachable());
+
+    try std.testing.expectEqualStrings("PE-290", row.issue.?);
+}
+
+test "a live session outranks anything left on disk for the same worktree" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const live: sessions.Session = .{
+        .id = "s-00000004",
+        .worktree = "/w/pe-290",
+        .branch = "feature/pe-290",
+        .issue = "PE-290",
+        .status = "active",
+        .last_activity_at = 9000,
+    };
+
+    const row = rowFor(arena, "/w/pe-290", "feature/pe-290", live, null, false);
+    try std.testing.expectEqual(sessions.Status.active, row.status.?);
+    try std.testing.expectEqualStrings("s-00000004", row.session_id.?);
+    try std.testing.expectEqual(@as(i64, 9000), row.last_activity_at);
+    try std.testing.expect(row.attachable());
+}
+
+test "a worktree with neither a session nor a report still reads as having none" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const row = rowFor(arena, "/w/quiet", "feature/pe-9-unrelated", null, null, true);
+    try std.testing.expect(row.status == null);
+    try std.testing.expect(row.session_id == null);
+    try std.testing.expectEqual(@as(i64, 0), row.last_activity_at);
+
+    try std.testing.expect(!row.stale);
 }
 
 test "a worktree row shows the session that is alive, not the first one recorded" {

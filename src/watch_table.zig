@@ -368,6 +368,34 @@ test "a row is attachable only when something is actually behind it" {
     try testing.expect(!row.attachable());
 }
 
+test "a status recovered from disk is read, but never offered as a session to attach to" {
+    for ([_]sessions.Status{ .waiting, .idle, .plan }) |status| {
+        const row: Row = .{
+            .key = "/w",
+            .session_id = null,
+            .status = status,
+            .issue = "PE-290",
+            .branch = "feature/pe-290",
+            .worktree = "/w",
+            .last_activity_at = 900,
+            .exit_code = null,
+            .stale = false,
+        };
+
+        try testing.expectEqualStrings(@tagName(status), statusText(row.status));
+
+        if (row.attachable()) {
+            std.debug.print(
+                "a {s} row rebuilt from a hook report offers itself for attach, but the daemon " ++
+                    "that owned that pty is gone: enter would ask for a session id nothing " ++
+                    "holds and come back unknown_session instead of starting the work again.\n",
+                .{@tagName(status)},
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 test "a planning row says plan, not active" {
     var buf: [4096]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);

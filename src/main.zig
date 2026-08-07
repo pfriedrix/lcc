@@ -575,6 +575,7 @@ test {
     _ = @import("watch_hooks.zig");
     _ = @import("watch_paths.zig");
     _ = @import("watch_session.zig");
+    _ = @import("watch_state.zig");
     _ = @import("watch_status.zig");
     _ = @import("watch_table.zig");
     _ = @import("wire.zig");

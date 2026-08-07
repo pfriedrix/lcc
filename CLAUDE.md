@@ -80,7 +80,9 @@ Conventions inside a test:
   `readMutation`, `unwrap` in `src/linear.zig`) — no requests, no Keychain reads.
 - Never let a test touch real state under `$HOME`. Build a `std.process.Environ.Map` and set
   the override the module reads: `LCC_REPOS`, `LCC_USAGE_CACHE`, `LCC_REMOTE_CACHE`,
-  `LCC_CLAUDE_PROJECTS`, `LCC_CLAUDE_JSON`, `LCC_DERIVED_DATA`.
+  `LCC_CLAUDE_PROJECTS`, `LCC_CLAUDE_JSON`, `LCC_DERIVED_DATA`, `LCC_SESSIONS`,
+  `LCC_WATCH_DIR`. The last one moves the socket, the lock, the hook settings and the
+  recovered-status files together, so it is the one the daemon and `watch_state` tests need.
 - Failure messages carry what a wrong answer costs, not just the mismatch. `start_plan_test.zig`
   is the reference for that shape.
 
@@ -116,6 +118,21 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
 - **`src/keychain.zig` imports five narrow C headers on purpose.** The umbrella
   `CoreFoundation.h` / `Security.h` do not translate on this SDK. Do not tidy them into one
   import.
+- **A hook event that reports no `permission_mode` must not clear the one already known.**
+  Only some events carry it — `Notification` does not (see the test in `watch_hooks.zig`).
+  `watch_session.setPlan` is guarded on `permission_mode.len > 0` for that reason, and
+  `watch_state.write` merges the previous record's mode in for the same one. Drop either
+  guard and it still compiles, still passes anything that only replays `PreToolUse`, and
+  quietly takes a session out of `◈ plan` the first time the agent asks for a permission —
+  so `plan` only ever survives until the next prompt, which reads as the mode being flaky
+  rather than as a bug.
+- **`watch_state` recovers a status, never a session.** The rows it feeds `collect` keep
+  `session_id = null` on purpose: that is the only thing making `watch_table.Row.attachable`
+  return `false`, so enter starts the work again instead of asking the daemon for a pty that
+  died with the previous one. Filling the id in from the record's `lcc_session` looks like an
+  improvement and turns every recovered row into an `unknown_session` error. The ids collide
+  across daemons anyway — `next_id` restarts at 1 — which is also why the state file is named
+  for Claude Code's session UUID rather than for either the lcc id or the worktree path.
 - **A session's hook settings file is per session, not per daemon.** `watch_paths.hooksFor`
   names it `hooks-<session id>.json` and `watch_hooks.settingsJson` bakes that id into every
   hook command line, so a report says which session it came from. Collapsing them back into
