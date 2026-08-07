@@ -170,7 +170,6 @@ const Loop = struct {
     app: app_mod.App,
     opts: Options,
     bound: *Bound,
-    hooks_path: []const u8,
     list: std.ArrayList(watch_session.Session) = .empty,
     clients: std.ArrayList(Client) = .empty,
     wake_r: std.posix.fd_t,
@@ -192,10 +191,21 @@ const Loop = struct {
     }
 
     fn findByWorktree(self: *Loop, cwd: []const u8) ?*watch_session.Session {
+        var fallback: ?*watch_session.Session = null;
         for (self.list.items) |*s| {
-            if (std.mem.eql(u8, s.worktree, cwd)) return s;
+            if (!std.mem.eql(u8, s.worktree, cwd)) continue;
+            if (s.status != .exited) return s;
+            if (fallback == null) fallback = s;
         }
-        return null;
+        return fallback;
+    }
+
+    fn route(self: *Loop, session: []const u8, cwd: []const u8) ?*watch_session.Session {
+        if (session.len > 0) {
+            if (self.find(session)) |s| return s;
+            return null;
+        }
+        return self.findByWorktree(cwd);
     }
 
     fn send(self: *Loop, client: *Client, t: wire.Type, payload: []const u8) void {
@@ -281,18 +291,17 @@ pub fn run(app: app_mod.App, opts: Options) !void {
         .app = app,
         .opts = opts,
         .bound = &bound,
-        .hooks_path = try writeHookSettings(app),
         .wake_r = wake[0],
         .started_at = app_mod.nowSeconds(app.io),
     };
     try serve(&loop);
 }
 
-fn writeHookSettings(app: app_mod.App) ![]const u8 {
+fn writeHookSettings(app: app_mod.App, session_id: []const u8) ![]const u8 {
     const exe = try exec.selfPath(app.gpa, app.io);
     const socket_path = try watch_paths.socket(app.gpa, app.environ);
-    const body = try watch_hooks.settingsJson(app.gpa, exe, socket_path);
-    const path = try watch_paths.hooks(app.gpa, app.environ);
+    const body = try watch_hooks.settingsJson(app.gpa, exe, socket_path, session_id);
+    const path = try watch_paths.hooksFor(app.gpa, app.environ, session_id);
     try Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = body });
     return path;
 }
@@ -483,7 +492,7 @@ fn handleFrame(loop: *Loop, client: *Client, frame: wire.Frame, at: i64) void {
         .hook => {
             const body = wire.parse(wire.Hook, gpa, frame) catch return;
             const event = watch_hooks.Event.parse(body.event) orelse return;
-            const session = loop.findByWorktree(body.cwd) orelse return;
+            const session = loop.route(body.session, body.cwd) orelse return;
             if (session.note(event, body.permission_mode, at)) loop.dirty = true;
         },
         .attach => attachClient(loop, client, frame),
@@ -515,8 +524,13 @@ fn registerSession(loop: *Loop, client: *Client, frame: wire.Frame, at: i64) voi
     const id = std.fmt.allocPrint(gpa, "s-{x:0>8}", .{loop.next_id}) catch return;
     loop.next_id += 1;
 
+    const hooks_path = writeHookSettings(loop.app, id) catch {
+        loop.fail(client, "hooks_unwritable", "Could not write the session's hook settings.");
+        return;
+    };
+
     var argv: std.ArrayList([]const u8) = .empty;
-    argv.appendSlice(gpa, &.{ "--settings", loop.hooks_path }) catch return;
+    argv.appendSlice(gpa, &.{ "--settings", hooks_path }) catch return;
     argv.appendSlice(gpa, body.argv) catch return;
 
     const session = watch_session.Session.start(gpa, .{
@@ -1160,17 +1174,136 @@ test "a hook reports to the socket it was handed, not to the one its environment
         }
     }.get;
 
-    watch_client.report(hook_app, null, base, "s", "waiting", "");
+    watch_client.report(hook_app, null, base, "s", "waiting", "", "");
     io.sleep(.fromMilliseconds(300), .awake) catch {};
     try testing.expectEqualStrings("starting", try statusNow(&conn, arena, &b));
 
-    watch_client.report(hook_app, socket_path, base, "s", "waiting", "");
+    watch_client.report(hook_app, socket_path, base, "s", "waiting", "", "");
     var waited: i32 = 5_000;
     while (waited > 0) : (waited -= 100) {
         if (std.mem.eql(u8, try statusNow(&conn, arena, &b), "waiting")) break;
         io.sleep(.fromMilliseconds(100), .awake) catch {};
     }
     try testing.expect(waited > 0);
+}
+
+test "two sessions in one worktree each get their own status" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("LCC_WATCH_DIR", base);
+    const socket_path = watch_paths.socket(arena, &environ) catch |err| switch (err) {
+        error.SocketPathTooLong => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var daemon_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer daemon_arena.deinit();
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_w: Io.Writer = .fixed(&out_buf);
+    var err_w: Io.Writer = .fixed(&err_buf);
+    const daemon_app: app_mod.App = .{
+        .gpa = daemon_arena.allocator(),
+        .io = io,
+        .environ = &environ,
+        .ui = .{ .io = io, .out = &out_w, .err = &err_w },
+    };
+
+    const thread = try std.Thread.spawn(.{}, runForTest, .{ daemon_app, Options{
+        .foreground = true,
+        .idle_exit_seconds = 3600,
+    } });
+    defer thread.join();
+
+    var budget: i32 = 15_000;
+    while (budget > 0) : (budget -= 50) {
+        if (Io.Dir.cwd().statFile(io, socket_path, .{})) |_| break else |_| {}
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+
+    var conn = try TestConn.open(arena, io, socket_path);
+    defer conn.close();
+    var b: i32 = 15_000;
+    try conn.hello(arena, &b);
+    defer conn.send(arena, .stop, wire.Stop{ .force = true }) catch {};
+
+    const register = struct {
+        fn go(c: *TestConn, a: std.mem.Allocator, i: Io, root: []const u8, budget_ms: *i32) ![]const u8 {
+            try c.send(a, .register, wire.Register{
+                .worktree = root,
+                .branch = "feature/pe-289-two-in-one-worktree",
+                .issue = "PE-289",
+                .repo_root = root,
+                .program = try standIn(a, i, root, stand_in_cat),
+                .argv = &.{},
+                .env = &.{"TERM=dumb"},
+                .cols = 80,
+                .rows = 24,
+            });
+            const registered = try wire.parse(wire.Registered, a, try c.recv(.registered, budget_ms));
+            return registered.session_id;
+        }
+    }.go;
+
+    const first = try register(&conn, arena, io, base, &b);
+    const second = try register(&conn, arena, io, base, &b);
+    try testing.expect(!std.mem.eql(u8, first, second));
+
+    const statusOf = struct {
+        fn get(c: *TestConn, a: std.mem.Allocator, id: []const u8, budget_ms: *i32) ![]const u8 {
+            try c.send(a, .list, .{});
+            const view = try wire.parse(wire.Snapshot, a, try c.recv(.snapshot, budget_ms));
+            for (view.sessions) |s| {
+                if (std.mem.eql(u8, s.id, id)) return s.status;
+            }
+            return "<none>";
+        }
+    }.get;
+
+    var hook_out: Io.Writer = .fixed(&out_buf);
+    var hook_err: Io.Writer = .fixed(&err_buf);
+    const hook_app: app_mod.App = .{
+        .gpa = arena,
+        .io = io,
+        .environ = &environ,
+        .ui = .{ .io = io, .out = &hook_out, .err = &hook_err },
+    };
+
+    watch_client.report(hook_app, socket_path, base, "claude-uuid", "waiting", "", second);
+    var waited: i32 = 5_000;
+    while (waited > 0) : (waited -= 100) {
+        if (std.mem.eql(u8, try statusOf(&conn, arena, second, &b), "waiting")) break;
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+    if (waited <= 0) {
+        std.debug.print(
+            "{s} named itself in the report and still reads `{s}`: the daemon routed on " ++
+                "the worktree instead, so the session that spoke is not the one that moved. " ++
+                "A live agent stays frozen at whatever its first byte of output set.\n",
+            .{ second, try statusOf(&conn, arena, second, &b) },
+        );
+        return error.TestExpectedEqual;
+    }
+
+    const stayed = try statusOf(&conn, arena, first, &b);
+    if (std.mem.eql(u8, stayed, "waiting")) {
+        std.debug.print(
+            "the report reached {s} as well as {s}: routing fell back to the worktree, " ++
+                "which both sessions share. That is how a dead session ate the live one's " ++
+                "hooks and the live one never left `idle`.\n",
+            .{ first, second },
+        );
+        return error.TestExpectedEqual;
+    }
 }
 
 test "a session is launched with the hook settings, read back off the real process" {
@@ -1190,7 +1323,6 @@ test "a session is launched with the hook settings, read back off the real proce
         error.SocketPathTooLong => return error.SkipZigTest,
         else => return err,
     };
-    const hooks_path = try watch_paths.hooks(arena, &environ);
 
     var daemon_arena: std.heap.ArenaAllocator = .init(gpa);
     defer daemon_arena.deinit();
@@ -1239,6 +1371,7 @@ test "a session is launched with the hook settings, read back off the real proce
     const pid = try std.fmt.allocPrint(arena, "{d}", .{body.pid});
     const line = try exec.capture(arena, io, &.{ "ps", "-p", pid, "-ww", "-o", "command=" }, null);
 
+    const hooks_path = try watch_paths.hooksFor(arena, &environ, body.session_id);
     const flag = try std.fmt.allocPrint(arena, "--settings {s}", .{hooks_path});
     try testing.expect(std.mem.indexOf(u8, line, flag) != null);
     try Io.Dir.cwd().access(io, hooks_path, .{});

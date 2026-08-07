@@ -244,6 +244,7 @@ pub const Hook = struct {
     session_id: []const u8,
     event: []const u8,
     permission_mode: []const u8 = "",
+    session: []const u8 = "",
 };
 pub const Kill = struct { session_id: []const u8, signal: []const u8 };
 pub const Stop = struct { force: bool };

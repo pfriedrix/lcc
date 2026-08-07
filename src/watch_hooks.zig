@@ -41,9 +41,15 @@ pub const blocking_matchers = [_][]const u8{
     "agent_needs_input",
 };
 
-fn command(gpa: std.mem.Allocator, exe: []const u8, socket: []const u8, event: Event) ![]const u8 {
-    return std.fmt.allocPrint(gpa, "{s} watch-hook --socket {s} --event {s}", .{
-        exe, socket, @tagName(event),
+fn command(
+    gpa: std.mem.Allocator,
+    exe: []const u8,
+    socket: []const u8,
+    session: []const u8,
+    event: Event,
+) ![]const u8 {
+    return std.fmt.allocPrint(gpa, "{s} watch-hook --socket {s} --session {s} --event {s}", .{
+        exe, socket, session, @tagName(event),
     });
 }
 
@@ -51,11 +57,12 @@ pub fn settingsJson(
     gpa: std.mem.Allocator,
     exe: []const u8,
     socket: []const u8,
+    session: []const u8,
 ) ![]u8 {
-    const waiting = try command(gpa, exe, socket, .waiting);
-    const active = try command(gpa, exe, socket, .active);
-    const idle = try command(gpa, exe, socket, .idle);
-    const ended = try command(gpa, exe, socket, .ended);
+    const waiting = try command(gpa, exe, socket, session, .waiting);
+    const active = try command(gpa, exe, socket, session, .active);
+    const idle = try command(gpa, exe, socket, session, .idle);
+    const ended = try command(gpa, exe, socket, session, .ended);
 
     var blocking: std.ArrayList(Entry) = .empty;
     for (blocking_matchers) |matcher| {
@@ -111,7 +118,7 @@ test "the settings name every event and bake the state into each command" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const body = try settingsJson(arena, "/opt/homebrew/bin/lcc", "/home/me/.config/lcc/daemon.sock");
+    const body = try settingsJson(arena, "/opt/homebrew/bin/lcc", "/home/me/.config/lcc/daemon.sock", "s-00000007");
 
     const Schema = struct {
         hooks: struct {
@@ -238,7 +245,7 @@ test "plan mode needs no hook of its own" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const body = try settingsJson(arena, "/opt/homebrew/bin/lcc", "/s.sock");
+    const body = try settingsJson(arena, "/opt/homebrew/bin/lcc", "/s.sock", "s-00000001");
     try testing.expect(std.mem.indexOf(u8, body, "permission_mode") == null);
     try testing.expect(std.mem.indexOf(u8, body, "--event plan") == null);
     inline for (@typeInfo(Events).@"struct".fields) |field| {
