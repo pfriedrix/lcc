@@ -424,16 +424,20 @@ test "the registry entry carries the status as text" {
     try testing.expectEqual(sessions.Status.active, row.parsedStatus());
 }
 
-test "a decayed session goes idle, and a waiting one never does" {
+test "a session that went silent mid-turn asks to be opened" {
     const gpa = testing.allocator;
     var scratch = try ring.Ring.init(gpa, 64);
     defer scratch.deinit(gpa);
     var s = stubSession(&scratch);
 
+    // Measured against a real row: a session whose hooks stopped arriving with a
+    // turn in flight sat for the full window and then read `idle` — "finished,
+    // come back whenever" — for a turn that had not ended and never would
+    // without someone opening it.
     _ = s.note(.active, "", 1000);
     try testing.expect(!s.tick(1000 + watch_status.active_decay_seconds));
     try testing.expect(s.tick(1000 + watch_status.active_decay_seconds + 1));
-    try testing.expectEqual(sessions.Status.idle, s.status);
+    try testing.expectEqual(sessions.Status.waiting, s.status);
 
     // An unanswered permission prompt is still unanswered a day later, and
     // ageing it into `idle` would hide it exactly when the user has been away
@@ -501,15 +505,17 @@ test "a change no reader can see costs no registry write" {
     _ = s.note(.active, "plan", 1000);
     s.dirty = false;
 
-    // The lifecycle decays `active` to `idle` underneath, but both compose to
-    // `plan`, so the row is unchanged. Reporting this as dirty would be a file
-    // write per session per quarter hour to record nothing.
-    try testing.expect(!s.tick(1000 + watch_status.active_decay_seconds + 1));
+    // A planning session ending a turn: the lifecycle goes `active` → `idle`
+    // underneath, and both compose to `plan`, so the row is unchanged. The
+    // common path rather than a corner — every turn of every planning session
+    // reaches it, and reporting it dirty would be a file write per turn to
+    // record nothing.
+    try testing.expect(!s.note(.idle, "plan", 1100));
     try testing.expect(!s.dirty);
     try testing.expectEqual(sessions.Status.idle, s.status);
     try testing.expectEqualStrings("plan", s.entry().status);
 
-    // And leaving plan mode then shows the decay that already happened.
+    // And leaving plan mode then shows the lifecycle that was under it all along.
     try testing.expect(s.note(.idle, "acceptEdits", 2000));
     try testing.expectEqualStrings("idle", s.entry().status);
 }

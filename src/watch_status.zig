@@ -23,12 +23,12 @@ pub const Status = sessions.Status;
 pub const Event = watch_hooks.Event;
 
 /// How long a session may sit in `active` with nothing further reported before
-/// it decays to `idle`.
+/// the dashboard stops believing the turn is still moving.
 ///
 /// A backstop for the hook that never arrived — a handler that failed, a
 /// `--settings` that did not reach the session, a Claude Code killed mid-turn.
-/// Generous, because a long tool call is ordinary and a session wrongly shown
-/// as finished is worse than one shown as busy a little too long.
+/// Generous, because a long tool call is ordinary and giving up on a session
+/// that is genuinely working is worse than showing it busy a little too long.
 pub const active_decay_seconds: i64 = 15 * 60;
 
 /// A single reported event applied to the status a session already had.
@@ -47,15 +47,30 @@ pub fn apply(current: Status, event: Event) Status {
 
 /// The status after `elapsed` seconds without a further event.
 ///
-/// Only `active` and `starting` decay. `waiting` must not: a permission prompt
-/// left unanswered overnight is still a permission prompt, and ageing it into
-/// `idle` would hide the one state the user actually has to act on.
+/// Silence resolves to `waiting`, never to `idle`. `idle` is a positive claim —
+/// "the turn finished, come back whenever" — and the only thing that licenses it
+/// is a `Stop`. What this function actually knows is that a turn was in flight
+/// and nothing has been reported about it for a quarter of an hour, which is the
+/// opposite of finished: either the turn is wedged, or it is blocked on
+/// something whose notification never reached the daemon. Both want a person,
+/// and `waiting` is how a row says so.
+///
+/// This was `idle`, and the cost of that was the whole point of the dashboard:
+/// the one session that had stopped and needed looking at was painted the same
+/// dim `○ idle` as every session that had finished cleanly, so it read as the
+/// row you could safely ignore.
+///
+/// Only `active` and `starting` decay. `waiting` has nowhere further to go — a
+/// permission prompt left unanswered overnight is still a permission prompt. And
+/// `idle` must not move: a session that reported `Stop` really is finished, and
+/// ageing it into `waiting` would claim attention for every row already dealt
+/// with, which is the same signal-destroying move in the other direction.
 pub fn decay(current: Status, seconds_since_event: i64) Status {
     // A clock that moved backwards reads as no time passed, never as a very
     // long time — the same clamp `remote_cache.fresh` applies.
     const elapsed = @max(0, seconds_since_event);
     return switch (current) {
-        .active, .starting => if (elapsed > active_decay_seconds) .idle else current,
+        .active, .starting => if (elapsed > active_decay_seconds) .waiting else current,
         else => current,
     };
 }
@@ -117,20 +132,29 @@ test "SessionEnd reports exited without waiting for the reap" {
     try testing.expectEqual(Status.exited, apply(.waiting, .ended));
 }
 
-test "active decays to idle, but waiting never does" {
+test "a turn that went silent asks for a person, rather than claiming it finished" {
     // The backstop for a hook that never arrived — a failed handler, or a
     // --settings that did not reach the session.
     try testing.expectEqual(Status.active, decay(.active, active_decay_seconds));
-    try testing.expectEqual(Status.idle, decay(.active, active_decay_seconds + 1));
-    try testing.expectEqual(Status.idle, decay(.starting, active_decay_seconds + 1));
+    try testing.expectEqual(Status.waiting, decay(.active, active_decay_seconds + 1));
+    try testing.expectEqual(Status.waiting, decay(.starting, active_decay_seconds + 1));
+
+    // Stated as the thing it must never be, because that is the bug: silence
+    // means lcc lost track of a turn that had not ended, and `idle` means one
+    // that had. Sent there, the single row that needed opening was painted the
+    // same dim circle as every row that needed nothing.
+    try testing.expect(decay(.active, active_decay_seconds + 1) != .idle);
 
     // A permission prompt left overnight is still a permission prompt. Ageing
     // it away would hide the one state the user has to act on, and would do it
     // precisely when they have been away longest.
     try testing.expectEqual(Status.waiting, decay(.waiting, active_decay_seconds * 100));
-    // And nothing resurrects a finished session.
-    try testing.expectEqual(Status.exited, decay(.exited, active_decay_seconds * 100));
+    // And the other direction is just as destructive: a session that really did
+    // report `Stop` is finished, and letting it age into `waiting` would light
+    // up every row the user has already dealt with.
     try testing.expectEqual(Status.idle, decay(.idle, active_decay_seconds * 100));
+    // Nothing resurrects a dead session either.
+    try testing.expectEqual(Status.exited, decay(.exited, active_decay_seconds * 100));
 }
 
 test "a clock that moved backwards is not a very long silence" {
@@ -143,7 +167,7 @@ test "a clock that moved backwards is not a very long silence" {
 
 test "resolve is decay expressed against a wall clock" {
     try testing.expectEqual(Status.active, resolve(.active, 1_000, 1_000 + active_decay_seconds));
-    try testing.expectEqual(Status.idle, resolve(.active, 1_000, 1_000 + active_decay_seconds + 1));
+    try testing.expectEqual(Status.waiting, resolve(.active, 1_000, 1_000 + active_decay_seconds + 1));
     try testing.expectEqual(Status.waiting, resolve(.waiting, 1_000, 1_000 + 86_400));
 }
 
