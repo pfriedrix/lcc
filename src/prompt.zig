@@ -17,9 +17,9 @@ const Terminal = term_mod.Terminal;
 const readKey = term_mod.readKey;
 const truncate = term_mod.truncate;
 
-fn pageSize(term: Terminal) usize {
+fn pageSize(term: Terminal, reserved: usize) usize {
     const rows = term.size().rows;
-    return @max(@as(usize, 5), @min(@as(usize, 30), rows -| 4));
+    return @max(@as(usize, 5), @min(@as(usize, 30), rows -| reserved));
 }
 
 fn score(haystack: []const u8, query: []const u8) ?i32 {
@@ -145,7 +145,7 @@ pub fn search(
 
     while (true) {
         const dims = term.size();
-        const page = pageSize(term);
+        const page = pageSize(term, 4);
         const width: usize = @max(@as(usize, 20), dims.cols);
 
         if (cursor >= filtered.items.len) cursor = filtered.items.len -| 1;
@@ -336,6 +336,7 @@ pub fn checkbox(
     gpa: std.mem.Allocator,
     io: Io,
     message: []const u8,
+    header: []const u8,
     items: []const Item,
     checked_default: bool,
 ) Error!?[]usize {
@@ -366,7 +367,7 @@ pub fn checkbox(
 
     while (true) {
         const dims = term.size();
-        const page = pageSize(term);
+        const page = pageSize(term, if (header.len > 0) 5 else 4);
         const width: usize = @max(@as(usize, 20), dims.cols);
 
         if (cursor < offset) offset = cursor;
@@ -378,6 +379,11 @@ pub fn checkbox(
 
         out.print("{s}?{s} {s}\n", .{ p.green, p.reset, message }) catch {};
         lines += 1;
+
+        if (header.len > 0) {
+            out.print("    {s}{s}{s}\n", .{ p.dim, truncate(header, width -| 5), p.reset }) catch {};
+            lines += 1;
+        }
 
         const end = @min(offset + page, items.len);
         for (items[offset..end], offset..) |item, row| {

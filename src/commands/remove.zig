@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const app_mod = @import("../app.zig");
 const cp = @import("../claude_projects.zig");
 const dd = @import("../derived_data.zig");
@@ -38,10 +39,24 @@ const Attached = struct {
     }
 };
 
-const Removal = struct {
-    choice: app_mod.Choice,
-    attached: Attached = .{},
+const Row = struct {
+    choice: ?app_mod.Choice = null,
+    branch: ?[]const u8 = null,
     disposition: ?git.BranchDisposition = null,
+    attached: Attached = .{},
+    dirty: ?u32 = null,
+    committed_at: i64 = 0,
+
+    fn entry(self: Row) ?git.WorktreeEntry {
+        const choice = self.choice orelse return null;
+        return choice.entry;
+    }
+
+    fn label(self: Row, gpa: std.mem.Allocator) ![]const u8 {
+        if (self.branch) |branch| return branch;
+        const found = self.entry() orelse return "—";
+        return std.fmt.allocPrint(gpa, "{s} (detached)", .{app_mod.shortHead(found.head)});
+    }
 };
 
 pub fn run(app: app_mod.App, opts: Opts) !void {
@@ -56,16 +71,34 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         return;
     }
 
-    const selected = try selectWorktrees(app, choices);
+    const rows = try app.gpa.alloc(Row, choices.len);
+    for (choices, 0..) |choice, i| {
+        rows[i] = .{ .choice = choice, .branch = choice.entry.branch };
+    }
+
+    if (!opts.keep_branch) {
+        try judge(app, repo, rows);
+        if (!opts.local) try consultGitHub(app, repo, rows);
+    }
+    try inspect(app, repo, rows);
+
+    const dd_root = try dd.root(app.gpa, app.io, app.environ);
+    const cp_root = try cp.root(app.gpa, app.environ);
+    try attach(app, rows, opts, dd_root, cp_root);
+
+    const selected = try select(
+        app,
+        rows,
+        opts,
+        "Select worktrees to remove (space toggles, enter confirms):",
+        false,
+    );
     if (selected.len == 0) {
         app.ui.hint("Nothing selected.", .{});
         return;
     }
 
-    const dd_root = try dd.root(app.gpa, app.io, app.environ);
-    const cp_root = try cp.root(app.gpa, app.environ);
-    const removals = try prepareRemovals(app, repo, selected, opts, dd_root, cp_root);
-    const actionable = try withoutUnsavedWork(app, removals, opts);
+    const actionable = try withoutUnsavedWork(app, selected, opts);
     if (actionable.len == 0) return;
 
     if (!opts.yes) {
@@ -81,163 +114,245 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     try removeSelected(app, repo, actionable, opts, dd_root, cp_root);
 }
 
-fn selectWorktrees(app: app_mod.App, choices: []const app_mod.Choice) ![]const app_mod.Choice {
-    const items = try app.gpa.alloc(prompt.Item, choices.len);
-    for (choices, 0..) |choice, i| {
-        items[i] = .{ .label = try app_mod.worktreeLabel(app.gpa, choice) };
+fn branchStatusTask(repo: git.Repo, out: *[]const git.BranchStatus) void {
+    out.* = repo.branchStatuses() catch &.{};
+}
+
+fn dirtyTask(repo: git.Repo, worktree_path: []const u8, out: *?u32) void {
+    out.* = repo.dirtyCount(worktree_path);
+}
+
+fn dispositionTask(repo: git.Repo, branch: []const u8, out: *?git.BranchDisposition) void {
+    out.* = repo.branchDisposition(branch) catch null;
+}
+
+fn judge(app: app_mod.App, repo: git.Repo, rows: []Row) !void {
+    var group: Io.Group = .init;
+    for (rows) |*row| {
+        const branch = row.branch orelse continue;
+        group.async(app.io, dispositionTask, .{ repo, branch, &row.disposition });
     }
+    try group.await(app.io);
+}
+
+fn inspect(app: app_mod.App, repo: git.Repo, rows: []Row) !void {
+    var statuses: []const git.BranchStatus = &.{};
+    {
+        var group: Io.Group = .init;
+        group.async(app.io, branchStatusTask, .{ repo, &statuses });
+        for (rows) |*row| {
+            const found = row.entry() orelse continue;
+            group.async(app.io, dirtyTask, .{ repo, found.path, &row.dirty });
+        }
+        try group.await(app.io);
+    }
+
+    for (rows) |*row| {
+        const branch = row.branch orelse continue;
+        for (statuses) |status| {
+            if (!std.mem.eql(u8, status.branch, branch)) continue;
+            row.committed_at = status.committed_at;
+            break;
+        }
+    }
+}
+
+const headers = .{
+    .branch = "BRANCH",
+    .merge = "MERGE",
+    .status = "STATUS",
+    .age = "AGE",
+    .frees = "FREES",
+    .spent = "SPENT",
+    .where = "PATH",
+};
+
+const Cells = struct {
+    branch: []const u8,
+    merge: []const u8,
+    status: []const u8,
+    age: []const u8,
+    frees: []const u8,
+    spent: []const u8,
+    where: []const u8,
+    note: []const u8,
+};
+
+const Widths = struct {
+    branch: usize = headers.branch.len,
+    merge: usize = headers.merge.len,
+    status: usize = headers.status.len,
+    age: usize = headers.age.len,
+    frees: usize = headers.frees.len,
+    spent: usize = headers.spent.len,
+};
+
+fn measure(cells: []const Cells) Widths {
+    var w: Widths = .{};
+    for (cells) |cell| {
+        w.branch = @max(w.branch, ui.displayWidth(cell.branch));
+        w.merge = @max(w.merge, ui.displayWidth(cell.merge));
+        w.status = @max(w.status, ui.displayWidth(cell.status));
+        w.age = @max(w.age, ui.displayWidth(cell.age));
+        w.frees = @max(w.frees, ui.displayWidth(cell.frees));
+        w.spent = @max(w.spent, ui.displayWidth(cell.spent));
+    }
+    return w;
+}
+
+fn headerLine(gpa: std.mem.Allocator, w: Widths) ![]const u8 {
+    return std.fmt.allocPrint(gpa, "{f}  {f}  {f}  {f}  {f}  {f}  {s}", .{
+        ui.pad(headers.branch, w.branch),
+        ui.pad(headers.merge, w.merge),
+        ui.pad(headers.status, w.status),
+        ui.pad(headers.age, w.age),
+        ui.pad(headers.frees, w.frees),
+        ui.pad(headers.spent, w.spent),
+        headers.where,
+    });
+}
+
+fn rowLine(gpa: std.mem.Allocator, cell: Cells, w: Widths) ![]const u8 {
+    return std.fmt.allocPrint(gpa, "{f}  {f}  {f}  {f}  {f}  {f}  {s}{s}", .{
+        ui.pad(cell.branch, w.branch),
+        ui.pad(cell.merge, w.merge),
+        ui.pad(cell.status, w.status),
+        ui.pad(cell.age, w.age),
+        ui.pad(cell.frees, w.frees),
+        ui.pad(cell.spent, w.spent),
+        cell.where,
+        cell.note,
+    });
+}
+
+fn cellsFor(app: app_mod.App, row: Row, opts: Opts, now: i64) !Cells {
+    return .{
+        .branch = try row.label(app.gpa),
+        .merge = try mergeCell(app.gpa, row.disposition),
+        .status = try statusCell(app.gpa, row),
+        .age = try ageCell(app.gpa, row.committed_at, now),
+        .frees = try sizeCell(app.gpa, row.attached.reclaimable(opts.sessions)),
+        .spent = try spentCell(app.gpa, row.attached.spent),
+        .where = if (row.entry()) |found|
+            disk.abbreviate(app.gpa, app.environ, found.path)
+        else
+            "branch only — no worktree left",
+        .note = try noteCell(app.gpa, row),
+    };
+}
+
+fn mergeCell(gpa: std.mem.Allocator, disposition: ?git.BranchDisposition) ![]const u8 {
+    const d = disposition orelse return "—";
+    return switch (d.reason) {
+        .merged => "merged",
+        .merged_pr => try std.fmt.allocPrint(gpa, "merged #{d}", .{d.pr}),
+        .upstream_gone => "remote gone",
+        .default_branch => "default branch",
+        .unmerged => if (d.unmerged == 0)
+            "unmerged"
+        else
+            try std.fmt.allocPrint(gpa, "{d} unmerged", .{d.unmerged}),
+    };
+}
+
+fn statusCell(gpa: std.mem.Allocator, row: Row) ![]const u8 {
+    if (row.entry() == null) return "—";
+    const count = row.dirty orelse return "missing";
+    if (count == 0) return "clean";
+    return std.fmt.allocPrint(gpa, "{d} dirty", .{count});
+}
+
+fn ageCell(gpa: std.mem.Allocator, committed_at: i64, now: i64) ![]const u8 {
+    if (committed_at <= 0) return "—";
+    return std.fmt.allocPrint(gpa, "{f}", .{ui.age(now - committed_at)});
+}
+
+fn sizeCell(gpa: std.mem.Allocator, size: u64) ![]const u8 {
+    if (size == 0) return "—";
+    return std.fmt.allocPrint(gpa, "{f}", .{ui.bytes(size)});
+}
+
+fn spentCell(gpa: std.mem.Allocator, spent: usage.Totals) ![]const u8 {
+    if (spent.empty()) return "—";
+    return std.fmt.allocPrint(gpa, "{f}", .{ui.count(spent.counts.contextTokens())});
+}
+
+fn noteCell(gpa: std.mem.Allocator, row: Row) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    if (row.choice) |choice| {
+        if (choice.entry.locked) try out.appendSlice(gpa, "  locked");
+        if (choice.entry.prunable) try out.appendSlice(gpa, "  prunable");
+        if (choice.managed) try out.appendSlice(gpa, "  lcc");
+    }
+    if (row.attached.xcode.unsaved.len > 0) {
+        try out.appendSlice(gpa, "  — unsaved in Xcode");
+    } else if (row.attached.xcode.workspaces.len > 0) {
+        try out.appendSlice(gpa, "  — open in Xcode");
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn select(
+    app: app_mod.App,
+    rows: []const Row,
+    opts: Opts,
+    message: []const u8,
+    checked_default: bool,
+) ![]const Row {
+    const now = app_mod.nowSeconds(app.io);
+    const cells = try app.gpa.alloc(Cells, rows.len);
+    for (rows, 0..) |row, i| cells[i] = try cellsFor(app, row, opts, now);
+    const w = measure(cells);
+
+    const items = try app.gpa.alloc(prompt.Item, rows.len);
+    for (cells, 0..) |cell, i| items[i] = .{ .label = try rowLine(app.gpa, cell, w) };
 
     app.ui.flush();
     const chosen = try prompt.checkbox(
         app.gpa,
         app.io,
-        "Select worktrees to remove (space toggles, enter confirms):",
+        message,
+        try headerLine(app.gpa, w),
         items,
-        false,
+        checked_default,
     ) orelse std.process.exit(app_mod.cancelled_exit_code);
-    return choicesAt(app.gpa, choices, chosen);
+    return rowsAt(app.gpa, rows, chosen);
 }
 
-fn choicesAt(
-    gpa: std.mem.Allocator,
-    choices: []const app_mod.Choice,
-    indices: []const usize,
-) ![]const app_mod.Choice {
-    const subset = try gpa.alloc(app_mod.Choice, indices.len);
-    for (indices, 0..) |index, i| subset[i] = choices[index];
+fn rowsAt(gpa: std.mem.Allocator, rows: []const Row, indices: []const usize) ![]const Row {
+    const subset = try gpa.alloc(Row, indices.len);
+    for (indices, 0..) |index, i| subset[i] = rows[index];
     return subset;
 }
 
-fn prepareRemovals(
-    app: app_mod.App,
-    repo: git.Repo,
-    selected: []const app_mod.Choice,
-    opts: Opts,
-    dd_root: []const u8,
-    cp_root: []const u8,
-) ![]Removal {
-    const removals = try app.gpa.alloc(Removal, selected.len);
-    for (selected, 0..) |choice, i| {
-        removals[i] = .{
-            .choice = choice,
-            .disposition = if (choice.entry.branch != null and !opts.keep_branch)
-                try repo.branchDisposition(choice.entry.branch.?)
-            else
-                null,
-        };
-    }
-
-    if (!opts.local and !opts.keep_branch) {
-        var asked: std.ArrayList([]const u8) = .empty;
-        for (removals) |removal| {
-            const disposition = removal.disposition orelse continue;
-            if (disposition.reason == .unmerged) try asked.append(app.gpa, disposition.branch);
-        }
-        if (asked.items.len > 0) {
-            if (pullRequests(app, repo, asked.items)) |prs| {
-                for (removals) |*removal| {
-                    const disposition = removal.disposition orelse continue;
-                    const number = github.mergedFor(prs, disposition.branch) orelse continue;
-                    removal.disposition = disposition.withMergedPr(number);
-                }
-            }
-        }
-    }
-
-    const dd_all: []dd.Entry = if (opts.keep_derived_data)
-        &.{}
-    else
-        try dd.list(app.gpa, app.io, dd_root);
-    const cp_all = try cp.list(app.gpa, app.io, cp_root);
-    const held: xcode.Open = if (opts.keep_xcode) .{} else try xcode.openDocuments(app.gpa, app.io);
-    if (held.unanswered) {
-        app.ui.warn("Could not ask Xcode what it has open — it may be holding some of these.", .{});
-        app.ui.hint("  {s}", .{automation_hint});
-    }
-
-    const derived = try app.gpa.alloc([]dd.Entry, removals.len);
-    const sessions = try app.gpa.alloc([]cp.Entry, removals.len);
-    const in_xcode = try app.gpa.alloc(xcode.Open, removals.len);
-    var paths: std.ArrayList([]const u8) = .empty;
-
-    for (removals, 0..) |removal, i| {
-        const path = removal.choice.entry.path;
-        derived[i] = try dd.forWorktree(app.gpa, app.io, dd_all, path);
-        sessions[i] = try cp.forWorktree(app.gpa, app.io, cp_all, path);
-        in_xcode[i] = try held.inside(app.gpa, app.io, path);
-        for (derived[i]) |entry| try paths.append(app.gpa, entry.path);
-        for (sessions[i]) |entry| try paths.append(app.gpa, entry.path);
-    }
-
-    if (paths.items.len > 0) {
-        app.ui.step("Measuring build data and sessions ({d})…", .{paths.items.len});
-        app.ui.flush();
-    }
-    const sizes = try disk.usage(app.gpa, app.io, paths.items);
-
-    var scanner: usage.Scanner = .init(app.gpa, app.io, .open(app.gpa, app.io, app.environ));
-    defer scanner.deinit();
-
-    var at: usize = 0;
-    for (removals, 0..) |*removal, i| {
-        const dd_sized = try app.gpa.alloc(dd.Sized, derived[i].len);
-        for (derived[i], 0..) |entry, j| {
-            dd_sized[j] = .{ .entry = entry, .size = sizes[at] };
-            at += 1;
-        }
-
-        const cp_sized = try app.gpa.alloc(cp.Sized, sessions[i].len);
-        for (sessions[i], 0..) |entry, j| {
-            cp_sized[j] = .{ .entry = entry, .size = sizes[at] };
-            at += 1;
-        }
-        removal.attached = .{
-            .derived = dd_sized,
-            .sessions = cp_sized,
-            .spent = try scanner.worktree(cp_all, removal.choice.entry.path),
-            .xcode = in_xcode[i],
-        };
-    }
-    return removals;
-}
-
-fn confirmRemovalsMessage(app: app_mod.App, removals: []const Removal, opts: Opts) ![]u8 {
-    if (removals.len == 1) {
-        const removal = removals[0];
-        return confirmMessage(app, removal.choice, removal.attached, removal.disposition, opts);
-    }
+fn confirmRemovalsMessage(app: app_mod.App, rows: []const Row, opts: Opts) ![]u8 {
+    if (rows.len == 1) return confirmMessage(app, rows[0], opts);
 
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(app.gpa, try std.fmt.allocPrint(app.gpa, "Remove {d} worktrees?\n", .{removals.len}));
-    for (removals) |removal| {
-        const label = removal.choice.entry.branch orelse app_mod.shortHead(removal.choice.entry.head);
-        try out.appendSlice(app.gpa, try std.fmt.allocPrint(app.gpa, "\n  {s}\n", .{label}));
-        try appendConfirmationDetails(
-            app,
-            &out,
-            removal.choice,
-            removal.attached,
-            removal.disposition,
-            opts,
-        );
+    try out.appendSlice(app.gpa, try std.fmt.allocPrint(app.gpa, "Remove {d} worktrees?\n", .{rows.len}));
+    for (rows) |row| {
+        try out.appendSlice(app.gpa, try std.fmt.allocPrint(app.gpa, "\n  {s}\n", .{
+            try row.label(app.gpa),
+        }));
+        try appendConfirmationDetails(app, &out, row, opts);
     }
     return out.toOwnedSlice(app.gpa);
 }
 
-fn withoutUnsavedWork(app: app_mod.App, removals: []const Removal, opts: Opts) ![]const Removal {
-    if (opts.force) return removals;
+fn withoutUnsavedWork(app: app_mod.App, rows: []const Row, opts: Opts) ![]const Row {
+    if (opts.force) return rows;
 
-    var actionable: std.ArrayList(Removal) = .empty;
-    for (removals) |removal| {
-        if (removal.attached.xcode.unsaved.len == 0) {
-            try actionable.append(app.gpa, removal);
+    var actionable: std.ArrayList(Row) = .empty;
+    for (rows) |row| {
+        if (row.attached.xcode.unsaved.len == 0) {
+            try actionable.append(app.gpa, row);
             continue;
         }
 
-        const entry = removal.choice.entry;
-        const label = entry.branch orelse app_mod.shortHead(entry.head);
-        app.ui.warn("Kept {f} — Xcode has unsaved changes in it", .{ui.cyan(label)});
-        for (removal.attached.xcode.unsaved) |doc| app.ui.hint("  {s}", .{doc.path});
+        app.ui.warn("Kept {f} — Xcode has unsaved changes in it", .{
+            ui.cyan(try row.label(app.gpa)),
+        });
+        for (row.attached.xcode.unsaved) |doc| app.ui.hint("  {s}", .{doc.path});
         app.ui.hint("  Save them there, or rerun with: lcc remove --force", .{});
     }
     return actionable.toOwnedSlice(app.gpa);
@@ -246,7 +361,7 @@ fn withoutUnsavedWork(app: app_mod.App, removals: []const Removal, opts: Opts) !
 fn removeSelected(
     app: app_mod.App,
     repo: git.Repo,
-    removals: []const Removal,
+    rows: []const Row,
     opts: Opts,
     dd_root: []const u8,
     cp_root: []const u8,
@@ -255,18 +370,18 @@ fn removeSelected(
     var kept_sessions: usize = 0;
     var reclaimed: u64 = 0;
 
-    for (removals) |removal| {
-        const entry = removal.choice.entry;
-        const label = entry.branch orelse app_mod.shortHead(entry.head);
+    for (rows) |row| {
+        const entry = row.entry() orelse continue;
+        const label = try row.label(app.gpa);
 
-        if (removal.attached.xcode.unsaved.len > 0 and !opts.force) {
+        if (row.attached.xcode.unsaved.len > 0 and !opts.force) {
             app.ui.warn("Kept {f} — Xcode has unsaved changes in it", .{ui.cyan(label)});
-            for (removal.attached.xcode.unsaved) |doc| app.ui.hint("  {s}", .{doc.path});
+            for (row.attached.xcode.unsaved) |doc| app.ui.hint("  {s}", .{doc.path});
             app.ui.hint("  Save them there, or rerun with: lcc remove --force", .{});
             continue;
         }
 
-        const closed = closeXcode(app, removal.attached.xcode);
+        const closed = closeXcode(app, row.attached.xcode);
         const gone = remove: {
             repo.removeWorktree(entry.path, opts.force) catch {
                 if (opts.force) {
@@ -301,14 +416,14 @@ fn removeSelected(
 
         removed += 1;
         app.ui.success("Removed worktree {f}", .{ui.cyan(label)});
-        reclaimed += try purgeDerived(app, removal.attached.derived, dd_root);
+        reclaimed += try purgeDerived(app, row.attached.derived, dd_root);
         if (opts.sessions) {
-            reclaimed += try purgeSessions(app, removal.attached.sessions, cp_root);
+            reclaimed += try purgeSessions(app, row.attached.sessions, cp_root);
         } else {
-            kept_sessions += removal.attached.sessions.len;
+            kept_sessions += row.attached.sessions.len;
         }
 
-        try disposeBranch(app, repo, entry.branch, removal.disposition);
+        try disposeBranch(app, repo, entry.branch, row.disposition);
     }
 
     if (kept_sessions > 0) {
@@ -321,8 +436,8 @@ fn removeSelected(
             ui.bold(try std.fmt.allocPrint(app.gpa, "{f}", .{ui.bytes(reclaimed)})),
         });
     }
-    if (removals.len > 1) {
-        app.ui.success("Removed {d} of {d} selected worktrees.", .{ removed, removals.len });
+    if (rows.len > 1) {
+        app.ui.success("Removed {d} of {d} selected worktrees.", .{ removed, rows.len });
     }
 }
 
@@ -379,48 +494,51 @@ fn pullRequests(
     return list;
 }
 
-fn confirmMessage(
-    app: app_mod.App,
-    picked: app_mod.Choice,
-    attached: Attached,
-    disposition: ?git.BranchDisposition,
-    opts: Opts,
-) ![]u8 {
-    const label = picked.entry.branch orelse app_mod.shortHead(picked.entry.head);
-
+fn confirmMessage(app: app_mod.App, row: Row, opts: Opts) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     const w = app.gpa;
-    try out.appendSlice(w, try std.fmt.allocPrint(w, "Remove worktree {s}?\n", .{label}));
-    try appendConfirmationDetails(app, &out, picked, attached, disposition, opts);
+    try out.appendSlice(w, try std.fmt.allocPrint(w, "Remove worktree {s}?\n", .{
+        try row.label(w),
+    }));
+    try appendConfirmationDetails(app, &out, row, opts);
     return out.toOwnedSlice(w);
 }
 
 fn appendConfirmationDetails(
     app: app_mod.App,
     out: *std.ArrayList(u8),
-    picked: app_mod.Choice,
-    attached: Attached,
-    disposition: ?git.BranchDisposition,
+    row: Row,
     opts: Opts,
 ) !void {
     const w = app.gpa;
-    try out.appendSlice(w, try std.fmt.allocPrint(w, "    worktree   {s}\n", .{picked.entry.path}));
-    for (attached.xcode.workspaces) |doc| {
+    if (row.entry()) |entry| {
+        try out.appendSlice(w, try std.fmt.allocPrint(w, "    worktree   {s}\n", .{entry.path}));
+    }
+    if (row.dirty) |count| {
+        if (count > 0) {
+            try out.appendSlice(w, try std.fmt.allocPrint(
+                w,
+                "    changes    {d} uncommitted  (lost if the removal is forced)\n",
+                .{count},
+            ));
+        }
+    }
+    for (row.attached.xcode.workspaces) |doc| {
         try out.appendSlice(w, try std.fmt.allocPrint(w, "    xcode      {s}  (open — will be closed)\n", .{
             doc.name(),
         }));
     }
-    for (attached.xcode.unsaved) |doc| {
+    for (row.attached.xcode.unsaved) |doc| {
         try out.appendSlice(w, try std.fmt.allocPrint(w, "    unsaved    {s}  (in Xcode — the changes go too)\n", .{
             doc.name(),
         }));
     }
-    for (attached.derived) |item| {
+    for (row.attached.derived) |item| {
         try out.appendSlice(w, try std.fmt.allocPrint(w, "    build data {s}  ({f})\n", .{
             item.entry.name, ui.bytes(item.size),
         }));
     }
-    for (attached.sessions) |item| {
+    for (row.attached.sessions) |item| {
         try out.appendSlice(w, try std.fmt.allocPrint(w, "    sessions   {s}  ({d} session{s}, {f}){s}\n", .{
             item.entry.name,
             item.entry.sessions,
@@ -429,12 +547,12 @@ fn appendConfirmationDetails(
             if (opts.sessions) "" else "  — kept, use --sessions",
         }));
     }
-    if (!attached.spent.empty()) {
+    if (!row.attached.spent.empty()) {
         try out.appendSlice(w, try std.fmt.allocPrint(w, "    spent      {f}\n", .{
-            usage.brief(attached.spent, app_mod.nowSeconds(app.io)),
+            usage.brief(row.attached.spent, app_mod.nowSeconds(app.io)),
         }));
     }
-    if (disposition) |d| {
+    if (row.disposition) |d| {
         try out.appendSlice(w, try std.fmt.allocPrint(w, "    branch     {s}  {s}\n", .{
             d.branch, try describeDisposition(w, d),
         }));
@@ -520,22 +638,6 @@ fn purgeSessions(app: app_mod.App, sized: []const cp.Sized, root: []const u8) !u
     return reclaimed;
 }
 
-const Row = struct {
-    worktree: ?git.WorktreeEntry,
-    branch: []const u8,
-    disposition: git.BranchDisposition,
-    attached: Attached = .{},
-
-    fn reason(self: Row, gpa: std.mem.Allocator) []const u8 {
-        return switch (self.disposition.reason) {
-            .merged => "merged",
-            .merged_pr => std.fmt.allocPrint(gpa, "merged #{d}", .{self.disposition.pr}) catch "merged",
-            .upstream_gone => "remote gone",
-            else => "safe",
-        };
-    }
-};
-
 fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
     if (!opts.local) refresh(app, repo);
 
@@ -549,31 +651,30 @@ fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
         if (entry.branch) |branch| try checked_out.put(app.gpa, branch, {});
     }
 
+    const prefix = try app_mod.managedPrefix(app, repo);
+
     var candidates: std.ArrayList(Row) = .empty;
     for (worktrees) |entry| {
         if (entry.is_main) continue;
         const branch = entry.branch orelse continue;
         try candidates.append(app.gpa, .{
-            .worktree = entry,
+            .choice = .{ .entry = entry, .managed = app_mod.isManaged(prefix, entry.path) },
             .branch = branch,
-            .disposition = try repo.branchDisposition(branch),
         });
     }
 
     for (try repo.branchStatuses()) |status| {
         if (checked_out.contains(status.branch)) continue;
-        try candidates.append(app.gpa, .{
-            .worktree = null,
-            .branch = status.branch,
-            .disposition = try repo.branchDisposition(status.branch),
-        });
+        try candidates.append(app.gpa, .{ .branch = status.branch });
     }
 
+    try judge(app, repo, candidates.items);
     if (!opts.local) try consultGitHub(app, repo, candidates.items);
 
     var rows: std.ArrayList(Row) = .empty;
     for (candidates.items) |row| {
-        if (row.disposition.safe) try rows.append(app.gpa, row);
+        const d = row.disposition orelse continue;
+        if (d.safe) try rows.append(app.gpa, row);
     }
 
     if (rows.items.len == 0) {
@@ -581,11 +682,19 @@ fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
         return;
     }
 
+    try inspect(app, repo, rows.items);
+
     const dd_root = try dd.root(app.gpa, app.io, app.environ);
     const cp_root = try cp.root(app.gpa, app.environ);
     try attach(app, rows.items, opts, dd_root, cp_root);
 
-    const picked: []const Row = if (opts.yes) rows.items else try selectRows(app, rows.items, opts);
+    const picked: []const Row = if (opts.yes) rows.items else try select(
+        app,
+        rows.items,
+        opts,
+        "Select what to remove (space toggles, enter confirms):",
+        true,
+    );
     if (picked.len == 0) {
         app.ui.hint("Nothing selected.", .{});
         return;
@@ -596,22 +705,23 @@ fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
     var branches_gone: usize = 0;
 
     for (picked) |row| {
-        if (row.worktree) |entry| {
+        const branch = row.branch orelse continue;
+        if (row.entry()) |entry| {
             if (row.attached.xcode.unsaved.len > 0 and !opts.force) {
-                app.ui.warn("Kept {f} — Xcode has unsaved changes in it", .{ui.cyan(row.branch)});
+                app.ui.warn("Kept {f} — Xcode has unsaved changes in it", .{ui.cyan(branch)});
                 app.ui.hint("  Save them there, or rerun with: lcc remove --merged --force", .{});
                 continue;
             }
             const closed = closeXcode(app, row.attached.xcode);
 
             repo.removeWorktree(entry.path, opts.force) catch {
-                app.ui.warn("Kept {f} — {s}", .{ ui.cyan(row.branch), git.last_error });
+                app.ui.warn("Kept {f} — {s}", .{ ui.cyan(branch), git.last_error });
                 app.ui.hint("  Retry with: lcc remove --merged --force", .{});
                 noteReopen(app, closed);
                 continue;
             };
             worktrees_gone += 1;
-            app.ui.success("Removed worktree {f}", .{ui.cyan(row.branch)});
+            app.ui.success("Removed worktree {f}", .{ui.cyan(branch)});
 
             reclaimed += try purgeDerived(app, row.attached.derived, dd_root);
             if (opts.sessions) {
@@ -620,13 +730,14 @@ fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
         }
 
         if (opts.keep_branch) continue;
-        const forced = repo.deleteVerified(row.disposition) catch {
-            app.ui.warn("Could not delete branch {s} — {s}", .{ row.branch, git.last_error });
-            app.ui.hint("  Delete manually with: git branch -D {s}", .{row.branch});
+        const disposition = row.disposition orelse continue;
+        const forced = repo.deleteVerified(disposition) catch {
+            app.ui.warn("Could not delete branch {s} — {s}", .{ branch, git.last_error });
+            app.ui.hint("  Delete manually with: git branch -D {s}", .{branch});
             continue;
         };
         branches_gone += 1;
-        app.ui.success("Deleted branch {f}", .{ui.cyan(row.branch)});
+        app.ui.success("Deleted branch {f}", .{ui.cyan(branch)});
         if (forced) app.ui.hint("  git's own check could not see the merge — used -D.", .{});
     }
 
@@ -646,17 +757,19 @@ fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
 fn consultGitHub(app: app_mod.App, repo: git.Repo, rows: []Row) !void {
     var asked: std.ArrayList([]const u8) = .empty;
     for (rows) |row| {
-        if (row.disposition.reason != .unmerged) continue;
+        const d = row.disposition orelse continue;
+        if (d.reason != .unmerged) continue;
         for (asked.items) |seen| {
-            if (std.mem.eql(u8, seen, row.branch)) break;
-        } else try asked.append(app.gpa, row.branch);
+            if (std.mem.eql(u8, seen, d.branch)) break;
+        } else try asked.append(app.gpa, d.branch);
     }
     if (asked.items.len == 0) return;
 
     const prs = pullRequests(app, repo, asked.items) orelse return;
     for (rows) |*row| {
-        const number = github.mergedFor(prs, row.branch) orelse continue;
-        row.disposition = row.disposition.withMergedPr(number);
+        const d = row.disposition orelse continue;
+        const number = github.mergedFor(prs, d.branch) orelse continue;
+        row.disposition = d.withMergedPr(number);
     }
 }
 
@@ -685,7 +798,7 @@ fn attach(
     const in_xcode = try app.gpa.alloc(xcode.Open, rows.len);
 
     for (rows, 0..) |row, i| {
-        const entry = row.worktree orelse {
+        const entry = row.entry() orelse {
             derived[i] = &.{};
             sessions[i] = &.{};
             in_xcode[i] = .{};
@@ -722,134 +835,55 @@ fn attach(
         row.attached = .{
             .derived = dd_sized,
             .sessions = cp_sized,
-            .spent = if (row.worktree) |entry| try scanner.worktree(cp_all, entry.path) else .{},
+            .spent = if (row.entry()) |entry| try scanner.worktree(cp_all, entry.path) else .{},
             .xcode = in_xcode[i],
         };
     }
-}
-
-fn rowLabel(
-    gpa: std.mem.Allocator,
-    environ: *const std.process.Environ.Map,
-    row: Row,
-    branch_width: usize,
-    reason_width: usize,
-    opts: Opts,
-) ![]const u8 {
-    const size = row.attached.reclaimable(opts.sessions);
-    const reclaim = if (size == 0)
-        try gpa.dupe(u8, "—")
-    else
-        try std.fmt.allocPrint(gpa, "{f}", .{ui.bytes(size)});
-
-    const spent = if (row.attached.spent.empty())
-        try gpa.dupe(u8, "—")
-    else
-        try std.fmt.allocPrint(gpa, "{f}", .{
-            ui.count(row.attached.spent.counts.contextTokens()),
-        });
-
-    const where = if (row.worktree) |entry|
-        disk.abbreviate(gpa, environ, entry.path)
-    else
-        "branch only — no worktree left";
-
-    const note = if (row.attached.xcode.unsaved.len > 0)
-        "  — unsaved in Xcode"
-    else if (row.attached.xcode.workspaces.len > 0)
-        "  — open in Xcode"
-    else
-        "";
-
-    return std.fmt.allocPrint(gpa, "{f}  {f}  {f}  {f}  {s}{s}", .{
-        ui.pad(row.branch, branch_width),
-        ui.pad(row.reason(gpa), reason_width),
-        ui.pad(reclaim, 8),
-        ui.pad(spent, 7),
-        where,
-        note,
-    });
-}
-
-fn selectRows(app: app_mod.App, rows: []const Row, opts: Opts) ![]const Row {
-    var branch_width: usize = 0;
-    var reason_width: usize = 0;
-    for (rows) |row| {
-        branch_width = @max(branch_width, ui.displayWidth(row.branch));
-        reason_width = @max(reason_width, ui.displayWidth(row.reason(app.gpa)));
-    }
-
-    const items = try app.gpa.alloc(prompt.Item, rows.len);
-    for (rows, 0..) |row, i| {
-        items[i] = .{
-            .label = try rowLabel(app.gpa, app.environ, row, branch_width, reason_width, opts),
-        };
-    }
-
-    app.ui.flush();
-    const chosen = try prompt.checkbox(
-        app.gpa,
-        app.io,
-        "Select what to remove (space toggles, enter confirms):",
-        items,
-        true,
-    ) orelse std.process.exit(app_mod.cancelled_exit_code);
-
-    const subset = try app.gpa.alloc(Row, chosen.len);
-    for (chosen, 0..) |index, i| subset[i] = rows[index];
-    return subset;
 }
 
 fn plural(n: anytype) []const u8 {
     return if (n == 1) "" else "s";
 }
 
-test "worktree multi-selection preserves zero one and many choices" {
+fn testRow(path: []const u8, branch: ?[]const u8, head: []const u8) Row {
+    return .{
+        .choice = .{ .entry = .{
+            .path = path,
+            .branch = branch,
+            .head = head,
+            .locked = false,
+            .prunable = false,
+            .is_main = false,
+        }, .managed = true },
+        .branch = branch,
+    };
+}
+
+test "multi-selection preserves zero one and many picks" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const choices = [_]app_mod.Choice{
-        .{ .entry = .{
-            .path = "/tmp/one",
-            .branch = "feature/one",
-            .head = "11111111",
-            .locked = false,
-            .prunable = false,
-            .is_main = false,
-        }, .managed = true },
-        .{ .entry = .{
-            .path = "/tmp/two",
-            .branch = "feature/two",
-            .head = "22222222",
-            .locked = false,
-            .prunable = false,
-            .is_main = false,
-        }, .managed = true },
-        .{ .entry = .{
-            .path = "/tmp/detached",
-            .branch = null,
-            .head = "33333333",
-            .locked = false,
-            .prunable = false,
-            .is_main = false,
-        }, .managed = false },
+    const rows = [_]Row{
+        testRow("/tmp/one", "feature/one", "11111111"),
+        testRow("/tmp/two", "feature/two", "22222222"),
+        testRow("/tmp/detached", null, "33333333"),
     };
 
-    const none = try choicesAt(arena, &choices, &.{});
+    const none = try rowsAt(arena, &rows, &.{});
     try std.testing.expectEqual(@as(usize, 0), none.len);
 
-    const one = try choicesAt(arena, &choices, &.{1});
-    try std.testing.expectEqualStrings("feature/two", one[0].entry.branch.?);
+    const one = try rowsAt(arena, &rows, &.{1});
+    try std.testing.expectEqualStrings("feature/two", one[0].branch.?);
 
-    const many = try choicesAt(arena, &choices, &.{ 0, 2 });
+    const many = try rowsAt(arena, &rows, &.{ 0, 2 });
     try std.testing.expectEqual(@as(usize, 2), many.len);
-    try std.testing.expectEqualStrings("/tmp/one", many[0].entry.path);
-    try std.testing.expectEqualStrings("/tmp/detached", many[1].entry.path);
-    try std.testing.expect(many[1].entry.branch == null);
+    try std.testing.expectEqualStrings("/tmp/one", many[0].entry().?.path);
+    try std.testing.expectEqualStrings("/tmp/detached", many[1].entry().?.path);
+    try std.testing.expect(many[1].branch == null);
 }
 
-test "a bulk row shows what it frees and what it spent" {
+test "a row says whether its work landed before it is ticked, not after" {
     const gpa = std.testing.allocator;
 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -859,49 +893,146 @@ test "a bulk row shows what it frees and what it spent" {
     var environ: std.process.Environ.Map = .init(arena);
     try environ.put("HOME", "/Users/me");
 
-    const worktree: git.WorktreeEntry = .{
-        .path = "/Users/me/Projects/App/.lcc/worktrees/pe-101",
-        .branch = "feature/pe-101-shipped",
-        .head = "abc",
-        .locked = false,
-        .prunable = false,
-        .is_main = false,
-    };
-    const row: Row = .{
-        .worktree = worktree,
-        .branch = "feature/pe-101-shipped",
-        .disposition = .{ .branch = "feature/pe-101-shipped", .safe = true, .reason = .merged, .unmerged = 0 },
-        .attached = .{
-            .derived = &.{},
-            .sessions = &.{},
-            .spent = .{
-                .counts = .{ .messages = 190, .cache_read = 52_600_000 },
-                .sessions = 1,
-            },
-        },
+    const app: app_mod.App = .{
+        .gpa = arena,
+        .io = undefined,
+        .environ = &environ,
+        .ui = undefined,
     };
 
-    const label = try rowLabel(arena, &environ, row, 22, 11, .{});
-    try std.testing.expect(std.mem.indexOf(u8, label, "53M") != null);
-    try std.testing.expect(std.mem.indexOf(u8, label, "—") != null);
-    try std.testing.expect(std.mem.indexOf(u8, label, "~/Projects/App/.lcc/worktrees/pe-101") != null);
-
-    var orphan = row;
-    orphan.worktree = null;
-    orphan.attached = .{};
-    const orphan_label = try rowLabel(arena, &environ, orphan, 22, 11, .{});
-    try std.testing.expect(std.mem.indexOf(u8, orphan_label, "53M") == null);
-    try std.testing.expect(std.mem.indexOf(u8, orphan_label, "branch only") != null);
-
-    var by_pr = row;
-    by_pr.disposition = (git.BranchDisposition{
-        .branch = "feature/pe-101-shipped",
+    const now: i64 = 1_800_000_000;
+    var row = testRow(
+        "/Users/me/Projects/App/.lcc/worktrees/pe-256",
+        "feature/pe-256-app-hangs",
+        "abc",
+    );
+    row.disposition = .{
+        .branch = "feature/pe-256-app-hangs",
         .safe = false,
         .reason = .unmerged,
         .unmerged = 3,
-    }).withMergedPr(412);
-    const pr_label = try rowLabel(arena, &environ, by_pr, 22, 11, .{});
-    try std.testing.expect(std.mem.indexOf(u8, pr_label, "merged #412") != null);
+    };
+    row.dirty = 2;
+    row.committed_at = now - 7200;
+
+    const unmerged = try cellsFor(app, row, .{}, now);
+    try std.testing.expectEqualStrings("3 unmerged", unmerged.merge);
+    try std.testing.expectEqualStrings("2 dirty", unmerged.status);
+    try std.testing.expectEqualStrings("2h", unmerged.age);
+
+    var landed = row;
+    landed.disposition = row.disposition.?.withMergedPr(412);
+    landed.dirty = 0;
+    const merged = try cellsFor(app, landed, .{}, now);
+    try std.testing.expectEqualStrings("merged #412", merged.merge);
+    try std.testing.expectEqualStrings("clean", merged.status);
+
+    var untracked = row;
+    untracked.disposition = null;
+    untracked.dirty = null;
+    untracked.committed_at = 0;
+    const unknown = try cellsFor(app, untracked, .{}, now);
+    try std.testing.expectEqualStrings("—", unknown.merge);
+    try std.testing.expectEqualStrings("missing", unknown.status);
+    try std.testing.expectEqualStrings("—", unknown.age);
+}
+
+test "a row shows what it frees and what it spent" {
+    const gpa = std.testing.allocator;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("HOME", "/Users/me");
+
+    const app: app_mod.App = .{
+        .gpa = arena,
+        .io = undefined,
+        .environ = &environ,
+        .ui = undefined,
+    };
+
+    const now: i64 = 1_800_000_000;
+    var row = testRow(
+        "/Users/me/Projects/App/.lcc/worktrees/pe-101",
+        "feature/pe-101-shipped",
+        "abc",
+    );
+    row.disposition = .{
+        .branch = "feature/pe-101-shipped",
+        .safe = true,
+        .reason = .merged,
+        .unmerged = 0,
+    };
+    row.dirty = 0;
+
+    var derived = [_]dd.Sized{.{
+        .entry = .{
+            .name = "App-abc",
+            .path = "/dd/App-abc",
+            .workspace_path = "/Users/me/x",
+        },
+        .size = 1_200_000_000,
+    }};
+    var sessions = [_]cp.Sized{.{
+        .entry = .{
+            .name = "-Users-me-x",
+            .path = "/cp/-Users-me-x",
+            .cwd = "/Users/me/x",
+            .sessions = 3,
+        },
+        .size = 40_000_000,
+    }};
+    row.attached = .{
+        .derived = &derived,
+        .sessions = &sessions,
+        .spent = .{
+            .counts = .{ .messages = 190, .cache_read = 52_600_000 },
+            .sessions = 1,
+        },
+    };
+
+    const kept = try cellsFor(app, row, .{}, now);
+    try std.testing.expectEqualStrings("1.1 GB", kept.frees);
+    try std.testing.expectEqualStrings("53M", kept.spent);
+    try std.testing.expectEqualStrings("~/Projects/App/.lcc/worktrees/pe-101", kept.where);
+    try std.testing.expectEqualStrings("  lcc", kept.note);
+
+    const with_sessions = try cellsFor(app, row, .{ .sessions = true }, now);
+    try std.testing.expectEqualStrings("1.2 GB", with_sessions.frees);
+
+    var orphan: Row = .{ .branch = "feature/pe-103-squashed" };
+    orphan.disposition = .{
+        .branch = "feature/pe-103-squashed",
+        .safe = true,
+        .reason = .upstream_gone,
+        .unmerged = 1,
+    };
+    const gone = try cellsFor(app, orphan, .{}, now);
+    try std.testing.expectEqualStrings("remote gone", gone.merge);
+    try std.testing.expectEqualStrings("—", gone.status);
+    try std.testing.expectEqualStrings("—", gone.frees);
+    try std.testing.expectEqualStrings("branch only — no worktree left", gone.where);
+}
+
+test "an open Xcode window is named on the row that would close it" {
+    const gpa = std.testing.allocator;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("HOME", "/Users/me");
+
+    const app: app_mod.App = .{
+        .gpa = arena,
+        .io = undefined,
+        .environ = &environ,
+        .ui = undefined,
+    };
 
     const doc: xcode.Document = .{
         .app = "/Applications/Xcode.app",
@@ -909,13 +1040,51 @@ test "a bulk row shows what it frees and what it spent" {
         .resolved = "/Users/me/Projects/App/.lcc/worktrees/pe-101/App.xcodeproj",
     };
 
-    var opened = row;
-    opened.attached.xcode = .{ .workspaces = &.{doc} };
-    const open_label = try rowLabel(arena, &environ, opened, 22, 11, .{});
-    try std.testing.expect(std.mem.indexOf(u8, open_label, "open in Xcode") != null);
+    var row = testRow("/Users/me/Projects/App/.lcc/worktrees/pe-101", "feature/pe-101", "abc");
 
-    var dirty = row;
-    dirty.attached.xcode = .{ .workspaces = &.{doc}, .unsaved = &.{doc} };
-    const dirty_label = try rowLabel(arena, &environ, dirty, 22, 11, .{});
-    try std.testing.expect(std.mem.indexOf(u8, dirty_label, "unsaved in Xcode") != null);
+    row.attached.xcode = .{ .workspaces = &.{doc} };
+    const opened = try cellsFor(app, row, .{}, 0);
+    try std.testing.expectEqualStrings("  lcc  — open in Xcode", opened.note);
+
+    row.attached.xcode = .{ .workspaces = &.{doc}, .unsaved = &.{doc} };
+    const dirty = try cellsFor(app, row, .{}, 0);
+    try std.testing.expectEqualStrings("  lcc  — unsaved in Xcode", dirty.note);
+}
+
+test "every column is as wide as its widest cell, header included" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cells = [_]Cells{
+        .{
+            .branch = "feature/pe-256-app-hangs",
+            .merge = "merged #412",
+            .status = "clean",
+            .age = "2h",
+            .frees = "1.2 GB",
+            .spent = "53M",
+            .where = "~/Projects/App/.lcc/worktrees/pe-256",
+            .note = "",
+        },
+    };
+
+    const w = measure(&cells);
+    try std.testing.expectEqual(@as(usize, "feature/pe-256-app-hangs".len), w.branch);
+    try std.testing.expectEqual(@as(usize, "merged #412".len), w.merge);
+    try std.testing.expectEqual(@as(usize, "STATUS".len), w.status);
+    try std.testing.expectEqual(@as(usize, "AGE".len), w.age);
+    try std.testing.expectEqual(@as(usize, "1.2 GB".len), w.frees);
+    try std.testing.expectEqual(@as(usize, "SPENT".len), w.spent);
+
+    const header = try headerLine(arena, w);
+    const line = try rowLine(arena, cells[0], w);
+    try std.testing.expectEqual(
+        std.mem.indexOf(u8, header, "STATUS").?,
+        std.mem.indexOf(u8, line, "clean").?,
+    );
+    try std.testing.expectEqual(
+        std.mem.indexOf(u8, header, "PATH").?,
+        std.mem.indexOf(u8, line, "~/Projects").?,
+    );
 }
