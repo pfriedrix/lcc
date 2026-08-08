@@ -104,8 +104,21 @@ pub fn onDisk(
 ) ![]const sessions.Session {
     var out: std.ArrayList(sessions.Session) = .empty;
     for (list) |s| {
-        if (sessions.visible(io, s, true) == null) continue;
+        if (!sessions.present(io, s)) continue;
         try out.append(arena, s);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+pub fn onDiskChoices(
+    io: Io,
+    arena: std.mem.Allocator,
+    choices: []const app_mod.Choice,
+) ![]const app_mod.Choice {
+    var out: std.ArrayList(app_mod.Choice) = .empty;
+    for (choices) |choice| {
+        if (disk.isGone(io, choice.entry.path)) continue;
+        try out.append(arena, choice);
     }
     return out.toOwnedSlice(arena);
 }
@@ -144,6 +157,11 @@ fn emit(app: app_mod.App, opts: Opts, rows: []const Row, live: bool, outdated: b
         return;
     }
 
+    if (live and outdated) {
+        app.ui.warn("{s}", .{outdated_warning});
+        app.ui.hint("{s}", .{outdated_hint});
+    }
+
     if (rows.len == 0) {
         app.ui.info("No watched sessions.", .{});
         app.ui.hint("Start one with: lcc start PE-256", .{});
@@ -151,10 +169,6 @@ fn emit(app: app_mod.App, opts: Opts, rows: []const Row, live: bool, outdated: b
     }
 
     if (!live) app.ui.warn("Nothing is running these sessions — showing the last recorded state.", .{});
-    if (live and outdated) {
-        app.ui.warn("{s}", .{outdated_warning});
-        app.ui.hint("{s}", .{outdated_hint});
-    }
 
     var widths = struct { issue: usize, status: usize, branch: usize }{
         .issue = "ISSUE".len,
@@ -377,15 +391,18 @@ fn footer(
 }
 
 fn collect(app: app_mod.App, arena: std.mem.Allocator, now: i64) ![]watch_table.Row {
+    var scoped = app;
+    scoped.gpa = arena;
+
     var rows: std.ArrayList(watch_table.Row) = .empty;
 
     var live: []const sessions.Session = &.{};
     var stale = false;
-    if (watch_client.snapshot(app) catch null) |list| {
-        live = try onDisk(app.io, arena, list);
+    if (watch_client.snapshot(scoped) catch null) |list| {
+        live = try onDisk(scoped.io, arena, list);
     } else {
-        const state = sessions.load(arena, app.io, app.environ);
-        const resolved = try sessions.resolved(arena, app.io, state, now);
+        const state = sessions.load(arena, scoped.io, scoped.environ);
+        const resolved = try sessions.resolved(arena, scoped.io, state, now);
         const carried = try arena.alloc(sessions.Session, resolved.len);
         for (resolved, 0..) |r, i| {
             carried[i] = r.session;
@@ -397,65 +414,65 @@ fn collect(app: app_mod.App, arena: std.mem.Allocator, now: i64) ![]watch_table.
 
     var states: ?[]const watch_state.Record = null;
 
-    if (app.repo()) |repo| {
-        for (try app_mod.worktreeChoices(app, repo)) |choice| {
-            if (!disk.isDirectory(app.io, choice.entry.path)) continue;
+    if (scoped.repo()) |repo| {
+        const choices = try onDiskChoices(scoped.io, arena, try app_mod.worktreeChoices(scoped, repo));
+        for (choices) |choice| {
             const branch = choice.entry.branch orelse app_mod.shortHead(choice.entry.head);
-            const match = liveMatch(findSession(live, choice.entry.path));
-            const recovered: ?watch_state.Resolved = if (match != null) null else recover: {
-                if (states == null) states = watch_state.load(arena, app.io, app.environ);
-                break :recover watch_state.statusFor(
-                    states.?,
-                    disk.realPath(arena, app.io, choice.entry.path),
-                );
-            };
-            try rows.append(arena, rowFor(arena, choice.entry.path, branch, match, recovered, stale));
+            try rows.append(arena, rowAt(scoped, arena, &states, live, choice.entry.path, branch, stale));
         }
     } else |_| {}
 
     for (live) |s| {
-        var already = false;
-        for (rows.items) |row| {
-            if (std.mem.eql(u8, row.worktree, s.worktree)) already = true;
-        }
-        if (already) continue;
-        try rows.append(arena, .{
-            .key = s.worktree,
-            .session_id = s.id,
-            .status = s.parsedStatus(),
-            .issue = s.issue,
-            .branch = s.branch,
-            .worktree = s.worktree,
-            .last_activity_at = s.last_activity_at,
-            .exit_code = s.exit_code,
-            .stale = stale,
-        });
+        if (findRow(rows.items, s.worktree) != null) continue;
+        try rows.append(arena, rowAt(scoped, arena, &states, live, s.worktree, s.branch, stale));
     }
 
     return rows.toOwnedSlice(arena);
+}
+
+fn rowAt(
+    app: app_mod.App,
+    arena: std.mem.Allocator,
+    states: *?[]const watch_state.Record,
+    live: []const sessions.Session,
+    path: []const u8,
+    branch: []const u8,
+    stale: bool,
+) watch_table.Row {
+    const found = findSession(live, path);
+    const recovered: ?watch_state.Resolved = if (liveMatch(found) != null) null else recover: {
+        if (states.* == null) states.* = watch_state.load(arena, app.io, app.environ);
+        break :recover watch_state.statusFor(states.*.?, disk.realPath(arena, app.io, path));
+    };
+    return rowFor(arena, path, branch, found, recovered, stale);
 }
 
 pub fn rowFor(
     arena: std.mem.Allocator,
     path: []const u8,
     branch: []const u8,
-    match: ?sessions.Session,
+    found: ?sessions.Session,
     recovered: ?watch_state.Resolved,
     stale: bool,
 ) watch_table.Row {
+    const match = liveMatch(found);
     return .{
         .key = path,
         .session_id = if (match) |m| m.id else null,
         .status = if (match) |m| m.parsedStatus() else if (recovered) |r| r.status else null,
-        .issue = if (match) |m| m.issue else issueOf(arena, branch),
+        .issue = issue: {
+            if (match) |m| if (m.issue) |i| break :issue i;
+            if (found) |f| if (f.issue) |i| break :issue i;
+            break :issue issueOf(arena, branch);
+        },
         .branch = branch,
         .worktree = path,
-        .last_activity_at = if (match) |m|
-            m.last_activity_at
-        else if (recovered) |r|
-            r.last_activity_at
-        else
-            0,
+        .last_activity_at = activity: {
+            if (match) |m| break :activity m.last_activity_at;
+            if (recovered) |r| break :activity r.last_activity_at;
+            if (found) |f| break :activity f.last_activity_at;
+            break :activity 0;
+        },
         .exit_code = if (match) |m| m.exit_code else null,
         .stale = stale and match != null,
     };
@@ -717,7 +734,7 @@ test "a row left behind by a dead daemon does not outrank what the hooks reporte
         arena,
         "/w/pe-290",
         "feature/pe-290",
-        liveMatch(leftover),
+        leftover,
         .{ .status = .waiting, .last_activity_at = 1700 },
         false,
     );
@@ -738,6 +755,97 @@ test "a row left behind by a dead daemon does not outrank what the hooks reporte
     running.status = "waiting";
     try std.testing.expectEqualStrings("s-00000006", liveMatch(running).?.id);
     try std.testing.expect(liveMatch(null) == null);
+}
+
+test "a registry row that is only bookkeeping still dates the worktree and names its issue" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const leftover: sessions.Session = .{
+        .id = "s-00000006",
+        .worktree = "/w/tidy",
+        .branch = "chore/tidy-up",
+        .issue = "PE-291",
+        .status = "unknown",
+        .last_activity_at = 1200,
+    };
+
+    const row = rowFor(arena, "/w/tidy", "chore/tidy-up", leftover, null, false);
+
+    try std.testing.expect(row.status == null);
+    try std.testing.expect(row.session_id == null);
+
+    if (row.last_activity_at != 1200) {
+        std.debug.print(
+            "the row came back dated {d} for a session the registry last saw at 1200: AGE reads " ++
+                "`—` for every worktree a dead daemon touched with no hook report, so a session " ++
+                "that stopped minutes ago is indistinguishable from one that never ran.\n",
+            .{row.last_activity_at},
+        );
+        return error.TestExpectedEqual;
+    }
+
+    if (row.issue == null) {
+        std.debug.print(
+            "the issue was dropped along with the dead session: a branch the naming scheme " ++
+                "cannot parse loses the only record of what the work was, even though the " ++
+                "registry still names it.\n",
+            .{},
+        );
+        return error.TestExpectedEqual;
+    }
+    try std.testing.expectEqualStrings("PE-291", row.issue.?);
+}
+
+test "a worktree git still lists after its directory went is no longer a row" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const removed = try std.fs.path.join(arena, &.{ base, "removed" });
+
+    const kept = try onDiskChoices(io, arena, &.{
+        .{
+            .entry = .{
+                .path = base,
+                .branch = "feature/pe-284",
+                .head = "abcdef01",
+                .locked = false,
+                .prunable = false,
+                .is_main = false,
+            },
+            .managed = true,
+        },
+        .{
+            .entry = .{
+                .path = removed,
+                .branch = "feature/pe-283",
+                .head = "abcdef02",
+                .locked = false,
+                .prunable = true,
+                .is_main = false,
+            },
+            .managed = true,
+        },
+    });
+
+    if (kept.len != 1) {
+        std.debug.print(
+            "{d} of 2 worktrees survived with one directory deleted: the dashboard lists a " ++
+                "worktree `git worktree prune` has not caught up with yet, and enter on that row " ++
+                "starts an agent in a directory that is not there.\n",
+            .{kept.len},
+        );
+        return error.TestExpectedEqual;
+    }
+    try std.testing.expectEqualStrings(base, kept[0].entry.path);
 }
 
 test "a worktree with neither a session nor a report still reads as having none" {

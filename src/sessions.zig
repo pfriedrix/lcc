@@ -127,9 +127,21 @@ pub fn daemonOutdated(state: State, binary_modified: ?i64) bool {
     return built > daemon.started_at;
 }
 
+pub fn present(io: Io, session: Session) bool {
+    return !disk.isGone(io, session.worktree);
+}
+
 pub fn visible(io: Io, session: Session, daemon_alive: bool) ?Status {
-    if (!disk.isDirectory(io, session.worktree)) return null;
+    if (!present(io, session)) return null;
     return if (daemon_alive) session.parsedStatus() else .unknown;
+}
+
+pub fn visibleCount(io: Io, state: State) usize {
+    var count: usize = 0;
+    for (state.sessions) |session| {
+        if (present(io, session)) count += 1;
+    }
+    return count;
 }
 
 pub fn resolved(
@@ -378,6 +390,40 @@ test "a deleted worktree is gone from the list whether or not a daemon is still 
     try testing.expect(visible(io, .{ .worktree = removed, .status = "waiting" }, false) == null);
     try testing.expect(visible(io, .{ .worktree = "", .status = "waiting" }, true) == null);
     try testing.expectEqual(Status.waiting, visible(io, .{ .worktree = base, .status = "waiting" }, true).?);
+}
+
+test "the count the daemon reports is the count the dashboard shows, not everything it ever ran" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const removed = try std.fs.path.join(arena, &.{ base, "removed" });
+
+    const state: State = .{
+        .daemon = .{ .pid = 1, .wrote_at = 1000 },
+        .sessions = &.{
+            .{ .id = "s-here", .worktree = base, .status = "waiting" },
+            .{ .id = "s-gone", .worktree = removed, .status = "active" },
+            .{ .id = "s-done", .worktree = removed, .status = "exited" },
+        },
+    };
+
+    const rows = try resolved(arena, io, state, 1001);
+    if (visibleCount(io, state) != rows.len) {
+        std.debug.print(
+            "`lcc daemon --status` counts {d} where `lcc open` lists {d}: a script that gates " ++
+                "on the daemon's count attaches to sessions that are not there, and a person is " ++
+                "told agents are running with no row to reach them by.\n",
+            .{ visibleCount(io, state), rows.len },
+        );
+        return error.TestExpectedEqual;
+    }
+    try testing.expectEqual(@as(usize, 1), visibleCount(io, state));
 }
 
 test "plan round-trips as text, like every other status" {

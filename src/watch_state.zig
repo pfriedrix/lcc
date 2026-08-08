@@ -120,7 +120,7 @@ pub fn load(
         const file_path = std.fs.path.join(gpa, &.{ base, dirent.name }) catch continue;
         var record = readAt(gpa, io, file_path) orelse continue;
         if (record.cwd.len == 0) continue;
-        if (!disk.isDirectory(io, record.cwd)) continue;
+        if (disk.isGone(io, record.cwd)) continue;
 
         record.cwd = disk.realPath(gpa, io, record.cwd);
         out.append(gpa, record) catch continue;

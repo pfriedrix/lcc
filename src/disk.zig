@@ -38,10 +38,23 @@ pub fn realPath(gpa: std.mem.Allocator, io: Io, target: []const u8) []const u8 {
     return Io.Dir.cwd().realPathFileAlloc(io, target, gpa) catch target;
 }
 
+pub const Presence = enum { present, missing, unknown };
+
+pub fn presence(io: Io, path: []const u8) Presence {
+    if (path.len == 0) return .missing;
+    const info = Io.Dir.cwd().statFile(io, path, .{}) catch |err| return switch (err) {
+        error.FileNotFound, error.NotDir => .missing,
+        else => .unknown,
+    };
+    return if (info.kind == .directory) .present else .missing;
+}
+
 pub fn isDirectory(io: Io, path: []const u8) bool {
-    if (path.len == 0) return false;
-    const info = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
-    return info.kind == .directory;
+    return presence(io, path) == .present;
+}
+
+pub fn isGone(io: Io, path: []const u8) bool {
+    return presence(io, path) == .missing;
 }
 
 pub fn removeChild(io: Io, parent: []const u8, path: []const u8) !void {
@@ -90,6 +103,47 @@ test "a worktree is a directory that is there, not a name that used to be one" {
     }
 
     try std.testing.expect(!isDirectory(io, ""));
+}
+
+test "a directory we are not allowed to look at is not the same answer as one that was deleted" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    const sealed = try std.fs.path.join(arena, &.{ base, "sealed" });
+    const inside = try std.fs.path.join(arena, &.{ sealed, "worktree" });
+    try Io.Dir.cwd().createDirPath(io, inside);
+
+    var dir = try Io.Dir.cwd().openDir(io, sealed, .{});
+    defer dir.close(io);
+    try dir.setPermissions(io, @enumFromInt(0o000));
+    defer dir.setPermissions(io, @enumFromInt(0o700)) catch {};
+
+    switch (presence(io, inside)) {
+        .unknown, .present => {},
+        .missing => {
+            std.debug.print(
+                "a worktree behind a directory this process cannot enter answered `gone`: a " ++
+                    "permission error, an unmounted volume or a stalled network mount deletes " ++
+                    "every live session's row, and the agents still running have nothing left " ++
+                    "to attach to or kill.\n",
+                .{},
+            );
+            return error.TestUnexpectedResult;
+        },
+    }
+
+    const removed = try std.fs.path.join(arena, &.{ base, "removed" });
+    try std.testing.expect(isGone(io, removed));
+    try std.testing.expect(isGone(io, ""));
+    try std.testing.expect(!isGone(io, base));
 }
 
 test "isInside distinguishes containment from a shared prefix" {
