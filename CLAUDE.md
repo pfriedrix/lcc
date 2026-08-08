@@ -12,7 +12,7 @@ library plus CoreFoundation/Security.
 Run from the repo root:
 
 ```bash
-zig build test --summary all       # unit tests (~3s, 300 at last count)
+zig build test --summary all       # unit tests (~3s, 303 at last count)
 zig build                          # debug binary → zig-out/bin/lcc
 zig build -Doptimize=ReleaseFast   # what PATH should be serving
 zig build run -- list              # run without installing
@@ -124,9 +124,26 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   code signature, so `build.zig` signs the installed binary to keep one "Always Allow"
   valid across rebuilds. Removing or bypassing that (`-Dsign=none`) brings back a login
   password prompt on every rebuild, from a process that blocks with no output.
+- **"No token" and "the Keychain would not give it to me" are different answers.**
+  `oauth.readToken` separates `.missing` from `.unreadable`, and every caller has to keep
+  them apart — collapsing them back into `getToken() == null` compiles, reads tidier, and
+  tells a user whose token is right there to run `lcc auth` again: a browser round trip for
+  a Keychain dialog that only had to be answered. The refusal is the *likelier* of the two
+  on a machine that rebuilds lcc, because a renewed signing certificate changes the
+  designated requirement and macOS asks once more — and that prompt can be denied, escaped,
+  or missed behind a full-screen terminal. `keychain.describeLast` is what turns the
+  OSStatus into that sentence; leaving it uncalled is how the distinction quietly dies.
 - **`src/keychain.zig` imports five narrow C headers on purpose.** The umbrella
   `CoreFoundation.h` / `Security.h` do not translate on this SDK. Do not tidy them into one
   import.
+- **`start.zig`'s `bail` only exits when nobody is waiting on it.** It returns
+  `error{Failed}` under `opts.returns_to_caller`, which is what `lcc open`'s `n` sets: the
+  dashboard calls `start.run` in-process, so a `std.process.exit` in there takes the whole
+  dashboard down — every other session's row with it — over one bad answer. That is why
+  every call site reads `return bail(…)` and why `cancel` has the same shape. A new call
+  site written as a bare `bail(…)` is a compile error rather than a silent fall-through,
+  but only because the returned error value cannot be discarded; do not "fix" that by
+  ignoring it.
 - **A hook event that reports no `permission_mode` must not clear the one already known.**
   Only some events carry it — `Notification` does not (see the test in `watch_hooks.zig`).
   `watch_session.setPlan` is guarded on `permission_mode.len > 0` for that reason, and

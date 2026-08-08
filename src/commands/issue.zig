@@ -85,8 +85,17 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
 fn authorize(app: app_mod.App, opts: Opts) !oauth.Token {
     app.ui.hint("Reading the Linear token from the Keychain...", .{});
     app.ui.flush();
-    if (oauth.getToken(app.gpa) == null) {
-        bail(app, opts.json, "not_authenticated", "Not authenticated. Run `lcc auth` first.", .{});
+    switch (oauth.readToken(app.gpa)) {
+        .token => {},
+        .missing => bail(app, opts.json, "not_authenticated", "Not authenticated. Run `lcc auth` first.", .{}),
+        .unreadable => |why| bail(
+            app,
+            opts.json,
+            "keychain_unreadable",
+            "The Linear token is in the Keychain, but reading it failed: {s}. " ++
+                "Answer `Always Allow` if macOS asks again; `lcc auth` re-stores it if it stays refused.",
+            .{why},
+        ),
     }
 
     const cfg = try config.load(app.gpa, app.io, app.environ);

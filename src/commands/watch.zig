@@ -354,7 +354,7 @@ fn newSession(app: app_mod.App, screen: *term.Screen, terminal: term.Terminal) !
         .no_attach = true,
         .all = cfg.allIssues,
         .plan_mode = cfg.planMode,
-        .cancel_returns = true,
+        .returns_to_caller = true,
     }) catch {};
 
     _ = try term.Terminal.enterRaw();

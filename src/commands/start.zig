@@ -28,37 +28,46 @@ pub const Opts = struct {
     plan_mode: bool = true,
     watch: bool = true,
     no_attach: bool = false,
-    cancel_returns: bool = false,
+    returns_to_caller: bool = false,
 };
 
 fn cancel(opts: Opts) error{Cancelled} {
-    if (opts.cancel_returns) return error.Cancelled;
+    if (opts.returns_to_caller) return error.Cancelled;
     std.process.exit(app_mod.cancelled_exit_code);
 }
 
 pub fn run(app: app_mod.App, opts: Opts) !void {
     if (opts.json and opts.issue == null) {
-        bail(app, opts.json, "usage", "--json needs an issue to resolve, e.g. `lcc start PE-256 --json`.", .{});
+        return bail(app, opts, "usage", "--json needs an issue to resolve, e.g. `lcc start PE-256 --json`.", .{});
     }
     if (opts.json and opts.all) {
-        bail(app, opts.json, "usage", "--all only affects the picker, which --json does not use.", .{});
+        return bail(app, opts, "usage", "--all only affects the picker, which --json does not use.", .{});
     }
     const plan_path: ?[]const u8 = if (opts.plan) |raw| blk: {
         const resolved = Io.Dir.cwd().realPathFileAlloc(app.io, raw, app.gpa) catch |err| switch (err) {
-            error.FileNotFound => bail(app, opts.json, "plan_not_found", "No plan file at {s}.", .{raw}),
-            else => bail(app, opts.json, "plan_unreadable", "Cannot read plan at {s}: {s}", .{ raw, @errorName(err) }),
+            error.FileNotFound => return bail(app, opts, "plan_not_found", "No plan file at {s}.", .{raw}),
+            else => return bail(app, opts, "plan_unreadable", "Cannot read plan at {s}: {s}", .{ raw, @errorName(err) }),
         };
         const info = Io.Dir.cwd().statFile(app.io, resolved, .{}) catch |err|
-            bail(app, opts.json, "plan_unreadable", "Cannot read plan at {s}: {s}", .{ raw, @errorName(err) });
+            return bail(app, opts, "plan_unreadable", "Cannot read plan at {s}: {s}", .{ raw, @errorName(err) });
         if (info.kind != .file) {
-            bail(app, opts.json, "plan_not_found", "{s} is a {s}, not a plan file.", .{ raw, @tagName(info.kind) });
+            return bail(app, opts, "plan_not_found", "{s} is a {s}, not a plan file.", .{ raw, @tagName(info.kind) });
         }
         break :blk resolved;
     } else null;
     app.ui.hint("Reading the Linear token from the Keychain...", .{});
     app.ui.flush();
-    if (oauth.getToken(app.gpa) == null) {
-        bail(app, opts.json, "not_authenticated", "Not authenticated. Run `lcc auth` first.", .{});
+    switch (oauth.readToken(app.gpa)) {
+        .token => {},
+        .missing => return bail(app, opts, "not_authenticated", "Not authenticated. Run `lcc auth` first.", .{}),
+        .unreadable => |why| return bail(
+            app,
+            opts,
+            "keychain_unreadable",
+            "The Linear token is in the Keychain, but reading it failed: {s}. " ++
+                "Answer `Always Allow` if macOS asks again; `lcc auth` re-stores it if it stays refused.",
+            .{why},
+        ),
     }
 
     const cfg = try config.load(app.gpa, app.io, app.environ);
@@ -66,9 +75,9 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     const plan_mode = plan_path == null and opts.plan_mode;
 
     if (plan_path != null and !templateCarriesPlan(cfg.startTaskCommand)) {
-        bail(
+        return bail(
             app,
-            opts.json,
+            opts,
             "usage",
             "--plan needs {{plan}} in startTaskCommand — nothing else carries it to the agent. Add it with `lcc setup`.",
             .{},
@@ -76,7 +85,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     }
 
     const token = oauth.ensureFreshToken(app.gpa, app.io, cfg.clientId) catch |err| {
-        bail(app, opts.json, "auth_failed", "{s}: {s}", .{ @errorName(err), oauth.last_detail });
+        return bail(app, opts, "auth_failed", "{s}: {s}", .{ @errorName(err), oauth.last_detail });
     };
 
     const selected = if (opts.issue) |raw|
@@ -182,9 +191,9 @@ fn fetchNamed(
     raw: []const u8,
 ) !linear.Issue {
     const trimmed = std.mem.trim(u8, raw, " \t");
-    const ref = linear.refFromBranch(trimmed) orelse bail(
+    const ref = linear.refFromBranch(trimmed) orelse return bail(
         app,
-        opts.json,
+        opts,
         "bad_identifier",
         "'{s}' is not an issue identifier — expected something like PE-256.",
         .{trimmed},
@@ -195,14 +204,15 @@ fn fetchNamed(
         app.ui.flush();
     }
 
-    const found = linear.fetchIssue(app.gpa, app.io, token, ref) catch |err| bail(
+    const found = linear.fetchIssue(app.gpa, app.io, token, ref) catch |err| return bail(
         app,
-        opts.json,
+        opts,
         "linear_failed",
         "Linear request failed ({s}, HTTP {d}): {s}",
         .{ @errorName(err), linear.last_status, linear.last_message },
     );
-    return found orelse bail(app, opts.json, "issue_not_found", "No issue {s} in Linear.", .{trimmed});
+    if (found) |issue| return issue;
+    return bail(app, opts, "issue_not_found", "No issue {s} in Linear.", .{trimmed});
 }
 
 fn pickFromActive(
@@ -218,9 +228,9 @@ fn pickFromActive(
     app.ui.step("Fetching Linear issues ({s})...", .{fetch_label});
     app.ui.flush();
 
-    const result = linear.fetchActiveIssues(app.gpa, app.io, token, cfg.activeStates, opts.all) catch |err| bail(
+    const result = linear.fetchActiveIssues(app.gpa, app.io, token, cfg.activeStates, opts.all) catch |err| return bail(
         app,
-        opts.json,
+        opts,
         "linear_failed",
         "Linear request failed ({s}, HTTP {d}): {s}",
         .{ @errorName(err), linear.last_status, linear.last_message },
@@ -358,17 +368,17 @@ fn bootstrap(
         }
 
         const wt = repo.createWorktree(branch, path, base.?) catch |err| switch (err) {
-            git.Error.WorktreePathExists => bail(
+            git.Error.WorktreePathExists => return bail(
                 app,
-                opts.json,
+                opts,
                 "worktree_path_exists",
                 "Worktree path already exists but no worktree is registered there: {s}\nRemove it first with: git worktree remove {s}  (or delete the directory).",
                 .{ path, path },
             ),
             git.Error.GitFailed => if (git.last_error.len > 0)
-                bail(app, opts.json, "git_failed", "git worktree add failed: {s}", .{git.last_error})
+                return bail(app, opts, "git_failed", "git worktree add failed: {s}", .{git.last_error})
             else
-                bail(app, opts.json, "git_failed", "git worktree add failed.", .{}),
+                return bail(app, opts, "git_failed", "git worktree add failed.", .{}),
             else => return err,
         };
         created = wt.created;
@@ -417,13 +427,15 @@ fn bootstrap(
 }
 
 fn resolveRepo(app: app_mod.App, opts: Opts, identifier: []const u8) !git.Repo {
-    if (opts.repo) |given| return app.repoAt(given) catch bail(
-        app,
-        opts.json,
-        "bad_repo",
-        "--repo {s} is not inside a git repository.",
-        .{given},
-    );
+    if (opts.repo) |given| {
+        return app.repoAt(given) catch return bail(
+            app,
+            opts,
+            "bad_repo",
+            "--repo {s} is not inside a git repository.",
+            .{given},
+        );
+    }
 
     const state = repos.load(app.gpa, app.io, app.environ);
 
@@ -452,9 +464,9 @@ fn resolveRepo(app: app_mod.App, opts: Opts, identifier: []const u8) !git.Repo {
         return found;
     }
 
-    if (opts.json) bail(
+    if (opts.json) return bail(
         app,
-        opts.json,
+        opts,
         "repo_unconfirmed",
         "Nothing says which repository {s} belongs to: no answer remembered for it, and " ++
             "no branch for it in any repository lcc knows{s}. --json will not fall back to the " ++
@@ -675,13 +687,13 @@ fn isCwd(app: app_mod.App, path: []const u8) bool {
 
 fn bail(
     app: app_mod.App,
-    json: bool,
+    opts: Opts,
     code: []const u8,
     comptime fmt: []const u8,
     args: anytype,
-) noreturn {
+) error{Failed} {
     const message = std.fmt.allocPrint(app.gpa, fmt, args) catch "";
-    if (json) {
+    if (opts.json) {
         const body = std.json.Stringify.valueAlloc(app.gpa, .{
             .@"error" = .{ .code = code, .message = message },
         }, .{ .whitespace = .indent_2 }) catch "{\"error\":{\"code\":\"internal\"}}";
@@ -689,6 +701,7 @@ fn bail(
     }
     app.ui.fail("{s}", .{message});
     app.ui.flush();
+    if (opts.returns_to_caller) return error.Failed;
     std.process.exit(1);
 }
 
@@ -739,6 +752,50 @@ fn pickBaseBranch(app: app_mod.App, repo: git.Repo) !?[]const u8 {
     app.ui.flush();
     const index = try prompt.search(app.gpa, app.io, "Pick base branch:", items) orelse return null;
     return branches[index];
+}
+
+test "a refusal on the dashboard's new-session path comes back as an error, instead of taking the dashboard down with it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var environ: std.process.Environ.Map = .init(arena);
+
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_w: Io.Writer = .fixed(&out_buf);
+    var err_w: Io.Writer = .fixed(&err_buf);
+    const app: app_mod.App = .{
+        .gpa = arena,
+        .io = io,
+        .environ = &environ,
+        .ui = .{ .io = io, .out = &out_w, .err = &err_w },
+    };
+
+    const missing = "/nowhere/lcc-has-no-plan-here.md";
+    const answer = run(app, .{ .plan = missing, .returns_to_caller = true });
+
+    if (answer) |_| {
+        std.debug.print(
+            "start.run accepted a plan file that is not there, so the refusal this test " ++
+                "watches never happened and nothing was proven about how it comes back.\n",
+            .{},
+        );
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(error.Failed, err);
+    }
+
+    if (std.mem.indexOf(u8, err_w.buffered(), missing) == null) {
+        std.debug.print(
+            "the refusal came back without naming {s} anywhere the user can see it: pressing " ++
+                "n on the dashboard would fail silently and redraw as if nothing had happened.\n",
+            .{missing},
+        );
+        return error.TestExpectedEqual;
+    }
 }
 
 test "findWorktree prefers the exact branch, then the issue behind it" {

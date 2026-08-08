@@ -83,9 +83,17 @@ fn withPersonalToken(app: app_mod.App, pat: []const u8) !void {
 }
 
 fn status(app: app_mod.App) !void {
-    const stored = oauth.getToken(app.gpa) orelse {
-        app.ui.warn("Not authenticated. Run `lcc auth`.", .{});
-        return;
+    const stored = switch (oauth.readToken(app.gpa)) {
+        .token => |t| t,
+        .missing => {
+            app.ui.warn("Not authenticated. Run `lcc auth`.", .{});
+            return;
+        },
+        .unreadable => |why| {
+            app.ui.fail("The Linear token is stored, but reading it failed: {s}", .{why});
+            app.ui.hint("Answer `Always Allow` if macOS asks again; `lcc auth` re-stores it if it stays refused.", .{});
+            std.process.exit(1);
+        },
     };
     const cfg = try config.load(app.gpa, app.io, app.environ);
 
@@ -123,6 +131,10 @@ fn reportAuthError(app: app_mod.App, err: anyerror) noreturn {
         error.CallbackTimedOut => app.ui.fail("Timed out waiting for browser authorization", .{}),
         error.AuthorizationDenied => app.ui.fail("Linear returned error: {s}", .{detail}),
         error.NotAuthenticated => app.ui.fail("Not authenticated. Run `lcc auth` first.", .{}),
+        error.KeychainUnreadable => app.ui.fail(
+            "The Linear token is stored, but reading it failed: {s}",
+            .{detail},
+        ),
         error.TokenExpiredNoRefresh => app.ui.fail(
             "Access token expired and no refresh token available. Run `lcc auth` again.",
             .{},

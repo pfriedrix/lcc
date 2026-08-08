@@ -199,9 +199,18 @@ fn issueTask(app: app_mod.App, refs: []const linear.Ref, out: *IssueColumn) void
         out.note = "Linear column skipped — could not read the config.";
         return;
     };
-    if (oauth.getToken(app.gpa) == null) {
-        out.note = "Linear column needs `lcc auth`.";
-        return;
+    switch (oauth.readToken(app.gpa)) {
+        .token => {},
+        .missing => {
+            out.note = "Linear column needs `lcc auth`.";
+            return;
+        },
+        .unreadable => |why| {
+            out.note = std.fmt.allocPrint(app.gpa, "Linear column skipped — the Keychain refused the token: {s}", .{
+                why,
+            }) catch "Linear column skipped — the Keychain refused the token.";
+            return;
+        },
     }
     const token = oauth.ensureFreshToken(app.gpa, app.io, cfg.clientId) catch {
         out.note = "Could not refresh the Linear token — run `lcc auth`.";
