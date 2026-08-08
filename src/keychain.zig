@@ -19,6 +19,8 @@ const err_sec_success: c.OSStatus = 0;
 const err_sec_item_not_found: c.OSStatus = -25300;
 const err_sec_duplicate_item: c.OSStatus = -25299;
 const err_sec_auth_failed: c.OSStatus = -25293;
+const err_sec_interaction_not_allowed: c.OSStatus = -25308;
+const err_sec_interaction_required: c.OSStatus = -25315;
 const err_sec_user_canceled: c.OSStatus = -128;
 
 pub var last_status: c.OSStatus = err_sec_success;
@@ -139,7 +141,45 @@ pub fn describeStatus(status: c.OSStatus) []const u8 {
         err_sec_item_not_found => "item not found",
         err_sec_duplicate_item => "duplicate item",
         err_sec_auth_failed => "authorization failed (keychain prompt denied?)",
+        err_sec_interaction_not_allowed, err_sec_interaction_required => "the keychain is locked and no prompt could be shown",
         err_sec_user_canceled => "user canceled the keychain prompt",
         else => "unmapped OSStatus",
     };
+}
+
+pub fn describeLast(gpa: std.mem.Allocator) []const u8 {
+    return std.fmt.allocPrint(gpa, "{s} (OSStatus {d})", .{
+        describeStatus(last_status),
+        last_status,
+    }) catch describeStatus(last_status);
+}
+
+test "a refused read is described by what the Keychain answered, not left as a bare failure" {
+    const gpa = std.testing.allocator;
+
+    const refusals = [_]c.OSStatus{
+        err_sec_auth_failed,
+        err_sec_interaction_not_allowed,
+        err_sec_user_canceled,
+    };
+    for (refusals) |status| {
+        last_status = status;
+        const said = describeLast(gpa);
+        defer gpa.free(said);
+
+        if (std.mem.indexOf(u8, said, "unmapped") != null) {
+            std.debug.print(
+                "OSStatus {d} came back as an unmapped number: the one line telling the user " ++
+                    "why the Keychain refused reads as noise, and the only thing left to act on " ++
+                    "is the wrong advice to authenticate again.\n",
+                .{status},
+            );
+            return error.TestUnexpectedResult;
+        }
+        const number = try std.fmt.allocPrint(gpa, "{d}", .{status});
+        defer gpa.free(number);
+        try std.testing.expect(std.mem.indexOf(u8, said, number) != null);
+    }
+
+    last_status = err_sec_success;
 }

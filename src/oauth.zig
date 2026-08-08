@@ -17,6 +17,7 @@ pub const Token = struct {
 
 pub const Error = error{
     NotAuthenticated,
+    KeychainUnreadable,
     TokenExpiredNoRefresh,
     TokenEndpointFailed,
     CallbackFailed,
@@ -373,12 +374,31 @@ pub fn refreshAccessToken(
     return token;
 }
 
-pub fn getToken(gpa: std.mem.Allocator) ?Token {
-    const raw = keychain.get(gpa, service, account) catch return null;
-    const value = raw orelse return null;
-    return std.json.parseFromSliceLeaky(Token, gpa, value, .{
+pub const Stored = union(enum) {
+    token: Token,
+    missing,
+    unreadable: []const u8,
+};
+
+pub fn decodeStored(gpa: std.mem.Allocator, raw: ?[]const u8) Stored {
+    const value = raw orelse return .missing;
+    const parsed = std.json.parseFromSliceLeaky(Token, gpa, value, .{
         .ignore_unknown_fields = true,
-    }) catch null;
+    }) catch return .{ .unreadable = "the stored token is not the JSON lcc wrote" };
+    return .{ .token = parsed };
+}
+
+pub fn readToken(gpa: std.mem.Allocator) Stored {
+    const raw = keychain.get(gpa, service, account) catch
+        return .{ .unreadable = keychain.describeLast(gpa) };
+    return decodeStored(gpa, raw);
+}
+
+pub fn getToken(gpa: std.mem.Allocator) ?Token {
+    return switch (readToken(gpa)) {
+        .token => |t| t,
+        else => null,
+    };
 }
 
 pub fn setToken(gpa: std.mem.Allocator, token: Token) !void {
@@ -393,8 +413,47 @@ pub fn clearToken() void {
     keychain.delete(service, account) catch {};
 }
 
+test "a token the Keychain would not give up is a different answer from never having logged in" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqual(
+        @as(std.meta.Tag(Stored), .missing),
+        decodeStored(arena, null),
+    );
+
+    const good = decodeStored(arena, "{\"access_token\":\"lin_oauth_x\",\"scope\":\"read write\"}");
+    try std.testing.expectEqualStrings("lin_oauth_x", good.token.access_token);
+
+    const damaged = [_][]const u8{ "", "   ", "{", "null", "{\"scope\":\"read\"}" };
+    for (damaged) |raw| {
+        switch (decodeStored(arena, raw)) {
+            .unreadable => {},
+            .missing => {
+                std.debug.print(
+                    "a Keychain entry holding {s} was reported as no entry at all: the user is " ++
+                        "sent to `lcc auth` to fix a login that is already there, and the damaged " ++
+                        "value that actually needs replacing is never named.\n",
+                    .{if (raw.len == 0) "an empty value" else raw},
+                );
+                return error.TestUnexpectedResult;
+            },
+            .token => return error.TestUnexpectedResult,
+        }
+    }
+}
+
 pub fn ensureFreshToken(gpa: std.mem.Allocator, io: Io, client_id: []const u8) Error!Token {
-    const token = getToken(gpa) orelse return Error.NotAuthenticated;
+    const token = switch (readToken(gpa)) {
+        .token => |t| t,
+        .missing => return Error.NotAuthenticated,
+        .unreadable => |why| {
+            last_detail = why;
+            return Error.KeychainUnreadable;
+        },
+    };
     if (token.is_pat orelse false) return token;
 
     const expired = if (token.expires_at) |at| at <= nowSeconds(io) else false;

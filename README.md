@@ -350,7 +350,7 @@ Failures come back in the same shape, on stdout, with exit code 1:
 { "error": { "code": "issue_not_found", "message": "No issue PE-999 in Linear." } }
 ```
 
-Codes: `usage`, `not_authenticated`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`, `worktree_path_exists`, `git_failed`, `bad_repo`, `plan_not_found`, `plan_unreadable`, `repo_unconfirmed` — the last one is the picker above in a mode with nobody to ask: pass `--repo <path>`, or run it once interactively and the answer is remembered. Progress lines and the human-readable error go to stderr, so stdout holds nothing but the payload — including git's own output, which is captured rather than inherited in this mode.
+Codes: `usage`, `not_authenticated`, `keychain_unreadable`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`, `worktree_path_exists`, `git_failed`, `bad_repo`, `plan_not_found`, `plan_unreadable`, `repo_unconfirmed` — the last one is the picker above in a mode with nobody to ask: pass `--repo <path>`, or run it once interactively and the answer is remembered. Progress lines and the human-readable error go to stderr, so stdout holds nothing but the payload — including git's own output, which is captured rather than inherited in this mode.
 
 ### `lcc issue`
 
@@ -521,7 +521,7 @@ Some details that are easy to get wrong, and are decided here rather than left t
 
 `gh` is optional throughout: without it rule 4 falls back to the commit-distance contest, which needs no network, no auth and no remote — the absence costs one note.
 
-Failures take the same shape as `lcc start --json` — JSON on stdout, the human line on stderr, exit 1. Codes shared by every subcommand: `usage`, `not_authenticated`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`. `comment` adds `body_not_found`, `body_unreadable`, `body_empty`, `body_too_large`.
+Failures take the same shape as `lcc start --json` — JSON on stdout, the human line on stderr, exit 1. Codes shared by every subcommand: `usage`, `not_authenticated`, `keychain_unreadable`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`. `comment` adds `body_not_found`, `body_unreadable`, `body_empty`, `body_too_large`.
 
 ### `lcc open`
 
@@ -804,6 +804,16 @@ The designated requirement becomes `identifier lcc and … certificate leaf[subj
 | `-Dsign=none` | opt out, keep the ad-hoc signature |
 
 A self-signed certificate works and never expires on someone else's schedule (Keychain Access → Certificate Assistant → *Create a Certificate*, type *Code Signing*); name it `lcc-dev` and it is preferred automatically. An Apple Development certificate is equally fine, with the caveat that it expires — the requirement changes with the certificate, so the first run after a renewal asks once more.
+
+That one prompt is answerable with *Deny*, or with Escape, or it can be missed entirely behind a full-screen terminal — and a refused read is not a missing login. It is reported as one:
+
+```
+✗ The Linear token is in the Keychain, but reading it failed: authorization failed
+  (keychain prompt denied?) (OSStatus -25293). Answer `Always Allow` if macOS asks
+  again; `lcc auth` re-stores it if it stays refused.
+```
+
+`lcc auth --status` says the same thing rather than "Not authenticated", and `--json` calls it `keychain_unreadable` rather than `not_authenticated`. Re-running `lcc auth` does fix it, by storing the item afresh under the current signature — but it is a full browser round trip for a dialog that only had to be answered, which is why the two are told apart.
 
 ### MCP servers
 
