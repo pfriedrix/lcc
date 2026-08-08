@@ -187,6 +187,7 @@ fn select(app: app_mod.App, candidates: []const Candidate) ![]const Candidate {
         app.gpa,
         app.io,
         "Select what to delete (space toggles, enter confirms):",
+        "",
         items,
         true,
     ) orelse std.process.exit(app_mod.cancelled_exit_code);
