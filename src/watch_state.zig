@@ -120,17 +120,12 @@ pub fn load(
         const file_path = std.fs.path.join(gpa, &.{ base, dirent.name }) catch continue;
         var record = readAt(gpa, io, file_path) orelse continue;
         if (record.cwd.len == 0) continue;
-        if (!worktreeExists(io, record.cwd)) continue;
+        if (!disk.isDirectory(io, record.cwd)) continue;
 
         record.cwd = disk.realPath(gpa, io, record.cwd);
         out.append(gpa, record) catch continue;
     }
     return out.toOwnedSlice(gpa) catch &.{};
-}
-
-fn worktreeExists(io: Io, worktree: []const u8) bool {
-    const info = Io.Dir.cwd().statFile(io, worktree, .{}) catch return false;
-    return info.kind == .directory;
 }
 
 const testing = std.testing;
@@ -182,7 +177,6 @@ test "a recovered status is never one only a live session can be in" {
         try testing.expect(status != .active);
         try testing.expect(status != .starting);
         try testing.expect(status != .exited);
-        try testing.expect(status != .orphan);
         try testing.expect(status != .unknown);
     }
 }

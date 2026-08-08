@@ -76,8 +76,9 @@ fn snapshotOnce(app: app_mod.App, opts: Opts) !void {
     const outdated = outdatedDaemon(app, app.gpa, exec.selfModified(app.gpa, app.io));
 
     if (live) |list| {
-        const rows = try app.gpa.alloc(Row, list.len);
-        for (list, 0..) |s, i| rows[i] = toRow(s, false);
+        const present = try onDisk(app.io, app.gpa, list);
+        const rows = try app.gpa.alloc(Row, present.len);
+        for (present, 0..) |s, i| rows[i] = toRow(s, false);
         return emit(app, opts, rows, true, outdated, now);
     }
 
@@ -94,6 +95,19 @@ fn snapshotOnce(app: app_mod.App, opts: Opts) !void {
 
 fn outdatedDaemon(app: app_mod.App, arena: std.mem.Allocator, built: ?i64) bool {
     return sessions.daemonOutdated(sessions.load(arena, app.io, app.environ), built);
+}
+
+pub fn onDisk(
+    io: Io,
+    arena: std.mem.Allocator,
+    list: []const sessions.Session,
+) ![]const sessions.Session {
+    var out: std.ArrayList(sessions.Session) = .empty;
+    for (list) |s| {
+        if (sessions.visible(io, s, true) == null) continue;
+        try out.append(arena, s);
+    }
+    return out.toOwnedSlice(arena);
 }
 
 const outdated_warning = "These sessions are running an older build of lcc than this one.";
@@ -368,7 +382,7 @@ fn collect(app: app_mod.App, arena: std.mem.Allocator, now: i64) ![]watch_table.
     var live: []const sessions.Session = &.{};
     var stale = false;
     if (watch_client.snapshot(app) catch null) |list| {
-        live = list;
+        live = try onDisk(app.io, arena, list);
     } else {
         const state = sessions.load(arena, app.io, app.environ);
         const resolved = try sessions.resolved(arena, app.io, state, now);
@@ -385,8 +399,9 @@ fn collect(app: app_mod.App, arena: std.mem.Allocator, now: i64) ![]watch_table.
 
     if (app.repo()) |repo| {
         for (try app_mod.worktreeChoices(app, repo)) |choice| {
+            if (!disk.isDirectory(app.io, choice.entry.path)) continue;
             const branch = choice.entry.branch orelse app_mod.shortHead(choice.entry.head);
-            const match = findSession(live, choice.entry.path);
+            const match = liveMatch(findSession(live, choice.entry.path));
             const recovered: ?watch_state.Resolved = if (match != null) null else recover: {
                 if (states == null) states = watch_state.load(arena, app.io, app.environ);
                 break :recover watch_state.statusFor(
@@ -444,6 +459,11 @@ pub fn rowFor(
         .exit_code = if (match) |m| m.exit_code else null,
         .stale = stale and match != null,
     };
+}
+
+pub fn liveMatch(found: ?sessions.Session) ?sessions.Session {
+    const session = found orelse return null;
+    return if (session.parsedStatus() == .unknown) null else session;
 }
 
 pub fn findSession(list: []const sessions.Session, worktree: []const u8) ?sessions.Session {
@@ -635,6 +655,89 @@ test "a live session outranks anything left on disk for the same worktree" {
     try std.testing.expectEqualStrings("s-00000004", row.session_id.?);
     try std.testing.expectEqual(@as(i64, 9000), row.last_activity_at);
     try std.testing.expect(row.attachable());
+}
+
+test "a session the daemon is still running in a deleted worktree is dropped too, not just the dead ones" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const removed = try std.fs.path.join(arena, &.{ base, "removed" });
+
+    const present = try onDisk(io, arena, &.{
+        .{ .id = "s-here", .worktree = base, .branch = "feature/pe-284", .status = "waiting" },
+        .{ .id = "s-gone", .worktree = removed, .branch = "feature/pe-283", .status = "active" },
+        .{ .id = "s-done", .worktree = removed, .branch = "feature/pe-286", .status = "exited" },
+    });
+
+    if (present.len != 1) {
+        std.debug.print(
+            "{d} of 3 sessions survived a snapshot with two deleted worktrees: the dashboard " ++
+                "lists work that has nowhere left to happen, and enter on those rows opens an " ++
+                "agent in a directory that is not there.\n",
+            .{present.len},
+        );
+        return error.TestExpectedEqual;
+    }
+    try std.testing.expectEqualStrings("s-here", present[0].id);
+    try std.testing.expectEqualStrings("waiting", present[0].status);
+}
+
+test "a row left behind by a dead daemon does not outrank what the hooks reported" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const leftover: sessions.Session = .{
+        .id = "s-00000006",
+        .worktree = "/w/pe-290",
+        .branch = "feature/pe-290",
+        .issue = "PE-290",
+        .status = "unknown",
+        .last_activity_at = 1200,
+    };
+
+    if (liveMatch(leftover) != null) {
+        std.debug.print(
+            "a session the daemon left in the registry still counts as a match: it reports " ++
+                "`unknown` for every worktree that daemon ever touched, and the status the hooks " ++
+                "wrote to disk is never consulted, which is the whole point of recovering it.\n",
+            .{},
+        );
+        return error.TestUnexpectedResult;
+    }
+
+    const row = rowFor(
+        arena,
+        "/w/pe-290",
+        "feature/pe-290",
+        liveMatch(leftover),
+        .{ .status = .waiting, .last_activity_at = 1700 },
+        false,
+    );
+    try std.testing.expectEqual(sessions.Status.waiting, row.status.?);
+    try std.testing.expectEqual(@as(i64, 1700), row.last_activity_at);
+
+    if (row.attachable()) {
+        std.debug.print(
+            "the recovered row kept the dead session's id and offers itself for attach: enter " ++
+                "asks the daemon for a session nothing holds and comes back unknown_session, " ++
+                "instead of starting the work again.\n",
+            .{},
+        );
+        return error.TestUnexpectedResult;
+    }
+
+    var running = leftover;
+    running.status = "waiting";
+    try std.testing.expectEqualStrings("s-00000006", liveMatch(running).?.id);
+    try std.testing.expect(liveMatch(null) == null);
 }
 
 test "a worktree with neither a session nor a report still reads as having none" {

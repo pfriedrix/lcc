@@ -123,6 +123,16 @@ A session running in another repository still appears, because an agent working
 somewhere you are not looking is the one you most need to see. `lcc open xcode`
 is unchanged and still opens a worktree in Xcode.
 
+What the list never shows is a directory that is not there. A worktree you
+removed drops off the moment its directory does — including one `git worktree
+prune` has not caught up with yet, which git still lists — and the sessions that
+ran in it go with it rather than staying as rows that open nothing. Nothing
+cleans up after them otherwise: the background process never drops a session from
+its own list and writes that list once more on the way out, so its file goes on
+naming every worktree it ever touched until a new one replaces the file. The one
+thing you give up is reaching an agent still running in a directory you deleted —
+it has no row any more, and `lcc open --stop-all` is what ends it.
+
 `● waiting` is the one that wants you: the agent is blocked on a permission
 prompt or a question. `◐ active` is a turn in flight, `○ idle` is finished.
 Those come from Claude Code's own hooks rather than from reading its screen, so
@@ -182,6 +192,12 @@ turn in flight is a claim only a running one can make. A session you quit
 normally clears its file and goes back to `no session`, having nothing left to
 say. Sessions that died before this shipped left no file behind and stay
 `no session` until you start them again.
+
+A row the dead process left in the registry does not outrank that file either. It
+can only read `unknown` — the one thing that could have said otherwise is gone —
+and what the hooks reported is better than that, so the recovered status wins. It
+is still not offered for attach: the session behind that row died with its
+process, whatever the registry remembers of it.
 
 Sessions also hold the build of `lcc` they started under. After `zig build` the
 sessions still running can be many commits behind the `lcc` you are typing —
