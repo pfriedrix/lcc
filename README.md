@@ -129,9 +129,16 @@ prune` has not caught up with yet, which git still lists — and the sessions th
 ran in it go with it rather than staying as rows that open nothing. Nothing
 cleans up after them otherwise: the background process never drops a session from
 its own list and writes that list once more on the way out, so its file goes on
-naming every worktree it ever touched until a new one replaces the file. The one
-thing you give up is reaching an agent still running in a directory you deleted —
-it has no row any more, and `lcc open --stop-all` is what ends it.
+naming every worktree it ever touched until a new one replaces the file.
+
+That rule holds even when the agent is still running: a session whose directory
+you deleted has no row, because the row would open nothing and the work has
+nowhere left to happen. `lcc remove` is the usual way to get there — it does not
+stop a session before taking its worktree away — and `lcc open --stop-all` is
+what ends what is left. Gone means gone, though, and not "could not tell": a
+worktree behind a directory this process cannot read, or on a volume that is not
+mounted right now, keeps its row and its session rather than being reported as
+deleted.
 
 `● waiting` is the one that wants you: the agent is blocked on a permission
 prompt or a question. `◐ active` is a turn in flight, `○ idle` is finished.

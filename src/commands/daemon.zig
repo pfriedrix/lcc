@@ -20,6 +20,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
 fn status(app: app_mod.App, opts: Opts) !void {
     const state = sessions.load(app.gpa, app.io, app.environ);
     const running = sessions.alive(state);
+    const listed = sessions.visibleCount(app.io, state);
     const socket_path = watch_paths.socket(app.gpa, app.environ) catch "";
 
     if (opts.json) {
@@ -28,7 +29,7 @@ fn status(app: app_mod.App, opts: Opts) !void {
             .pid = if (state.daemon) |d| d.pid else null,
             .socket = socket_path,
             .protocol = wire.protocol,
-            .sessions = state.sessions.len,
+            .sessions = listed,
         }, .{ .whitespace = .indent_2 });
         app.ui.payload("{s}\n", .{body});
         app.ui.flush();
@@ -37,10 +38,10 @@ fn status(app: app_mod.App, opts: Opts) !void {
 
     if (!running) {
         app.ui.info("No daemon running.", .{});
-        if (state.sessions.len > 0) {
+        if (listed > 0) {
             app.ui.warn(
                 "{d} session(s) were recorded before it stopped — their agents may still be running.",
-                .{state.sessions.len},
+                .{listed},
             );
         }
         return;
@@ -48,7 +49,7 @@ fn status(app: app_mod.App, opts: Opts) !void {
 
     app.ui.success("Daemon running (pid {d}), {d} session(s).", .{
         if (state.daemon) |d| d.pid else 0,
-        state.sessions.len,
+        listed,
     });
     app.ui.hint("Socket: {s}", .{socket_path});
 }

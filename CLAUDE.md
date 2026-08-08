@@ -12,7 +12,7 @@ library plus CoreFoundation/Security.
 Run from the repo root:
 
 ```bash
-zig build test --summary all       # unit tests (~3s, 293 at last count)
+zig build test --summary all       # unit tests (~3s, 300 at last count)
 zig build                          # debug binary → zig-out/bin/lcc
 zig build -Doptimize=ReleaseFast   # what PATH should be serving
 zig build run -- list              # run without installing
@@ -142,21 +142,39 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   improvement and turns every recovered row into an `unknown_session` error. The ids collide
   across daemons anyway — `next_id` restarts at 1 — which is also why the state file is named
   for Claude Code's session UUID rather than for either the lcc id or the worktree path.
-- **A dashboard row has to name a directory that still exists.** `sessions.visible` is that
+- **A dashboard row has to name a directory that still exists.** `sessions.present` is that
   rule, and *both* ways the rows are read have to go through it — the live snapshot in
   `collect` / `snapshotOnce` and `sessions.resolved` — because the daemon never drops a
   session from its own list and flushes that whole list once more as it exits, so its file
   outlives it naming every worktree it ever ran in. `collect` puts the same predicate on
-  `app.worktreeChoices`, not inside it: git keeps listing a worktree whose directory was
-  deleted (`prunable`), and that is exactly the row `lcc list` shows in red and `lcc remove`
-  needs in order to clean the entry up.
-- **A registry row reading `unknown` is bookkeeping, not a session.** `collect` collapses it to
-  `null` through `liveMatch` before `rowFor` ever sees it. Leave it a match and the worktree's
-  hook-recovered status is never consulted — which after a daemon dies is every worktree it
-  touched, so `watch_state` recovers nothing and the column reads `unknown` with an age
-  measured from the epoch. Passing `rowFor` the recovered status *and* the dead session id
+  `app.worktreeChoices` through `onDiskChoices`, not inside `worktreeChoices`: git keeps
+  listing a worktree whose directory was deleted (`prunable`), and that is exactly the row
+  `lcc list` shows in red and `lcc remove` needs in order to clean the entry up. Anything
+  counting sessions has to ask too — `lcc daemon --status` reports `sessions.visibleCount`,
+  not `state.sessions.len`, or it contradicts the list `lcc open` prints from the same file.
+- **"Gone" is a narrower answer than "the stat failed".** `disk.presence` separates the two and
+  `isGone` is the one a row is hidden on, because the predicate now runs against *live*
+  sessions: collapse `AccessDenied`, `SymLinkLoop`, a stalled mount or a deleted cwd into
+  `missing` and one unreadable parent directory takes every running agent off the dashboard,
+  out of `lcc open --json`, and out of reach of anything but `--stop-all`. `isDirectory` is the
+  positive question and stays false for `unknown`; nothing may hide a row on `!isDirectory`.
+- **A registry row reading `unknown` is bookkeeping, not a session.** `rowFor` collapses it
+  through `liveMatch` itself, so no caller can hand it a dead id. Leave it a match and the
+  worktree's hook-recovered status is never consulted — which after a daemon dies is every
+  worktree it touched, so `watch_state` recovers nothing and the column reads `unknown` with an
+  age measured from the epoch. Giving `rowFor` the recovered status *and* the dead session id
   instead is worse than either: `attachable` goes true and enter asks the daemon for a session
-  nothing holds.
+  nothing holds. The collapsed entry is still read for the age and the issue — dropping it
+  whole is what leaves a worktree the daemon lost reading `—` with no issue, as if nothing had
+  ever run there. Both of `collect`'s loops go through `rowAt`; the second one exists for
+  sessions outside this repo, and building its rows by hand is how they end up the only ones
+  that never recover a status.
+- **`collect` runs once a second, so it allocates from the frame arena.** It rebinds the app
+  (`var scoped = app; scoped.gpa = arena;`) and every call under it — `watch_client.snapshot`,
+  `scoped.repo()`, `worktreeChoices`, `sessions.load` — inherits that. Hand any of them
+  `app.gpa` and the dashboard grows a git spawn's output plus a parsed snapshot per frame in
+  the process arena, which is never freed, until an overnight `lcc open` is measured in
+  hundreds of megabytes.
 - **A session's hook settings file is per session, not per daemon.** `watch_paths.hooksFor`
   names it `hooks-<session id>.json` and `watch_hooks.settingsJson` bakes that id into every
   hook command line, so a report says which session it came from. Collapsing them back into
