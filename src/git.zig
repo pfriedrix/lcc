@@ -117,7 +117,18 @@ pub const Repo = struct {
         return statuses.toOwnedSlice(self.gpa);
     }
 
+    fn unlinked(self: Repo, worktree_path: []const u8) bool {
+        const link = std.fs.path.join(self.gpa, &.{ worktree_path, ".git" }) catch return false;
+        _ = Io.Dir.cwd().statFile(self.io, link, .{}) catch |err| return switch (err) {
+            error.FileNotFound, error.NotDir => true,
+            else => false,
+        };
+        return false;
+    }
+
     pub fn dirtyCount(self: Repo, worktree_path: []const u8) ?u32 {
+        if (self.unlinked(worktree_path)) return null;
+
         const out = self.captureIn(worktree_path, &.{ "git", "status", "--porcelain" }) orelse
             return null;
 
@@ -827,6 +838,60 @@ fn runGit(gpa: std.mem.Allocator, io: Io, cwd: []const u8, args: []const []const
         std.debug.print("git {s} failed: {s}\n", .{ args[0], exec.message(out) });
         return error.GitFailed;
     }
+}
+
+test "a worktree whose checkout is gone does not report the main repo's changes as its own" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const proj = try std.fs.path.join(arena, &.{ base, "proj" });
+    const linked = try std.fs.path.join(arena, &.{ proj, ".lcc", "worktrees", "x" });
+
+    try runGit(gpa, io, base, &.{ "init", "-q", "-b", "master", "proj" });
+    try runGit(gpa, io, proj, &.{ "commit", "-q", "--allow-empty", "-m", "init" });
+    try runGit(gpa, io, proj, &.{ "worktree", "add", "-q", linked, "-b", "feature/x" });
+
+    const repo: Repo = .{ .gpa = arena, .io = io, .root = proj };
+
+    const cwd = Io.Dir.cwd();
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ proj, "left-behind.txt" }),
+        .data = "uncommitted work in the main checkout\n",
+    });
+
+    try std.testing.expectEqual(@as(u32, 0), repo.dirtyCount(linked).?);
+
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ linked, "mine.txt" }),
+        .data = "uncommitted work in the worktree\n",
+    });
+    try std.testing.expectEqual(@as(u32, 1), repo.dirtyCount(linked).?);
+
+    try cwd.deleteTree(io, linked);
+    try cwd.createDirPath(io, linked);
+
+    if (repo.dirtyCount(linked)) |count| {
+        std.debug.print(
+            "a worktree with nothing left in it answered `{d} dirty`: git walked up out of the " ++
+                "emptied directory and counted the main checkout's changes, so `lcc remove` and " ++
+                "`lcc list` call the row clean-or-dirty instead of missing, and the removal " ++
+                "prompt warns about {d} uncommitted change(s) that are not in there and cannot " ++
+                "be lost.\n",
+            .{ count, count },
+        );
+        return error.TestUnexpectedResult;
+    }
+
+    try cwd.deleteTree(io, linked);
+    try std.testing.expect(repo.dirtyCount(linked) == null);
 }
 
 test "rewriteBranchName keeps only the tail" {

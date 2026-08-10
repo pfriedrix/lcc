@@ -12,7 +12,7 @@ library plus CoreFoundation/Security.
 Run from the repo root:
 
 ```bash
-zig build test --summary all       # unit tests (~3s, 303 at last count)
+zig build test --summary all       # unit tests (~3s, 305 at last count)
 zig build                          # debug binary → zig-out/bin/lcc
 zig build -Doptimize=ReleaseFast   # what PATH should be serving
 zig build run -- list              # run without installing
@@ -130,6 +130,18 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   `reserved` argument to `pageSize` is what keeps the two in step — `checkbox` passes 5 when
   it has a column header and 4 when it does not. Add a line to a frame without raising it and
   the list looks fine until the terminal is short.
+- **A `git` run with `cwd` inside a worktree can answer for a different repository.** Git
+  discovers its repo by walking *up* from `cwd` until it finds a `.git`, and the default
+  worktree template is `{repoRoot}/.lcc/worktrees/{branchLeaf}` — so a worktree that lost its
+  `.git` link does not make `git status --porcelain` fail, it makes it succeed with the *main*
+  checkout's changes. `dirtyCount` guards on `unlinked` for that reason: without it every
+  emptied worktree reads `clean` or `N dirty` in `lcc remove` and `lcc list` instead of
+  `missing`, and the removal prompt warns about uncommitted changes that are not in there and
+  cannot be lost. The guard only bails when the `.git` entry is *definitely* absent
+  (`FileNotFound` / `NotDir`) — an unreadable parent has to fall through to git rather than be
+  reported as a deleted checkout, the same distinction `disk.presence` draws. Any new read that
+  passes a worktree path as `cwd` needs the same guard; a broken `.git` *pointer* is already
+  safe, because git fails loudly (exit 128) instead of escaping.
 - **Keychain and code signing are coupled.** The Linear token's ACL is keyed on the binary's
   code signature, so `build.zig` signs the installed binary to keep one "Always Allow"
   valid across rebuilds. Removing or bypassing that (`-Dsign=none`) brings back a login
