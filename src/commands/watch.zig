@@ -352,7 +352,7 @@ fn newSession(app: app_mod.App, screen: *term.Screen, terminal: term.Terminal) !
     start_cmd.run(app, .{
         .watch = true,
         .no_attach = true,
-        .all = cfg.allIssues,
+        .all = start_cmd.AllIssues.resolve(null, cfg.allIssues),
         .plan_mode = cfg.planMode,
         .returns_to_caller = true,
     }) catch {};

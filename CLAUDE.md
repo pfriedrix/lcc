@@ -107,6 +107,16 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   exit 1, and `lcc issue show`'s `issue` block matches `lcc start --json`'s field for field
   where they overlap. Adding a key is cheap; renaming or dropping one is a breaking change
   for the slash commands that parse it.
+- **`orConfig` erases who asked for an option, so nothing may be *refused* on its value.**
+  `opts.all`, `opts.plan_mode`, `opts.watch`, `opts.tokens` all come back from `orConfig` as a
+  plain `bool` that reads the same whether the user typed the flag or a `~/.config/lcc` key set
+  it years ago. A guard like "`--all` does nothing under `--json`" is a sentence about *argv*,
+  and keying it on the resolved value fires for every caller of a config carrying
+  `allIssues: true` — who cannot unset a flag they never passed, so `lcc start PE-N --json`
+  fails outright and the worktree gets made by hand. `start.AllIssues` keeps `.flag` apart from
+  `.config` for that reason: behaviour asks `enabled()`, the refusal asks `== .flag`. A new
+  guard over a config-backed option needs the same split, and `.config` has to stay a distinct
+  tag rather than be folded back into a bool once it looks unused.
 - **Interactive commands need a tty.** `src/prompt.zig` puts the terminal in raw mode and
   returns `Error.NotATerminal` otherwise, so any path that reaches a picker fails when run
   from a tool call. Exercise the non-interactive paths instead: `lcc start PE-N --json`,

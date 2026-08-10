@@ -18,8 +18,23 @@ const watch_cmd = @import("watch.zig");
 
 const priority_label = [_][]const u8{ "   ", "U  ", "H  ", "M  ", "L  " };
 
+pub const AllIssues = enum {
+    off,
+    config,
+    flag,
+
+    pub fn resolve(flag: ?bool, configured: bool) AllIssues {
+        if (flag) |explicit| return if (explicit) .flag else .off;
+        return if (configured) .config else .off;
+    }
+
+    pub fn enabled(self: AllIssues) bool {
+        return self != .off;
+    }
+};
+
 pub const Opts = struct {
-    all: bool = false,
+    all: AllIssues = .off,
     issue: ?[]const u8 = null,
     json: bool = false,
     base: ?[]const u8 = null,
@@ -40,7 +55,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     if (opts.json and opts.issue == null) {
         return bail(app, opts, "usage", "--json needs an issue to resolve, e.g. `lcc start PE-256 --json`.", .{});
     }
-    if (opts.json and opts.all) {
+    if (opts.json and opts.all == .flag) {
         return bail(app, opts, "usage", "--all only affects the picker, which --json does not use.", .{});
     }
     const plan_path: ?[]const u8 = if (opts.plan) |raw| blk: {
@@ -221,14 +236,14 @@ fn pickFromActive(
     cfg: config.Config,
     token: oauth.Token,
 ) !?linear.Issue {
-    const fetch_label = if (opts.all)
+    const fetch_label = if (opts.all.enabled())
         try app.gpa.dupe(u8, "all states")
     else
         try std.mem.join(app.gpa, ", ", cfg.activeStates);
     app.ui.step("Fetching Linear issues ({s})...", .{fetch_label});
     app.ui.flush();
 
-    const result = linear.fetchActiveIssues(app.gpa, app.io, token, cfg.activeStates, opts.all) catch |err| return bail(
+    const result = linear.fetchActiveIssues(app.gpa, app.io, token, cfg.activeStates, opts.all.enabled()) catch |err| return bail(
         app,
         opts,
         "linear_failed",
@@ -236,7 +251,7 @@ fn pickFromActive(
         .{ @errorName(err), linear.last_status, linear.last_message },
     );
 
-    if (!opts.all and result.skipped.len > 0) {
+    if (!opts.all.enabled() and result.skipped.len > 0) {
         var skipped_total: u32 = 0;
         for (result.skipped) |s| skipped_total += s.count;
 
@@ -259,7 +274,7 @@ fn pickFromActive(
     }
 
     if (result.matched.len == 0) {
-        if (opts.all) {
+        if (opts.all.enabled()) {
             app.ui.warn("No active issues assigned to you (excluding Completed/Canceled).", .{});
         } else {
             app.ui.warn("No issues assigned to you in: {s}.", .{fetch_label});
@@ -795,6 +810,57 @@ test "a refusal on the dashboard's new-session path comes back as an error, inst
             .{missing},
         );
         return error.TestExpectedEqual;
+    }
+}
+
+test "an allIssues default in config does not refuse a --json start over a flag the caller never typed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var environ: std.process.Environ.Map = .init(arena);
+
+    const missing = "/nowhere/lcc-has-no-plan-here.md";
+
+    for ([_]struct { all: AllIssues, code: []const u8 }{
+        .{ .all = .config, .code = "plan_not_found" },
+        .{ .all = .off, .code = "plan_not_found" },
+        .{ .all = .flag, .code = "usage" },
+    }) |c| {
+        var out_buf: [4096]u8 = undefined;
+        var err_buf: [4096]u8 = undefined;
+        var out_w: Io.Writer = .fixed(&out_buf);
+        var err_w: Io.Writer = .fixed(&err_buf);
+        const app: app_mod.App = .{
+            .gpa = arena,
+            .io = io,
+            .environ = &environ,
+            .ui = .{ .io = io, .out = &out_w, .err = &err_w, .divert = true },
+        };
+
+        const answer = run(app, .{
+            .json = true,
+            .issue = "PE-256",
+            .all = c.all,
+            .plan = missing,
+            .returns_to_caller = true,
+        });
+        try std.testing.expectEqual(error.Failed, answer);
+
+        if (std.mem.indexOf(u8, out_w.buffered(), c.code) == null) {
+            std.debug.print(
+                "with all = .{s} the --json payload came back without \"{s}\": " ++
+                    "`lcc start PE-N --json` answers for the wrong thing. A config that widens " ++
+                    "the picker (allIssues: true) must not turn every machine-mode start into a " ++
+                    "usage error about --all, because the caller cannot unset a flag it never " ++
+                    "passed and has to fall back to `git worktree add` by hand; a typed " ++
+                    "--all with --json must still say so. Payload was: {s}\n",
+                .{ @tagName(c.all), c.code, out_w.buffered() },
+            );
+            return error.TestExpectedEqual;
+        }
     }
 }
 

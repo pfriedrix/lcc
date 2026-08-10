@@ -203,7 +203,7 @@ fn startCommand(app: app_mod.App, args: []const []const u8) !void {
     }
 
     const cfg = try config.load(app.gpa, app.io, app.environ);
-    opts.all = orConfig(all, cfg.allIssues);
+    opts.all = start_cmd.AllIssues.resolve(all, cfg.allIssues);
     opts.plan_mode = orConfig(plan_mode, cfg.planMode);
     opts.watch = orConfig(watch, cfg.watchByDefault);
 
