@@ -33,6 +33,7 @@ pub const keys = [_]Key{
     .{ .name = "keepBranch", .kind = .boolean, .label = "Removing keeps the branch" },
     .{ .name = "keepDerivedData", .kind = .boolean, .label = "Removing keeps build data" },
     .{ .name = "keepXcode", .kind = .boolean, .label = "Removing leaves Xcode alone" },
+    .{ .name = "xcodeApp", .kind = .text, .label = "Xcode to open worktrees in" },
     .{ .name = "worktreeTemplate", .kind = .text, .label = "Worktree path" },
     .{ .name = "startTaskCommand", .kind = .text, .label = "Opening prompt" },
     .{ .name = "activeStates", .kind = .list, .label = "Linear states offered" },
@@ -77,6 +78,7 @@ fn list(app: app_mod.App, opts: Opts) !void {
             .keepBranch = cfg.keepBranch,
             .keepDerivedData = cfg.keepDerivedData,
             .keepXcode = cfg.keepXcode,
+            .xcodeApp = cfg.xcodeApp,
             .worktreeTemplate = cfg.worktreeTemplate,
             .startTaskCommand = cfg.startTaskCommand,
             .activeStates = cfg.activeStates,
@@ -263,10 +265,7 @@ fn change(
             terminal.restore();
 
             const current = try render(app, cfg, key);
-            const shown = if (std.mem.eql(u8, current, "(none)") or std.mem.eql(u8, current, "(all)"))
-                ""
-            else
-                current;
+            const shown = if (placeholder(current)) "" else current;
             const typed = try prompt.input(app.gpa, app.io, key.name, shown);
 
             terminal.* = try term.Terminal.enterRaw();
@@ -284,6 +283,13 @@ fn change(
     config.save(app.gpa, app.io, app.environ, patch) catch {};
 }
 
+fn placeholder(text: []const u8) bool {
+    inline for (.{ "(none)", "(all)", "(ask)" }) |shown| {
+        if (std.mem.eql(u8, text, shown)) return true;
+    }
+    return false;
+}
+
 fn applyBool(patch: *config.Patch, name: []const u8, on: bool) void {
     if (std.mem.eql(u8, name, "watchByDefault")) patch.watchByDefault = on;
     if (std.mem.eql(u8, name, "planMode")) patch.planMode = on;
@@ -298,6 +304,7 @@ fn applyBool(patch: *config.Patch, name: []const u8, on: bool) void {
 fn applyText(patch: *config.Patch, name: []const u8, raw: []const u8) void {
     if (std.mem.eql(u8, name, "worktreeTemplate")) patch.worktreeTemplate = raw;
     if (std.mem.eql(u8, name, "startTaskCommand")) patch.startTaskCommand = raw;
+    if (std.mem.eql(u8, name, "xcodeApp")) patch.xcodeApp = raw;
 }
 
 fn applyList(patch: *config.Patch, name: []const u8, items: []const []const u8) void {
@@ -335,6 +342,9 @@ fn render(app: app_mod.App, cfg: config.Config, key: Key) ![]const u8 {
     if (std.mem.eql(u8, key.name, "worktreeTemplate")) return cfg.worktreeTemplate;
     if (std.mem.eql(u8, key.name, "startTaskCommand")) {
         return if (cfg.startTaskCommand.len == 0) "(none)" else cfg.startTaskCommand;
+    }
+    if (std.mem.eql(u8, key.name, "xcodeApp")) {
+        return if (cfg.xcodeApp.len == 0) "(ask)" else cfg.xcodeApp;
     }
     if (std.mem.eql(u8, key.name, "activeStates")) return std.mem.join(app.gpa, ", ", cfg.activeStates);
     if (std.mem.eql(u8, key.name, "linkPatterns")) return std.mem.join(app.gpa, ", ", cfg.linkPatterns);
