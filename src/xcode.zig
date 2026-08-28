@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const disk = @import("disk.zig");
 const exec = @import("exec.zig");
+const plist = @import("plist.zig");
 
 const ignore_dirs = [_][]const u8{ "node_modules", "Pods", "Carthage", "DerivedData", "vendor" };
 
@@ -37,6 +38,164 @@ const Candidate = struct {
     kind: Kind,
     depth: u8,
 };
+
+pub const Install = struct {
+    path: []const u8,
+    name: []const u8,
+    version: []const u8 = "",
+    build: []const u8 = "",
+    active: bool = false,
+
+    pub fn title(self: Install, gpa: std.mem.Allocator) ![]const u8 {
+        if (self.version.len == 0) return self.name;
+        return std.fmt.allocPrint(gpa, "{s} {s}", .{ self.name, self.version });
+    }
+};
+
+const spotlight_query = "kMDItemCFBundleIdentifier == 'com.apple.dt.Xcode'";
+
+pub fn installs(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+) ![]const Install {
+    var paths: std.ArrayList([]const u8) = .empty;
+    if (exec.run(gpa, io, &.{ "mdfind", spotlight_query }, null)) |out| {
+        if (out.ok()) {
+            for (try parseSpotlight(gpa, out.stdout)) |path| try remember(gpa, &paths, path);
+        }
+    } else |_| {}
+
+    try scanApps(gpa, io, "/Applications", &paths);
+    if (environ.get("HOME")) |home| {
+        try scanApps(gpa, io, try std.fs.path.join(gpa, &.{ home, "Applications" }), &paths);
+    }
+
+    const selected = activeApp(gpa, io);
+
+    var found: std.ArrayList(Install) = .empty;
+    for (paths.items) |path| {
+        var install = (try describeApp(gpa, io, path)) orelse continue;
+        install.active = std.mem.eql(u8, install.path, selected);
+        try found.append(gpa, install);
+    }
+    std.mem.sort(Install, found.items, {}, preferred);
+    return found.toOwnedSlice(gpa);
+}
+
+pub fn describeApp(gpa: std.mem.Allocator, io: Io, path: []const u8) !?Install {
+    const bundle = std.mem.trimEnd(u8, path, "/");
+    if (bundle.len == 0) return null;
+
+    const executable = try std.fs.path.join(gpa, &.{ bundle, "Contents", "MacOS", "Xcode" });
+    Io.Dir.cwd().access(io, executable, .{}) catch return null;
+
+    var install: Install = .{ .path = try gpa.dupe(u8, bundle), .name = bundleName(bundle) };
+    const version_plist = try std.fs.path.join(gpa, &.{ bundle, "Contents", "version.plist" });
+    if (readPlist(gpa, io, version_plist)) |xml| {
+        install.version = (try plist.string(gpa, xml, "CFBundleShortVersionString")) orelse "";
+        install.build = (try plist.string(gpa, xml, "ProductBuildVersion")) orelse "";
+    }
+    return install;
+}
+
+pub fn match(found: []const Install, raw: []const u8) ?Install {
+    const value = std.mem.trimEnd(u8, std.mem.trim(u8, raw, " \t\r\n"), "/");
+    if (value.len == 0) return null;
+
+    for (found) |install| {
+        if (std.mem.eql(u8, install.path, value)) return install;
+        if (std.ascii.eqlIgnoreCase(install.name, value)) return install;
+        if (std.ascii.eqlIgnoreCase(std.fs.path.basename(install.path), value)) return install;
+        if (install.build.len > 0 and std.ascii.eqlIgnoreCase(install.build, value)) return install;
+    }
+    for (found) |install| {
+        if (install.version.len == 0) continue;
+        if (std.mem.eql(u8, install.version, value)) return install;
+        if (std.mem.startsWith(u8, install.version, value) and
+            install.version.len > value.len and install.version[value.len] == '.') return install;
+    }
+    return null;
+}
+
+fn bundleName(bundle: []const u8) []const u8 {
+    const leaf = std.fs.path.basename(bundle);
+    return if (std.mem.endsWith(u8, leaf, ".app")) leaf[0 .. leaf.len - ".app".len] else leaf;
+}
+
+fn readPlist(gpa: std.mem.Allocator, io: Io, path: []const u8) ?[]const u8 {
+    const raw = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch return null;
+    if (std.mem.indexOf(u8, raw, "<key>") != null) return raw;
+    return exec.capture(gpa, io, &.{ "plutil", "-convert", "xml1", "-o", "-", path }, null) catch null;
+}
+
+fn parseSpotlight(gpa: std.mem.Allocator, listing: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, listing, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (!std.mem.endsWith(u8, line, ".app")) continue;
+        try remember(gpa, &out, line);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn scanApps(
+    gpa: std.mem.Allocator,
+    io: Io,
+    dir_path: []const u8,
+    out: *std.ArrayList([]const u8),
+) !void {
+    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".app")) continue;
+        try remember(gpa, out, try std.fs.path.join(gpa, &.{ dir_path, entry.name }));
+    }
+}
+
+fn remember(gpa: std.mem.Allocator, out: *std.ArrayList([]const u8), path: []const u8) !void {
+    const trimmed = std.mem.trimEnd(u8, path, "/");
+    if (trimmed.len == 0) return;
+    for (out.items) |seen| {
+        if (std.mem.eql(u8, seen, trimmed)) return;
+    }
+    try out.append(gpa, try gpa.dupe(u8, trimmed));
+}
+
+const developer_suffix = "/Contents/Developer";
+
+fn activeApp(gpa: std.mem.Allocator, io: Io) []const u8 {
+    const developer = exec.capture(gpa, io, &.{ "xcode-select", "-p" }, null) catch return "";
+    if (!std.mem.endsWith(u8, developer, developer_suffix)) return "";
+    return developer[0 .. developer.len - developer_suffix.len];
+}
+
+fn preferred(_: void, a: Install, b: Install) bool {
+    if (a.active != b.active) return a.active;
+    const order = compareVersions(a.version, b.version);
+    if (order != .eq) return order == .gt;
+    return std.mem.lessThan(u8, a.name, b.name);
+}
+
+fn compareVersions(a: []const u8, b: []const u8) std.math.Order {
+    var left = std.mem.splitScalar(u8, a, '.');
+    var right = std.mem.splitScalar(u8, b, '.');
+    while (true) {
+        const next_left = left.next();
+        const next_right = right.next();
+        if (next_left == null and next_right == null) return .eq;
+        const order = std.math.order(component(next_left), component(next_right));
+        if (order != .eq) return order;
+    }
+}
+
+fn component(part: ?[]const u8) u64 {
+    const text = std.mem.trim(u8, part orelse return 0, " \t");
+    return std.fmt.parseUnsigned(u64, text, 10) catch 0;
+}
 
 pub const Error = error{ XcodeLaunchFailed, XcodeCloseFailed } || std.mem.Allocator.Error;
 
@@ -102,8 +261,13 @@ pub fn describe(gpa: std.mem.Allocator, target: Target) ![]u8 {
     });
 }
 
-pub fn open(gpa: std.mem.Allocator, io: Io, target: []const u8) Error!void {
-    const out = exec.run(gpa, io, &.{ "open", "-a", "Xcode", target }, null) catch
+pub fn open(
+    gpa: std.mem.Allocator,
+    io: Io,
+    application: []const u8,
+    target: []const u8,
+) Error!void {
+    const out = exec.run(gpa, io, &.{ "open", "-a", application, target }, null) catch
         return Error.XcodeLaunchFailed;
     if (!out.ok()) {
         last_error = exec.message(out);
@@ -449,4 +613,130 @@ test "no target at all" {
     defer arena_state.deinit();
 
     try std.testing.expect((try findTarget(arena_state.allocator(), io, root, 4)) == null);
+}
+
+test "an Xcode Spotlight found outside /Applications counts, and a duplicate does not" {
+    const gpa = std.testing.allocator;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+
+    const listing =
+        \\/Applications/Xcode.app
+        \\/Users/me/Downloads/Xcode-beta.app
+        \\/Applications/Xcode.app
+        \\/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild
+        \\
+    ;
+    const paths = try parseSpotlight(arena_state.allocator(), listing);
+    try std.testing.expectEqual(@as(usize, 2), paths.len);
+    try std.testing.expectEqualStrings("/Applications/Xcode.app", paths[0]);
+    try std.testing.expectEqualStrings("/Users/me/Downloads/Xcode-beta.app", paths[1]);
+}
+
+test "an app is an Xcode by the executable it carries, and names the version it reports" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try tmp.dir.createDirPath(io, "Xcode-beta.app/Contents/MacOS");
+    try tmp.dir.writeFile(io, .{ .sub_path = "Xcode-beta.app/Contents/MacOS/Xcode", .data = "" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "Xcode-beta.app/Contents/version.plist",
+        .data =
+        \\<plist><dict>
+        \\<key>CFBundleShortVersionString</key>
+        \\<string>27.0</string>
+        \\<key>ProductBuildVersion</key>
+        \\<string>27A5218g</string>
+        \\</dict></plist>
+        ,
+    });
+    try tmp.dir.createDirPath(io, "Safari.app/Contents/MacOS");
+
+    const beta = (try describeApp(arena, io, try std.fs.path.join(arena, &.{ root, "Xcode-beta.app" }))).?;
+    try std.testing.expectEqualStrings("Xcode-beta", beta.name);
+    try std.testing.expectEqualStrings("27.0", beta.version);
+    try std.testing.expectEqualStrings("27A5218g", beta.build);
+
+    const safari = try describeApp(arena, io, try std.fs.path.join(arena, &.{ root, "Safari.app" }));
+    try std.testing.expect(safari == null);
+}
+
+test "an Xcode with no readable version is still offered, by name alone" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try tmp.dir.createDirPath(io, "Xcode.app/Contents/MacOS");
+    try tmp.dir.writeFile(io, .{ .sub_path = "Xcode.app/Contents/MacOS/Xcode", .data = "" });
+
+    const found = (try describeApp(arena, io, try std.fs.path.join(arena, &.{ root, "Xcode.app" }))).?;
+    try std.testing.expectEqualStrings("Xcode", found.name);
+    try std.testing.expectEqualStrings("", found.version);
+    try std.testing.expectEqualStrings("Xcode", try found.title(arena));
+}
+
+test "naming the release build does not hand back the beta standing next to it" {
+    const found = [_]Install{
+        .{ .path = "/Applications/Xcode.app", .name = "Xcode", .version = "26.6", .build = "17F113" },
+        .{ .path = "/Users/me/Downloads/Xcode-beta.app", .name = "Xcode-beta", .version = "27.0", .build = "27A5218g" },
+    };
+
+    try std.testing.expectEqualStrings("/Applications/Xcode.app", match(&found, "Xcode").?.path);
+    try std.testing.expectEqualStrings("/Applications/Xcode.app", match(&found, "xcode").?.path);
+    try std.testing.expectEqualStrings("/Applications/Xcode.app", match(&found, "Xcode.app").?.path);
+    try std.testing.expectEqualStrings("/Applications/Xcode.app", match(&found, "26.6").?.path);
+    try std.testing.expectEqualStrings("/Applications/Xcode.app", match(&found, "26").?.path);
+    try std.testing.expectEqualStrings("/Applications/Xcode.app", match(&found, "17F113").?.path);
+
+    const beta = "/Users/me/Downloads/Xcode-beta.app";
+    try std.testing.expectEqualStrings(beta, match(&found, "Xcode-beta").?.path);
+    try std.testing.expectEqualStrings(beta, match(&found, beta).?.path);
+    try std.testing.expectEqualStrings(beta, match(&found, beta ++ "/").?.path);
+    try std.testing.expectEqualStrings(beta, match(&found, "27").?.path);
+
+    try std.testing.expect(match(&found, "Xcode-") == null);
+    try std.testing.expect(match(&found, "25") == null);
+    try std.testing.expect(match(&found, "") == null);
+    try std.testing.expect(match(&.{}, "Xcode") == null);
+}
+
+test "the picker leads with the Xcode the toolchain already points at" {
+    var found = [_]Install{
+        .{ .path = "/Applications/Xcode-15.app", .name = "Xcode-15", .version = "15.4" },
+        .{ .path = "/Applications/Xcode-beta.app", .name = "Xcode-beta", .version = "27.0" },
+        .{ .path = "/Applications/Xcode.app", .name = "Xcode", .version = "26.6", .active = true },
+    };
+    std.mem.sort(Install, &found, {}, preferred);
+
+    try std.testing.expectEqualStrings("Xcode", found[0].name);
+    try std.testing.expectEqualStrings("Xcode-beta", found[1].name);
+    try std.testing.expectEqualStrings("Xcode-15", found[2].name);
+}
+
+test "9.9 is older than 10.0, and a version nobody reported sorts last" {
+    try std.testing.expectEqual(std.math.Order.lt, compareVersions("9.9", "10.0"));
+    try std.testing.expectEqual(std.math.Order.gt, compareVersions("26.6", "26.5.1"));
+    try std.testing.expectEqual(std.math.Order.eq, compareVersions("26.6", "26.6.0"));
+    try std.testing.expectEqual(std.math.Order.lt, compareVersions("", "1.0"));
+    try std.testing.expectEqual(std.math.Order.eq, compareVersions("", ""));
 }

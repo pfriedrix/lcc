@@ -77,6 +77,10 @@ const usage =
     \\    --stop-all             end every session running in the background
     \\      --force              kill them rather than letting them finish
     \\  open xcode               Pick a worktree and open it in Xcode instead
+    \\    --xcode <app>          which Xcode, when more than one is installed — its
+    \\                           name, its version, or the path to the .app. Without
+    \\                           it, `lcc config xcodeApp` decides, and lcc asks when
+    \\                           neither does
     \\  remove | rm              Select and remove one or more worktrees, branches, and build data
     \\    --merged               bulk: every worktree and branch already merged
     \\    --local                decide from local refs only — no fetch, no asking
@@ -340,8 +344,11 @@ fn authCommand(app: app_mod.App, args: []const []const u8) !void {
 fn openCommand(app: app_mod.App, args: []const []const u8) !void {
     var target_arg: ?[]const u8 = null;
     var resume_opt: ?bool = null;
+    var xcode_app: ?[]const u8 = null;
     var watch_opts: watch_cmd.Opts = .{};
-    for (args) |arg| {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (eq(arg, "--no-resume")) {
             resume_opt = false;
         } else if (eq(arg, "--resume")) {
@@ -352,6 +359,10 @@ fn openCommand(app: app_mod.App, args: []const []const u8) !void {
             watch_opts.stop_all = true;
         } else if (eq(arg, "--force")) {
             watch_opts.force = true;
+        } else if (eq(arg, "--xcode")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            xcode_app = args[i];
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownOption;
         } else if (target_arg == null) {
@@ -365,6 +376,7 @@ fn openCommand(app: app_mod.App, args: []const []const u8) !void {
     };
 
     if (target == .claude) {
+        if (xcode_app != null) return error.UnknownOption;
         var machine = app;
         machine.ui.divert = watch_opts.json;
         return watch_cmd.run(machine, watch_opts);
@@ -373,7 +385,17 @@ fn openCommand(app: app_mod.App, args: []const []const u8) !void {
     if (watch_opts.json or watch_opts.stop_all or watch_opts.force) return error.UnknownOption;
 
     const cfg = try config.load(app.gpa, app.io, app.environ);
-    return open_cmd.run(app, target, !orConfig(resume_opt, cfg.resumeSessions));
+    return open_cmd.run(app, .{
+        .target = target,
+        .no_resume = !orConfig(resume_opt, cfg.resumeSessions),
+        .xcode_app = xcodePreference(xcode_app, cfg.xcodeApp),
+    });
+}
+
+fn xcodePreference(flag: ?[]const u8, configured: []const u8) open_cmd.Preference {
+    if (flag) |named| return .{ .flag = named };
+    if (configured.len > 0) return .{ .config = configured };
+    return .unset;
 }
 
 fn listCommand(app: app_mod.App, args: []const []const u8) !void {
@@ -558,6 +580,7 @@ test {
     _ = @import("link.zig");
     _ = @import("mcp.zig");
     _ = @import("oauth.zig");
+    _ = @import("plist.zig");
     _ = @import("prompt.zig");
     _ = @import("pty.zig");
     _ = @import("release.zig");
@@ -584,6 +607,7 @@ test {
     _ = @import("commands/daemon.zig");
     _ = @import("commands/issue.zig");
     _ = @import("commands/list.zig");
+    _ = @import("commands/open.zig");
     _ = @import("commands/remove.zig");
     _ = @import("commands/setup.zig");
     _ = @import("commands/start.zig");

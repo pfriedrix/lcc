@@ -527,11 +527,24 @@ Failures take the same shape as `lcc start --json` — JSON on stdout, the human
 
 Bare `lcc open` is the dashboard above; `lcc open claude` names that target explicitly and `lcc open xcode` picks the other one, case-insensitively.
 
-`--json` prints the sessions as a one-shot instead of drawing the dashboard, and `--stop-all` (with `--force` to kill rather than ask) ends every background session. Both are non-interactive, so both work from a script or a tool call, where the dashboard cannot. Neither means anything to `lcc open xcode`, which rejects them rather than ignoring them.
+`--json` prints the sessions as a one-shot instead of drawing the dashboard, and `--stop-all` (with `--force` to kill rather than ask) ends every background session. Both are non-interactive, so both work from a script or a tool call, where the dashboard cannot. Neither means anything to `lcc open xcode`, which rejects them rather than ignoring them — and `--xcode` means nothing to `lcc open claude`, which rejects it the same way.
 
 ### `lcc open xcode`
 
-Uses the same worktree picker, then launches Xcode instead of Claude. It looks for the shallowest `.xcworkspace`, `.xcodeproj`, or `Package.swift` in the worktree (workspace > project > package when several sit at the same depth) and opens it with `open -a Xcode`.
+Uses the same worktree picker, then launches Xcode instead of Claude. It looks for the shallowest `.xcworkspace`, `.xcodeproj`, or `Package.swift` in the worktree (workspace > project > package when several sit at the same depth) and opens it with `open -a`.
+
+*Which* Xcode is a second question on a machine that has more than one, and `open -a Xcode` cannot answer it: LaunchServices picks by bundle id, and a beta carries the same one as the release build. So lcc names the install by path, and asks which:
+
+```
+? Which Xcode?
+❯ Xcode 26.6 (17F113) · xcode-select
+  Xcode-beta 27.0 (27A5218g)
+  ~/Downloads/Xcode-beta.app
+```
+
+The list is every Xcode Spotlight knows about — `mdfind` by bundle id, so an install outside `/Applications` counts — plus a scan of `/Applications` and `~/Applications` for a machine with Spotlight switched off. A bundle qualifies by carrying `Contents/MacOS/Xcode`, not by its name; the version and build come from its own `version.plist`, and the one `xcode-select` points at leads the list. With a single Xcode installed, nothing is asked.
+
+`--xcode <app>` answers the question once, `lcc config xcodeApp <app>` answers it every time, and both accept the same four spellings, case-insensitively: the app's name (`Xcode-beta`), its version (`27.0`, or `27` for the newest 27.x), its build (`27A5218g`), or an absolute path to the `.app` — the path works even for an install discovery missed. A `--xcode` matching nothing fails with the list of what *is* installed, before the worktree picker opens; a configured `xcodeApp` matching nothing warns and asks instead, because a setting written months ago must not be able to block the command.
 
 ## Branch cleanup
 
@@ -756,6 +769,7 @@ months after anyone typed it.
 | `listNetwork` | `cached` | The PR and Linear columns in `lcc list`: `refresh`, `cached` or `local` |
 | `allIssues` | `false` | Offer every assigned issue in the picker, not just `activeStates` |
 | `keepBranch`, `keepDerivedData`, `keepXcode` | `false` | What `lcc remove` leaves behind |
+| `xcodeApp` | absent — ask | Which Xcode `lcc open xcode` launches: its name, version, build, or the path to the `.app` |
 | `mcpCarry` | absent — all of them | Which local-scope MCP servers to carry into Claude; setup accepts a comma-separated list, `all`, or `none` |
 | `clientId` | built-in | Linear OAuth application. Override with `LCC_CLIENT_ID` or `lcc auth setup --client-id <id>` |
 

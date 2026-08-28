@@ -50,6 +50,7 @@ pub const Stored = struct {
     keepBranch: ?bool = null,
     keepDerivedData: ?bool = null,
     keepXcode: ?bool = null,
+    xcodeApp: ?[]const u8 = null,
 };
 
 pub const McpCarry = union(enum) {
@@ -74,6 +75,7 @@ pub const Patch = struct {
     keepBranch: ?bool = null,
     keepDerivedData: ?bool = null,
     keepXcode: ?bool = null,
+    xcodeApp: ?[]const u8 = null,
 };
 
 pub const Config = struct {
@@ -93,6 +95,7 @@ pub const Config = struct {
     keepBranch: bool,
     keepDerivedData: bool,
     keepXcode: bool,
+    xcodeApp: []const u8,
 };
 
 pub fn dir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
@@ -152,6 +155,7 @@ pub fn load(
         .keepBranch = stored.keepBranch orelse false,
         .keepDerivedData = stored.keepDerivedData orelse false,
         .keepXcode = stored.keepXcode orelse false,
+        .xcodeApp = stored.xcodeApp orelse "",
     };
 }
 
@@ -183,6 +187,7 @@ pub fn save(
     if (patch.keepBranch) |v| merged.keepBranch = v;
     if (patch.keepDerivedData) |v| merged.keepDerivedData = v;
     if (patch.keepXcode) |v| merged.keepXcode = v;
+    if (patch.xcodeApp) |v| merged.xcodeApp = v;
     if (patch.mcpCarry) |carry| switch (carry) {
         .all => merged.mcpCarry = null,
         .only => |v| merged.mcpCarry = v,

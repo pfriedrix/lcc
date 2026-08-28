@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const disk = @import("disk.zig");
 const exec = @import("exec.zig");
+const plist = @import("plist.zig");
 
 pub const Entry = struct {
     path: []const u8,
@@ -60,58 +61,19 @@ pub fn list(gpa: std.mem.Allocator, io: Io, dir_path: []const u8) ![]Entry {
 }
 
 fn readWorkspacePath(gpa: std.mem.Allocator, io: Io, dir_path: []const u8) !?[]const u8 {
-    const plist = try std.fs.path.join(gpa, &.{ dir_path, "info.plist" });
-    const raw = Io.Dir.cwd().readFileAlloc(io, plist, gpa, .limited(1 << 20)) catch return null;
+    const plist_path = try std.fs.path.join(gpa, &.{ dir_path, "info.plist" });
+    const raw = Io.Dir.cwd().readFileAlloc(io, plist_path, gpa, .limited(1 << 20)) catch return null;
 
     if (try matchWorkspacePath(gpa, raw)) |value| return value;
 
     const converted = exec.capture(gpa, io, &.{
-        "plutil", "-convert", "xml1", "-o", "-", plist,
+        "plutil", "-convert", "xml1", "-o", "-", plist_path,
     }, null) catch return null;
     return matchWorkspacePath(gpa, converted);
 }
 
 fn matchWorkspacePath(gpa: std.mem.Allocator, xml: []const u8) !?[]const u8 {
-    const key = "<key>WorkspacePath</key>";
-    const key_at = std.mem.indexOf(u8, xml, key) orelse return null;
-    const after = xml[key_at + key.len ..];
-
-    const open_at = std.mem.indexOf(u8, after, "<string>") orelse return null;
-    for (after[0..open_at]) |c| {
-        if (!std.ascii.isWhitespace(c)) return null;
-    }
-    const value_start = open_at + "<string>".len;
-    const close_at = std.mem.indexOfPos(u8, after, value_start, "</string>") orelse return null;
-
-    const value = std.mem.trim(u8, after[value_start..close_at], " \t\r\n");
-    if (value.len == 0) return null;
-    return try decodeEntities(gpa, value);
-}
-
-fn decodeEntities(gpa: std.mem.Allocator, value: []const u8) ![]const u8 {
-    const replacements = [_][2][]const u8{
-        .{ "&lt;", "<" },
-        .{ "&gt;", ">" },
-        .{ "&quot;", "\"" },
-        .{ "&apos;", "'" },
-        .{ "&amp;", "&" },
-    };
-    var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    outer: while (i < value.len) {
-        if (value[i] == '&') {
-            for (replacements) |pair| {
-                if (std.mem.startsWith(u8, value[i..], pair[0])) {
-                    try out.appendSlice(gpa, pair[1]);
-                    i += pair[0].len;
-                    continue :outer;
-                }
-            }
-        }
-        try out.append(gpa, value[i]);
-        i += 1;
-    }
-    return out.toOwnedSlice(gpa);
+    return plist.string(gpa, xml, "WorkspacePath");
 }
 
 pub fn forWorktree(

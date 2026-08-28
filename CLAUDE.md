@@ -4,15 +4,15 @@ Working notes for an agent editing this repo. `README.md` is the user-facing man
 each command does and why it behaves that way lives there, and is not repeated here.
 
 `lcc` is a single Zig binary, macOS only, pinned to **Zig 0.16**. It shells out to `git`,
-`claude`, `gh`, `open`, `du`, `defaults`, `plutil`; everything else is the Zig standard
-library plus CoreFoundation/Security.
+`claude`, `gh`, `open`, `du`, `defaults`, `plutil`, `mdfind`, `xcode-select`; everything else
+is the Zig standard library plus CoreFoundation/Security.
 
 ## Commands
 
 Run from the repo root:
 
 ```bash
-zig build test --summary all       # unit tests (~3s, 305 at last count)
+zig build test --summary all       # unit tests (~3s, 317 at last count)
 zig build                          # debug binary → zig-out/bin/lcc
 zig build -Doptimize=ReleaseFast   # what PATH should be serving
 zig build run -- list              # run without installing
@@ -142,6 +142,17 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   reported as a deleted checkout, the same distinction `disk.presence` draws. Any new read that
   passes a worktree path as `cwd` needs the same guard; a broken `.git` *pointer* is already
   safe, because git fails loudly (exit 128) instead of escaping.
+- **An Xcode is a path, not a bundle id.** A beta carries `com.apple.dt.Xcode` exactly like
+  the release build, so `open -a Xcode` hands the choice to LaunchServices and `lcc open
+  xcode` cannot honour one — the same reason `closeIn` addresses each *running* Xcode by its
+  bundle path. Discovery leads with `mdfind` because an Xcode outside `/Applications` is
+  normal (a beta parked in `~/Downloads`); the `/Applications` and `~/Applications` scans are
+  the fallback for a machine with Spotlight off and would miss that beta on their own. What
+  makes a bundle an Xcode is `Contents/MacOS/Xcode` — the file `parseApps` already keys on —
+  not its name. `--xcode` and the `xcodeApp` setting run through the same matcher but not the
+  same failure: `open.Preference` keeps `.flag` apart from `.config` so a typo'd flag can fail
+  the command while a setting written months ago only warns and asks, which is the split
+  `start.AllIssues` draws for the same reason.
 - **Keychain and code signing are coupled.** The Linear token's ACL is keyed on the binary's
   code signature, so `build.zig` signs the installed binary to keep one "Always Allow"
   valid across rebuilds. Removing or bypassing that (`-Dsign=none`) brings back a login
