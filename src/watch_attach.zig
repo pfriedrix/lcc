@@ -183,6 +183,12 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
                     note(dump, app.io, "out", frame.payload);
                     writeAll(chunk_stdout, frame.payload);
                 },
+                .attached => {
+                    const body = wire.parse(wire.Attached, app.gpa, frame) catch continue;
+                    const modes = body.modes orelse continue;
+                    note(dump, app.io, "modes", modes);
+                    writeAll(chunk_stdout, modes);
+                },
                 .exited => return .ended,
                 else => {},
             };

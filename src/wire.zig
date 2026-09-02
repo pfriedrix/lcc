@@ -235,6 +235,7 @@ pub const Attached = struct {
     rows: u16,
     input: bool,
     attached_clients: u32,
+    modes: ?[]const u8 = null,
 };
 
 pub const Resize = struct { cols: u16, rows: u16 };

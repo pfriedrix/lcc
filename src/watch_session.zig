@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const ansi = @import("ansi.zig");
 const pty = @import("pty.zig");
 const ring = @import("ring.zig");
 const sessions = @import("sessions.zig");
@@ -20,6 +21,7 @@ pub const Session = struct {
     master_open: bool = true,
 
     scrollback: ring.Ring,
+    modes: ansi.ModeState = .{},
     size: pty.Size,
 
     status: sessions.Status = .starting,
@@ -107,6 +109,7 @@ pub const Session = struct {
             switch (pty.read(self.master, &buf)) {
                 .n => |n| {
                     self.scrollback.append(buf[0..n]);
+                    self.modes.feed(buf[0..n]);
                     if (self.status == .starting) self.setStatus(.idle, now);
                 },
                 .again => return false,

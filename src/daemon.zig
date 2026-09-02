@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const ansi = @import("ansi.zig");
 const app_mod = @import("app.zig");
 const exec = @import("exec.zig");
 const pty = @import("pty.zig");
@@ -604,12 +605,16 @@ fn attachClient(loop: *Loop, client: *Client, frame: wire.Frame) void {
             if (std.mem.eql(u8, id, session.id)) attached += 1;
         }
     }
+    var settled: [ansi.ModeState.render_capacity]u8 = undefined;
+    const modes = session.modes.render(&settled);
+
     loop.sendControl(client, .attached, wire.Attached{
         .session_id = session.id,
         .cols = session.size.cols,
         .rows = session.size.rows,
         .input = true,
         .attached_clients = attached,
+        .modes = if (modes.len > 0) modes else null,
     });
 
     const before = session.size;
@@ -971,6 +976,11 @@ fn awaitMark(
     }
     return error.TestExpectedEqual;
 }
+
+const stand_in_configures_terminal =
+    "#!/bin/sh\n" ++
+    "printf '\\033[?2004h\\033[?1004h\\033[>1u\\033[>4;2mREADY'\n" ++
+    "while :; do IFS= read -r line || continue; done\n";
 
 const stand_in_notes_winch =
     "#!/bin/sh\n" ++
@@ -1769,6 +1779,111 @@ test "output lost to a lapped ring is rebuilt, not left as a hole in the screen"
             .{},
         );
         return error.TestExpectedEqual;
+    }
+}
+
+test "re-attaching sets the terminal up the way the session left it" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("LCC_WATCH_DIR", base);
+    const socket_path = watch_paths.socket(arena, &environ) catch |err| switch (err) {
+        error.SocketPathTooLong => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var daemon_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer daemon_arena.deinit();
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_w: Io.Writer = .fixed(&out_buf);
+    var err_w: Io.Writer = .fixed(&err_buf);
+    const daemon_app: app_mod.App = .{
+        .gpa = daemon_arena.allocator(),
+        .io = io,
+        .environ = &environ,
+        .ui = .{ .io = io, .out = &out_w, .err = &err_w },
+    };
+
+    const thread = try std.Thread.spawn(.{}, runForTest, .{ daemon_app, Options{
+        .foreground = true,
+        .idle_exit_seconds = 3600,
+    } });
+    defer thread.join();
+
+    var budget: i32 = 15_000;
+    while (budget > 0) : (budget -= 50) {
+        if (Io.Dir.cwd().statFile(io, socket_path, .{})) |_| break else |_| {}
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+
+    var conn = try TestConn.open(arena, io, socket_path);
+    defer conn.close();
+    var b: i32 = 15_000;
+    try conn.hello(arena, &b);
+
+    try conn.send(arena, .register, wire.Register{
+        .worktree = base,
+        .branch = "feature/pe-11-modes",
+        .issue = "PE-11",
+        .repo_root = base,
+        .program = try standIn(arena, io, base, stand_in_configures_terminal),
+        .argv = &.{},
+        .env = &.{"TERM=dumb"},
+        .cols = 80,
+        .rows = 24,
+    });
+    const body = try wire.parse(wire.Registered, arena, try conn.recv(.registered, &b));
+    defer conn.send(arena, .stop, wire.Stop{ .force = true }) catch {};
+
+    var attach_conn = try TestConn.open(arena, io, socket_path);
+    defer attach_conn.close();
+    var ab: i32 = 15_000;
+    try attach_conn.send(arena, .hello, wire.Hello{ .role = "attach", .pid = 0 });
+    _ = try attach_conn.recv(.hello, &ab);
+    attach_conn.dec.role = .attach;
+
+    try attach_conn.send(arena, .attach, wire.Attach{
+        .session_id = body.session_id,
+        .cols = 80,
+        .rows = 24,
+        .replay = true,
+    });
+    _ = try attach_conn.recv(.attached, &ab);
+
+    var seen: std.ArrayList(u8) = .empty;
+    defer seen.deinit(gpa);
+    try awaitMark(gpa, &attach_conn, &seen, "READY", &ab);
+
+    try attach_conn.send(arena, .attach, wire.Attach{
+        .session_id = body.session_id,
+        .cols = 80,
+        .rows = 24,
+        .replay = false,
+    });
+    const again = try wire.parse(wire.Attached, arena, try attach_conn.recv(.attached, &ab));
+
+    const modes = again.modes orelse "";
+    for ([_][]const u8{ "\x1b[?2004h", "\x1b[?1004h", "\x1b[>4;2m", "\x1b[>1u" }) |needed| {
+        if (std.mem.indexOf(u8, modes, needed) == null) {
+            std.debug.print(
+                "attaching handed the terminal \"{f}\", missing the setup the child still " ++
+                    "believes is in force. sanitize() takes it down on detach and the child " ++
+                    "sends it once, at startup, where the replay filter drops it — so a " ++
+                    "re-attached Claude Code gets pastes a line at a time and cannot tell " ++
+                    "Shift+Enter from Enter.\n",
+                .{std.zig.fmtString(modes)},
+            );
+            return error.TestExpectedEqual;
+        }
     }
 }
 

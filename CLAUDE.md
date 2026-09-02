@@ -12,7 +12,7 @@ is the Zig standard library plus CoreFoundation/Security.
 Run from the repo root:
 
 ```bash
-zig build test --summary all       # unit tests (~4s, 327 at last count)
+zig build test --summary all       # unit tests (~5s, 334 at last count)
 zig build                          # debug binary → zig-out/bin/lcc
 zig build -Doptimize=ReleaseFast   # what PATH should be serving
 zig build run -- list              # run without installing
@@ -190,6 +190,20 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   output simply vanish. `ModeFilter.overhead` is the caller's buffer bound and is exact —
   it was one byte short of the worst case, which in ReleaseFast is a write past the end of
   a stack array.
+- **Dropping the child's setup from a replay leaves a debt the daemon has to settle.**
+  `ansi.ModeFilter` withholds the sequences that configure rather than draw, because
+  replaying a keyboard-stack push a second time is what once broke Enter in Claude Code's
+  picker. But the child sends that setup exactly once, at startup, and `term.sanitize` takes
+  all of it down on detach — so with only the filter, a re-attached terminal has bracketed
+  paste, the kitty keyboard protocol, modifyOtherKeys and focus reporting *off* while Claude
+  Code still believes them on: a multi-line paste submits a line at a time and Shift+Enter is
+  plain Enter. `watch_session.Session.modes` therefore tracks the resolved state over the
+  whole session — not the ring window, which for a long session no longer holds the startup —
+  and `attachClient` carries it on the `attached` frame for the client to apply before any
+  replay byte. The stack is settled to *one* push however many the history holds, which is
+  what keeps the original double-push bug fixed. `?2026` is excluded on purpose: a
+  synchronised update is per-frame, and settling a half-open one freezes the terminal until
+  the child's next frame closes it.
 - **`clamp`'s `skipped` is the only notice that a client's screen is now a lie.** When the
   ring laps past a client the cursor jumps an arbitrary range, mid-escape-sequence, and
   neither end can tell. Discarding the flag compiles and looks tidy, and it leaves a hole
