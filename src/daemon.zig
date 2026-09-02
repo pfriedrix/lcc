@@ -19,6 +19,7 @@ pub const Options = struct {
     max_sessions: u32 = 64,
     max_clients_per_session: u32 = 8,
     scrollback_bytes: usize = 256 * 1024,
+    repaint_settle_ms: i64 = 400,
 };
 
 pub const BindError = error{
@@ -69,6 +70,7 @@ pub fn bind(app: app_mod.App, opts: Options) BindError!?Bound {
 }
 
 pub const Deadlines = struct {
+    repaint_restore_at: ?i64 = null,
     registry_flush_at: ?i64 = null,
     reap_retry_at: ?i64 = null,
     listener_resume_at: ?i64 = null,
@@ -348,7 +350,7 @@ fn serve(loop: *Loop) !void {
             try fds.append(gpa, .{ .fd = c.fd, .events = events, .revents = 0 });
         }
 
-        const now_ms = loop.now() * std.time.ms_per_s;
+        const now_ms = app_mod.nowMillis(loop.app.io);
         _ = std.posix.poll(fds.items, nextTimeout(now_ms, loop.deadlines)) catch {};
 
         const at = loop.now();
@@ -596,7 +598,8 @@ fn attachClient(loop: *Loop, client: *Client, frame: wire.Frame) void {
 
     client.attached = session.id;
     client.size = .{ .rows = body.rows, .cols = body.cols };
-    client.cursor = if (body.replay) session.scrollback.oldest() else session.scrollback.written;
+    const worth_replaying = body.replay and !session.modes.onAltScreen();
+    client.cursor = if (worth_replaying) session.scrollback.oldest() else session.scrollback.written;
     client.replay_until = session.scrollback.written;
 
     var attached: u32 = 0;
@@ -619,7 +622,7 @@ fn attachClient(loop: *Loop, client: *Client, frame: wire.Frame) void {
 
     const before = session.size;
     renegotiate(loop);
-    if (std.meta.eql(session.size, before)) repaint(session);
+    if (std.meta.eql(session.size, before)) repaint(loop, session);
 }
 
 fn detachClient(loop: *Loop, client: *Client) void {
@@ -640,13 +643,28 @@ fn renegotiate(loop: *Loop) void {
         const size = watch_session.negotiateSize(sizes.items) orelse continue;
         if (size.rows == s.size.rows and size.cols == s.size.cols) continue;
         s.size = size;
+        s.repaint_pending = false;
         if (s.master_open) pty.resize(s.master, size);
     }
 }
 
-fn repaint(session: *watch_session.Session) void {
+fn repaint(loop: *Loop, session: *watch_session.Session) void {
     if (!session.master_open) return;
-    for (watch_session.pokeSizes(session.size)) |step| pty.resize(session.master, step);
+    if (session.repaint_pending) return;
+    const steps = watch_session.pokeSizes(session.size);
+    if (steps[0].rows == steps[1].rows and steps[0].cols == steps[1].cols) return;
+    pty.resize(session.master, steps[0]);
+    session.repaint_pending = true;
+    loop.deadlines.repaint_restore_at = app_mod.nowMillis(loop.app.io) + loop.opts.repaint_settle_ms;
+}
+
+fn restoreRepainted(loop: *Loop) void {
+    for (loop.list.items) |*s| {
+        if (!s.repaint_pending) continue;
+        s.repaint_pending = false;
+        if (s.master_open) pty.resize(s.master, s.size);
+    }
+    loop.deadlines.repaint_restore_at = null;
 }
 
 fn pumpClient(loop: *Loop, c: *Client) void {
@@ -657,7 +675,7 @@ fn pumpClient(loop: *Loop, c: *Client) void {
     while (c.out.items.len < session.scrollback.capacity()) {
         const clamped = session.scrollback.clamp(c.cursor);
         c.cursor = clamped.cursor;
-        if (clamped.skipped) repaint(session);
+        if (clamped.skipped) repaint(loop, session);
 
         const parts = session.scrollback.since(c.cursor);
         const available = parts[0].len + parts[1].len;
@@ -701,6 +719,9 @@ fn flushClient(loop: *Loop, client: *Client) void {
 }
 
 fn tick(loop: *Loop, at: i64, idle_since: *?i64) void {
+    if (loop.deadlines.repaint_restore_at) |due| {
+        if (app_mod.nowMillis(loop.app.io) >= due) restoreRepainted(loop);
+    }
     for (loop.list.items) |*s| {
         if (s.tick(at)) loop.dirty = true;
         if (!s.master_open and loop.reapAndAnnounce(s, at)) loop.dirty = true;
@@ -998,9 +1019,14 @@ const stand_in_notes_winch =
 
 const stand_in_winch =
     "#!/bin/sh\n" ++
-    "trap 'printf WINCH' WINCH\n" ++
+    "trap 'set -- $(stty size); printf \"W:$1 \"' WINCH\n" ++
     "printf READY\n" ++
-    "while :; do sleep 0.05; done\n";
+    "while :; do IFS= read -r line || continue; done\n";
+
+const stand_in_alt_screen =
+    "#!/bin/sh\n" ++
+    "printf '\\033[?1049h\\033[2J\\033[HREADY'\n" ++
+    "while :; do IFS= read -r line || continue; done\n";
 
 test "a registered session runs, echoes, and its output survives a reconnect" {
     const gpa = testing.allocator;
@@ -1592,6 +1618,7 @@ test "attaching at the size the session already has still makes the child repain
     const thread = try std.Thread.spawn(.{}, runForTest, .{ daemon_app, Options{
         .foreground = true,
         .idle_exit_seconds = 3600,
+        .repaint_settle_ms = 1000,
     } });
     defer thread.join();
 
@@ -1615,7 +1642,7 @@ test "attaching at the size the session already has still makes the child repain
         .argv = &.{},
         .env = &.{"TERM=dumb"},
         .cols = 80,
-        .rows = 24,
+        .rows = 25,
     });
     const body = try wire.parse(wire.Registered, arena, try conn.recv(.registered, &b));
     defer conn.send(arena, .stop, wire.Stop{ .force = true }) catch {};
@@ -1637,12 +1664,7 @@ test "attaching at the size the session already has still makes the child repain
 
     var seen: std.ArrayList(u8) = .empty;
     defer seen.deinit(gpa);
-    while (ab > 0 and std.mem.indexOf(u8, seen.items, "READY") == null) {
-        const frame = attach_conn.recvAny(&ab) catch break;
-        if (frame.type != .replay and frame.type != .output) continue;
-        try seen.appendSlice(gpa, frame.payload);
-    }
-    try testing.expect(std.mem.indexOf(u8, seen.items, "READY") != null);
+    try awaitMark(gpa, &attach_conn, &seen, "READY", &ab);
 
     try attach_conn.send(arena, .attach, wire.Attach{
         .session_id = body.session_id,
@@ -1654,17 +1676,138 @@ test "attaching at the size the session already has still makes the child repain
 
     var after: std.ArrayList(u8) = .empty;
     defer after.deinit(gpa);
-    while (ab > 0 and std.mem.indexOf(u8, after.items, "WINCH") == null) {
+    while (ab > 0 and std.mem.indexOf(u8, after.items, "W:24") == null) {
         const frame = attach_conn.recv(.output, &ab) catch break;
         try after.appendSlice(gpa, frame.payload);
     }
 
-    if (std.mem.indexOf(u8, after.items, "WINCH") == null) {
+    if (std.mem.indexOf(u8, after.items, "W:23") == null) {
         std.debug.print(
-            "re-attaching from a terminal the session is already sized for sent the child " ++
-                "no SIGWINCH, so Claude Code never repaints: the screen keeps whatever the " ++
-                "replay painted until the next keystroke. Saw \"{f}\" instead.\n",
-            .{std.zig.fmtString(after.items)},
+            "the child was signalled but never saw a size other than the one it already " ++
+                "had: it reported {s}. Two TIOCSWINSZ calls back to back coalesce into a " ++
+                "single delivery, and an app that reads the winsize in its handler finds " ++
+                "the original value and skips the repaint — which is what Claude Code does, " ++
+                "measured: 0 bytes back from a same-size attach against 10889 from a real " ++
+                "resize. The shrink has to stand long enough to be observed.\n",
+            .{if (after.items.len == 0) "nothing at all" else after.items},
+        );
+        return error.TestExpectedEqual;
+    }
+}
+
+test "a screen a byte replay cannot rebuild is not replayed at all" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("LCC_WATCH_DIR", base);
+    const socket_path = watch_paths.socket(arena, &environ) catch |err| switch (err) {
+        error.SocketPathTooLong => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var daemon_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer daemon_arena.deinit();
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_w: Io.Writer = .fixed(&out_buf);
+    var err_w: Io.Writer = .fixed(&err_buf);
+    const daemon_app: app_mod.App = .{
+        .gpa = daemon_arena.allocator(),
+        .io = io,
+        .environ = &environ,
+        .ui = .{ .io = io, .out = &out_w, .err = &err_w },
+    };
+
+    const thread = try std.Thread.spawn(.{}, runForTest, .{ daemon_app, Options{
+        .foreground = true,
+        .idle_exit_seconds = 3600,
+    } });
+    defer thread.join();
+
+    var budget: i32 = 15_000;
+    while (budget > 0) : (budget -= 50) {
+        if (Io.Dir.cwd().statFile(io, socket_path, .{})) |_| break else |_| {}
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+
+    var conn = try TestConn.open(arena, io, socket_path);
+    defer conn.close();
+    var b: i32 = 15_000;
+    try conn.hello(arena, &b);
+
+    try conn.send(arena, .register, wire.Register{
+        .worktree = base,
+        .branch = "feature/pe-12-alt",
+        .issue = "PE-12",
+        .repo_root = base,
+        .program = try standIn(arena, io, base, stand_in_alt_screen),
+        .argv = &.{},
+        .env = &.{"TERM=dumb"},
+        .cols = 80,
+        .rows = 24,
+    });
+    const body = try wire.parse(wire.Registered, arena, try conn.recv(.registered, &b));
+    defer conn.send(arena, .stop, wire.Stop{ .force = true }) catch {};
+
+    var first = try TestConn.open(arena, io, socket_path);
+    defer first.close();
+    var fb: i32 = 15_000;
+    try first.send(arena, .hello, wire.Hello{ .role = "attach", .pid = 0 });
+    _ = try first.recv(.hello, &fb);
+    first.dec.role = .attach;
+    try first.send(arena, .attach, wire.Attach{
+        .session_id = body.session_id,
+        .cols = 80,
+        .rows = 24,
+        .replay = true,
+    });
+    _ = try first.recv(.attached, &fb);
+
+    var seen: std.ArrayList(u8) = .empty;
+    defer seen.deinit(gpa);
+    try awaitMark(gpa, &first, &seen, "READY", &fb);
+
+    var second = try TestConn.open(arena, io, socket_path);
+    defer second.close();
+    var sb: i32 = 15_000;
+    try second.send(arena, .hello, wire.Hello{ .role = "attach", .pid = 0 });
+    _ = try second.recv(.hello, &sb);
+    second.dec.role = .attach;
+    try second.send(arena, .attach, wire.Attach{
+        .session_id = body.session_id,
+        .cols = 80,
+        .rows = 24,
+        .replay = true,
+    });
+    const attached = try wire.parse(wire.Attached, arena, try second.recv(.attached, &sb));
+
+    try testing.expect(attached.modes != null);
+    try testing.expect(std.mem.indexOf(u8, attached.modes.?, "\x1b[?1049h") != null);
+
+    var replayed: usize = 0;
+    var drain: i32 = 1_500;
+    while (drain > 0) {
+        const frame = second.recvAny(&drain) catch break;
+        if (frame.type == .replay) replayed += frame.payload.len;
+    }
+
+    if (replayed > 0) {
+        std.debug.print(
+            "{d} bytes of scrollback were replayed into an alternate screen. There is no " ++
+                "scrollback there to restore — the buffer is exactly one screen — and the " ++
+                "app that owns it paints by absolute address and rewrites only the cells it " ++
+                "believes changed. A byte history replayed from wherever the ring happens to " ++
+                "start rebuilds a screen that is not the one it thinks it is looking at, and " ++
+                "the next partial update leaves half of each stale line in place.\n",
+            .{replayed},
         );
         return error.TestExpectedEqual;
     }
@@ -1728,7 +1871,7 @@ test "output lost to a lapped ring is rebuilt, not left as a hole in the screen"
         .argv = &.{},
         .env = &.{"TERM=dumb"},
         .cols = 80,
-        .rows = 24,
+        .rows = 25,
     });
     const body = try wire.parse(wire.Registered, arena, try conn.recv(.registered, &b));
     defer conn.send(arena, .stop, wire.Stop{ .force = true }) catch {};

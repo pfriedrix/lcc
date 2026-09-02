@@ -23,6 +23,7 @@ pub const Session = struct {
     scrollback: ring.Ring,
     modes: ansi.ModeState = .{},
     size: pty.Size,
+    repaint_pending: bool = false,
 
     status: sessions.Status = .starting,
     status_at: i64,

@@ -12,7 +12,7 @@ is the Zig standard library plus CoreFoundation/Security.
 Run from the repo root:
 
 ```bash
-zig build test --summary all       # unit tests (~5s, 336 at last count)
+zig build test --summary all       # unit tests (~6s, 337 at last count)
 zig build                          # debug binary → zig-out/bin/lcc
 zig build -Doptimize=ReleaseFast   # what PATH should be serving
 zig build run -- list              # run without installing
@@ -228,14 +228,33 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   into the real terminal. `resolveSize` asks `term.currentSize()` and keeps `unmeasured_size`
   for the case where nothing on the process has a window — a `--json` start from a tool call.
   Anything that registers a session has to go through it.
-- **An attach that changes no size changes nothing.** `renegotiate` resizes the pty only when
-  the negotiated size differs, and re-attaching from the same terminal it was last attached
-  from differs by nothing — so Claude Code is never told to repaint and the screen keeps
-  whatever the replay painted until the next keystroke. `attachClient` compares the size
-  across `renegotiate` and pokes when it did not move; `pokeSizes` moves rows and never
-  columns, because a column change re-wraps text and causes the corruption it is meant to
-  clear. TIOCSWINSZ only signals on an actual change, which is why the poke is two calls and
-  not one.
+- **The repaint poke has to be two sizes separated in time, not two ioctls.** `renegotiate`
+  resizes the pty only when the negotiated size differs, so re-attaching from the terminal a
+  session was last attached from tells Claude Code nothing and the screen keeps whatever the
+  replay painted. `attachClient` compares the size across `renegotiate` and pokes when it did
+  not move — but the two `pty.resize` calls cannot be back to back. The kernel coalesces the
+  two SIGWINCHes, and an app that reads the winsize *in its handler* finds the value already
+  restored, sees no change, and skips the repaint. Measured against a real Claude Code: a
+  same-size attach with a back-to-back poke returned **0 bytes**, a resize with time either
+  side returned ~11 KB starting with `CSI 2J`, and the two-phase poke returns ~2 KB from a
+  session that was otherwise silent. So `repaint` shrinks now, sets `repaint_pending`, and
+  `restoreRepainted` puts it back on the `repaint_restore_at` deadline
+  (`Options.repaint_settle_ms`, 400ms). It restores to the session's *current* `size` rather
+  than a captured one, so a real resize inside the window wins; `renegotiate` clears the flag
+  for the same reason. A test whose stand-in traps SIGWINCH and prints proves nothing here —
+  a shell trap fires on the signal whatever the size says. It has to report the size it
+  actually read.
+- **Claude Code runs on the alternate screen, and a byte replay cannot rebuild one.** Its
+  first bytes are `ESC 7 CSI r ESC 8 CSI ?25h CSI ?1049h CSI 2J CSI H`, and from there it
+  paints by absolute address (`CSI 58;1H`) and rewrites only the cells it believes changed —
+  a capture of a live session contains **no LF at all** and no tabs. Two things follow. The
+  alternate screen has no scrollback, so there is nothing for a replay to restore: the buffer
+  is exactly one screen, and `attachClient` skips the replay entirely when
+  `ModeState.onAltScreen()` says so. And replaying a byte history from wherever the ring
+  happens to start rebuilds a screen that is *not* the one the app thinks it is looking at, so
+  its next partial update leaves half of each stale line in place — lines come out as a hybrid
+  of two different strings, which is what "text disappears or moves" actually looks like. The
+  forced repaint is what makes the screen right, not the replay.
 - **A hook event that reports no `permission_mode` must not clear the one already known.**
   Only some events carry it — `Notification` does not (see the test in `watch_hooks.zig`).
   `watch_session.setPlan` is guarded on `permission_mode.len > 0` for that reason, and

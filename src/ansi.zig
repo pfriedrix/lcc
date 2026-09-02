@@ -280,6 +280,19 @@ pub const ModeState = struct {
         };
     }
 
+    pub fn onAltScreen(self: ModeState) bool {
+        for (self.modes[0..self.mode_count]) |mode| {
+            const params = mode.params[0..mode.params_len];
+            if (std.mem.eql(u8, params, "?1049") or
+                std.mem.eql(u8, params, "?1047") or
+                std.mem.eql(u8, params, "?47"))
+            {
+                if (mode.set) return true;
+            }
+        }
+        return false;
+    }
+
     pub fn render(self: ModeState, out: []u8) []const u8 {
         var n: usize = 0;
         for (self.modes[0..self.mode_count]) |mode| {
