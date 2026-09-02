@@ -185,6 +185,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
             if (opts.no_attach) {
                 app.ui.success("Session {s} running in the background.", .{started.id});
                 app.ui.hint("It survives this terminal closing — `lcc open` shows it.", .{});
+                app.ui.flush();
                 return;
             }
             app.ui.flush();
@@ -192,6 +193,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         } else |err| {
             app.ui.warn("Could not start this in the background ({s}) — running in this terminal instead.", .{@errorName(err)});
             app.ui.hint("The session will not survive this terminal closing.", .{});
+            app.ui.flush();
         }
     }
 

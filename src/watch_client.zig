@@ -3,6 +3,7 @@ const Io = std.Io;
 const app_mod = @import("app.zig");
 const exec = @import("exec.zig");
 const sessions_mod = @import("sessions.zig");
+const term = @import("term.zig");
 const watch_paths = @import("watch_paths.zig");
 const wire = @import("wire.zig");
 
@@ -133,12 +134,20 @@ pub const Handoff = struct {
     repo_root: []const u8,
     program: []const u8,
     argv: []const []const u8,
-    size: struct { rows: u16, cols: u16 } = .{ .rows = 40, .cols = 120 },
+    size: ?term.Size = null,
 };
+
+pub const unmeasured_size: term.Size = .{ .rows = 40, .cols = 120 };
+
+pub fn resolveSize(requested: ?term.Size, measured: ?term.Size) term.Size {
+    return requested orelse measured orelse unmeasured_size;
+}
 
 pub fn startSession(app: app_mod.App, handoff: Handoff) Error!Started {
     var conn = try connect(app, .control);
     defer conn.close(app.io);
+
+    const size = resolveSize(handoff.size, term.currentSize());
 
     try conn.sendControl(app.gpa, .register, wire.Register{
         .worktree = handoff.worktree,
@@ -148,8 +157,8 @@ pub fn startSession(app: app_mod.App, handoff: Handoff) Error!Started {
         .program = handoff.program,
         .argv = handoff.argv,
         .env = try environSlice(app),
-        .cols = handoff.size.cols,
-        .rows = handoff.size.rows,
+        .cols = size.cols,
+        .rows = size.rows,
     });
 
     const frame = try conn.recv();
@@ -212,4 +221,25 @@ fn environSlice(app: app_mod.App) ![]const []const u8 {
         }));
     }
     return out.toOwnedSlice(app.gpa);
+}
+
+const testing = std.testing;
+
+test "a session is born the size of the terminal that asked for it" {
+    const measured: term.Size = .{ .rows = 58, .cols = 215 };
+    const got = resolveSize(null, measured);
+    if (!std.meta.eql(got, measured)) {
+        std.debug.print(
+            "a session measured at {d}x{d} was started at {d}x{d}. Claude Code lays out " ++
+                "its banner, its prompt box and its picker for the size the pty was born " ++
+                "with, and every one of those bytes is replayed into a terminal of the " ++
+                "other size before the first resize ever reaches it.\n",
+            .{ measured.cols, measured.rows, got.cols, got.rows },
+        );
+        return error.TestExpectedEqual;
+    }
+
+    const asked: term.Size = .{ .rows = 24, .cols = 80 };
+    try testing.expectEqual(asked, resolveSize(asked, measured));
+    try testing.expectEqual(unmeasured_size, resolveSize(null, null));
 }

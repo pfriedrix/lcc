@@ -12,7 +12,7 @@ is the Zig standard library plus CoreFoundation/Security.
 Run from the repo root:
 
 ```bash
-zig build test --summary all       # unit tests (~3s, 317 at last count)
+zig build test --summary all       # unit tests (~6s, 337 at last count)
 zig build                          # debug binary → zig-out/bin/lcc
 zig build -Doptimize=ReleaseFast   # what PATH should be serving
 zig build run -- list              # run without installing
@@ -130,6 +130,17 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   `reserved` argument to `pageSize` is what keeps the two in step — `checkbox` passes 5 when
   it has a column header and 4 when it does not. Add a line to a frame without raising it and
   the list looks fine until the terminal is short.
+- **The dashboard is a frame like any other, so every line it prints has to be paid for.**
+  It was the one that did not: `dims.rows` was read and never used, and the table rendered a
+  row per worktree. Past the height of the terminal the frame scrolls, `Screen.eraseFrame`
+  walks the cursor up over lines that are no longer the ones it wrote, and each redraw takes
+  another line of whatever was on the screen before `lcc open` started. `visibleRows` is the
+  budget — `spent` counts the lines already drawn this frame, and it leaves one row spare so
+  the closing newline cannot scroll — and `window` keeps the cursor inside it. Anything new
+  in that frame is another argument to `spent`, not a free line. The same rule is why an
+  error there is a *counted* line in the frame rather than an `app.ui.fail`: `fail` writes
+  through a different writer and past `screen.lines`, so the next erase walks the wrong
+  distance and the frame smears.
 - **A `git` run with `cwd` inside a worktree can answer for a different repository.** Git
   discovers its repo by walking *up* from `cwd` until it finds a `.git`, and the default
   worktree template is `{repoRoot}/.lcc/worktrees/{branchLeaf}` — so a worktree that lost its
@@ -177,6 +188,81 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   site written as a bare `bail(…)` is a compile error rather than a silent fall-through,
   but only because the returned error value cannot be discarded; do not "fix" that by
   ignoring it.
+- **A replay withholds a sequence; it must still hand back the half it swallowed.** The
+  replay ends at `scrollback.written` frozen at attach time — an offset that lands wherever
+  the child happened to be, so the last `.replay` frame regularly ends mid-CSI. The bytes
+  the filter has buffered are not discardable: the very next frame is `.output`, written
+  raw, and it begins with the rest of that sequence. `watch_attach` calls
+  `ModeFilter.flush` once, on the first live frame, for that reason. Without it the
+  terminal prints `1;31m` as text and the escape it belonged to is gone — which reads as
+  the agent emitting garbage rather than as a seam in lcc. The same rule is why a CSI too
+  long for `pending` is passed through verbatim instead of truncated: an unterminated CSI
+  eats every character after it until the terminal finds a final byte, so whole lines of
+  output simply vanish. `ModeFilter.overhead` is the caller's buffer bound and is exact —
+  it was one byte short of the worst case, which in ReleaseFast is a write past the end of
+  a stack array.
+- **Dropping the child's setup from a replay leaves a debt the daemon has to settle.**
+  `ansi.ModeFilter` withholds the sequences that configure rather than draw, because
+  replaying a keyboard-stack push a second time is what once broke Enter in Claude Code's
+  picker. But the child sends that setup exactly once, at startup, and `term.sanitize` takes
+  all of it down on detach — so with only the filter, a re-attached terminal has bracketed
+  paste, the kitty keyboard protocol, modifyOtherKeys and focus reporting *off* while Claude
+  Code still believes them on: a multi-line paste submits a line at a time and Shift+Enter is
+  plain Enter. `watch_session.Session.modes` therefore tracks the resolved state over the
+  whole session — not the ring window, which for a long session no longer holds the startup —
+  and `attachClient` carries it on the `attached` frame for the client to apply before any
+  replay byte. The stack is settled to *one* push however many the history holds, which is
+  what keeps the original double-push bug fixed. `?2026` is excluded on purpose: a
+  synchronised update is per-frame, and settling a half-open one freezes the terminal until
+  the child's next frame closes it.
+- **`clamp`'s `skipped` is the only notice that a client's screen is now a lie.** When the
+  ring laps past a client the cursor jumps an arbitrary range, mid-escape-sequence, and
+  neither end can tell. Discarding the flag compiles and looks tidy, and it leaves a hole
+  in the screen that nothing ever repaints over, because Claude Code only redraws what it
+  believes changed. `pumpClient` turns a skip into a `repaint` for that reason, and it
+  queues until the ring is drained rather than one frame per poll pass — the starvation was
+  what made the ring lap in the first place.
+- **A session's pty size is measured, never defaulted.** `Handoff.size` carried 40x120 and
+  no call site overrode it, so every session was born on a terminal nobody has: the banner,
+  the prompt box and the `--resume` picker were laid out for 120 columns and *then* replayed
+  into the real terminal. `resolveSize` asks `term.currentSize()` and keeps `unmeasured_size`
+  for the case where nothing on the process has a window — a `--json` start from a tool call.
+  Anything that registers a session has to go through it.
+- **The repaint poke has to be two sizes separated in time, not two ioctls.** `renegotiate`
+  resizes the pty only when the negotiated size differs, so re-attaching from the terminal a
+  session was last attached from tells Claude Code nothing and the screen keeps whatever the
+  replay painted. `attachClient` compares the size across `renegotiate` and pokes when it did
+  not move — but the two `pty.resize` calls cannot be back to back. The kernel coalesces the
+  two SIGWINCHes, and an app that reads the winsize *in its handler* finds the value already
+  restored, sees no change, and skips the repaint. Measured against a real Claude Code: a
+  same-size attach with a back-to-back poke returned **0 bytes**, a resize with time either
+  side returned ~11 KB starting with `CSI 2J`, and the two-phase poke returns ~2 KB from a
+  session that was otherwise silent. So `repaint` shrinks now, sets `repaint_pending`, and
+  `settleRepaint` puts it back on the `repaint_restore_at` deadline. It restores to the
+  session's *current* `size` rather than a captured one, so a real resize inside the window
+  wins; `renegotiate` clears the flag for the same reason.
+
+  How long the shrink stands is the whole of the user-visible cost: Claude Code anchors its
+  UI to the bottom row, so a frame drawn a row short and then restored *moves down a row* on
+  screen. `repaint_settle_ms` (400ms) is only the fallback for a child that never answers.
+  The real path is `reactedToRepaint`: the first output after the shrink is proof the child
+  read the new size, and it shortens the deadline to `repaint_floor_ms` (40ms). Do not settle
+  on that output *immediately* — a session that was already printing would restore before its
+  handler ever ran, and a busy session is exactly the one a ring lap pokes. Measured: the
+  child answers in ~9ms, the shrink stands ~40ms, and 400ms was plainly visible as a jump.
+  A test whose stand-in traps SIGWINCH and prints proves nothing here — a shell trap fires on
+  the signal whatever the size says. It has to report the size it actually read.
+- **Claude Code runs on the alternate screen, and a byte replay cannot rebuild one.** Its
+  first bytes are `ESC 7 CSI r ESC 8 CSI ?25h CSI ?1049h CSI 2J CSI H`, and from there it
+  paints by absolute address (`CSI 58;1H`) and rewrites only the cells it believes changed —
+  a capture of a live session contains **no LF at all** and no tabs. Two things follow. The
+  alternate screen has no scrollback, so there is nothing for a replay to restore: the buffer
+  is exactly one screen, and `attachClient` skips the replay entirely when
+  `ModeState.onAltScreen()` says so. And replaying a byte history from wherever the ring
+  happens to start rebuilds a screen that is *not* the one the app thinks it is looking at, so
+  its next partial update leaves half of each stale line in place — lines come out as a hybrid
+  of two different strings, which is what "text disappears or moves" actually looks like. The
+  forced repaint is what makes the screen right, not the replay.
 - **A hook event that reports no `permission_mode` must not clear the one already known.**
   Only some events carry it — `Notification` does not (see the test in `watch_hooks.zig`).
   `watch_session.setPlan` is guarded on `permission_mode.len > 0` for that reason, and

@@ -54,13 +54,28 @@ pub const Terminal = struct {
     }
 
     pub fn size(self: Terminal) Size {
-        var ws: std.posix.winsize = undefined;
-        if (ioctl(self.fd, std.c.T.IOCGWINSZ, &ws) == 0 and ws.row > 0) {
-            return .{ .rows = ws.row, .cols = ws.col };
-        }
-        return .{ .rows = 24, .cols = 80 };
+        return sizeOf(self.fd) orelse .{ .rows = 24, .cols = 80 };
     }
 };
+
+pub fn sizeOf(fd: std.posix.fd_t) ?Size {
+    var ws: std.posix.winsize = undefined;
+    if (ioctl(fd, std.c.T.IOCGWINSZ, &ws) != 0) return null;
+    if (ws.row == 0 or ws.col == 0) return null;
+    return .{ .rows = ws.row, .cols = ws.col };
+}
+
+pub fn currentSize() ?Size {
+    const candidates = [_]std.posix.fd_t{
+        std.posix.STDOUT_FILENO,
+        std.posix.STDIN_FILENO,
+        std.posix.STDERR_FILENO,
+    };
+    for (candidates) |fd| {
+        if (sizeOf(fd)) |found| return found;
+    }
+    return null;
+}
 
 pub const Key = union(enum) {
     up,
@@ -210,6 +225,14 @@ pub const Screen = struct {
     }
 };
 
+pub fn prepare(w: *Io.Writer) void {
+    w.writeAll(csi ++ "0m" ++
+        csi ++ "r" ++
+        csi ++ "?7h" ++
+        csi ++ "H" ++
+        csi ++ "2J") catch {};
+}
+
 pub fn sanitize(w: *Io.Writer) void {
     w.writeAll(csi ++ "?1049l" ++
         csi ++ "?1000l" ++
@@ -318,6 +341,38 @@ test "a shortcut is a key position, not a character" {
     try testing.expect(layoutKey(" ") == null);
     try testing.expect(layoutKey("→") == null);
     try testing.expect(layoutKey("") == null);
+}
+
+test "a window size comes back only from something that has one" {
+    try testing.expect(sizeOf(-1) == null);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(testing.io, "not-a-tty", .{});
+    defer file.close(testing.io);
+
+    if (sizeOf(file.handle) != null) {
+        std.debug.print(
+            "a plain file reported a window size. Nothing that is not a terminal has " ++
+                "one, and a session started from a pipe would be born at whatever that " ++
+                "invented number is instead of the documented fallback.\n",
+            .{},
+        );
+        return error.TestExpectedEqual;
+    }
+}
+
+test "prepare puts the cursor somewhere known before a replay lands on it" {
+    var buf: [128]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    prepare(&w);
+    const out = w.buffered();
+
+    for ([_][]const u8{ csi ++ "0m", csi ++ "r", csi ++ "?7h", csi ++ "H", csi ++ "2J" }) |needle| {
+        try testing.expect(std.mem.indexOf(u8, out, needle) != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, out, csi ++ "H").? < std.mem.indexOf(u8, out, csi ++ "2J").?);
+    try testing.expect(std.mem.indexOf(u8, out, csi ++ "3J") == null);
 }
 
 test "sanitize leaves the alternate screen before anything else" {

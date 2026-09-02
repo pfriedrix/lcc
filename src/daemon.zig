@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const ansi = @import("ansi.zig");
 const app_mod = @import("app.zig");
 const exec = @import("exec.zig");
 const pty = @import("pty.zig");
@@ -18,6 +19,8 @@ pub const Options = struct {
     max_sessions: u32 = 64,
     max_clients_per_session: u32 = 8,
     scrollback_bytes: usize = 256 * 1024,
+    repaint_settle_ms: i64 = 400,
+    repaint_floor_ms: i64 = 40,
 };
 
 pub const BindError = error{
@@ -68,6 +71,7 @@ pub fn bind(app: app_mod.App, opts: Options) BindError!?Bound {
 }
 
 pub const Deadlines = struct {
+    repaint_restore_at: ?i64 = null,
     registry_flush_at: ?i64 = null,
     reap_retry_at: ?i64 = null,
     listener_resume_at: ?i64 = null,
@@ -233,6 +237,7 @@ const Loop = struct {
         for (self.clients.items) |*c| {
             const id = c.attached orelse continue;
             if (!std.mem.eql(u8, id, session.id)) continue;
+            pumpClient(self, c);
             self.sendControl(c, .exited, wire.Exited{
                 .session_id = session.id,
                 .exit_code = session.exitCode(),
@@ -346,7 +351,7 @@ fn serve(loop: *Loop) !void {
             try fds.append(gpa, .{ .fd = c.fd, .events = events, .revents = 0 });
         }
 
-        const now_ms = loop.now() * std.time.ms_per_s;
+        const now_ms = app_mod.nowMillis(loop.app.io);
         _ = std.posix.poll(fds.items, nextTimeout(now_ms, loop.deadlines)) catch {};
 
         const at = loop.now();
@@ -360,9 +365,11 @@ fn serve(loop: *Loop) !void {
             const s = &loop.list.items[i];
             if (revents & std.posix.POLL.OUT != 0) s.onWritable();
             if (revents & (std.posix.POLL.IN | std.posix.POLL.HUP) != 0) {
+                const before = s.scrollback.written;
                 if (s.onReadable(at)) {
                     if (loop.reapAndAnnounce(s, at)) loop.dirty = true;
                 }
+                if (s.repaint_pending and s.scrollback.written != before) reactedToRepaint(loop, s);
             }
         }
 
@@ -594,7 +601,8 @@ fn attachClient(loop: *Loop, client: *Client, frame: wire.Frame) void {
 
     client.attached = session.id;
     client.size = .{ .rows = body.rows, .cols = body.cols };
-    client.cursor = if (body.replay) session.scrollback.oldest() else session.scrollback.written;
+    const worth_replaying = body.replay and !session.modes.onAltScreen();
+    client.cursor = if (worth_replaying) session.scrollback.oldest() else session.scrollback.written;
     client.replay_until = session.scrollback.written;
 
     var attached: u32 = 0;
@@ -603,14 +611,21 @@ fn attachClient(loop: *Loop, client: *Client, frame: wire.Frame) void {
             if (std.mem.eql(u8, id, session.id)) attached += 1;
         }
     }
+    var settled: [ansi.ModeState.render_capacity]u8 = undefined;
+    const modes = session.modes.render(&settled);
+
     loop.sendControl(client, .attached, wire.Attached{
         .session_id = session.id,
         .cols = session.size.cols,
         .rows = session.size.rows,
         .input = true,
         .attached_clients = attached,
+        .modes = if (modes.len > 0) modes else null,
     });
+
+    const before = session.size;
     renegotiate(loop);
+    if (std.meta.eql(session.size, before)) repaint(loop, session);
 }
 
 fn detachClient(loop: *Loop, client: *Client) void {
@@ -631,21 +646,57 @@ fn renegotiate(loop: *Loop) void {
         const size = watch_session.negotiateSize(sizes.items) orelse continue;
         if (size.rows == s.size.rows and size.cols == s.size.cols) continue;
         s.size = size;
+        s.repaint_pending = false;
         if (s.master_open) pty.resize(s.master, size);
     }
 }
 
-fn pump(loop: *Loop) void {
-    for (loop.clients.items) |*c| {
-        if (c.dead or c.out.items.len > 0) continue;
-        const id = c.attached orelse continue;
-        const session = loop.find(id) orelse continue;
+fn repaint(loop: *Loop, session: *watch_session.Session) void {
+    if (!session.master_open) return;
+    if (session.repaint_pending) return;
+    const steps = watch_session.pokeSizes(session.size);
+    if (steps[0].rows == steps[1].rows and steps[0].cols == steps[1].cols) return;
+    pty.resize(session.master, steps[0]);
+    session.repaint_pending = true;
+    session.repaint_at = app_mod.nowMillis(loop.app.io);
+    loop.deadlines.repaint_restore_at = session.repaint_at + loop.opts.repaint_settle_ms;
+}
 
+fn reactedToRepaint(loop: *Loop, session: *watch_session.Session) void {
+    const floor = session.repaint_at + loop.opts.repaint_floor_ms;
+    const due = loop.deadlines.repaint_restore_at orelse floor;
+    loop.deadlines.repaint_restore_at = @min(due, floor);
+}
+
+fn settleRepaint(loop: *Loop, session: *watch_session.Session) void {
+    if (!session.repaint_pending) return;
+    session.repaint_pending = false;
+    if (session.master_open) pty.resize(session.master, session.size);
+
+    for (loop.list.items) |*s| {
+        if (s.repaint_pending) return;
+    }
+    loop.deadlines.repaint_restore_at = null;
+}
+
+fn restoreRepainted(loop: *Loop) void {
+    for (loop.list.items) |*s| settleRepaint(loop, s);
+    loop.deadlines.repaint_restore_at = null;
+}
+
+fn pumpClient(loop: *Loop, c: *Client) void {
+    if (c.dead) return;
+    const id = c.attached orelse return;
+    const session = loop.find(id) orelse return;
+
+    while (c.out.items.len < session.scrollback.capacity()) {
         const clamped = session.scrollback.clamp(c.cursor);
         c.cursor = clamped.cursor;
+        if (clamped.skipped) repaint(loop, session);
+
         const parts = session.scrollback.since(c.cursor);
         const available = parts[0].len + parts[1].len;
-        if (available == 0) continue;
+        if (available == 0) return;
 
         const room = if (c.cursor < c.replay_until)
             @min(available, c.replay_until - c.cursor)
@@ -655,11 +706,15 @@ fn pump(loop: *Loop) void {
         const first = @min(parts[0].len, take);
         const kind: wire.Type = if (c.cursor < c.replay_until) .replay else .output;
         const header = wire.encodeHeader(kind, @intCast(take));
-        c.out.appendSlice(loop.app.gpa, &header) catch continue;
-        c.out.appendSlice(loop.app.gpa, parts[0][0..first]) catch continue;
-        if (take > first) c.out.appendSlice(loop.app.gpa, parts[1][0 .. take - first]) catch continue;
+        c.out.appendSlice(loop.app.gpa, &header) catch return;
+        c.out.appendSlice(loop.app.gpa, parts[0][0..first]) catch return;
+        if (take > first) c.out.appendSlice(loop.app.gpa, parts[1][0 .. take - first]) catch return;
         c.cursor += take;
     }
+}
+
+fn pump(loop: *Loop) void {
+    for (loop.clients.items) |*c| pumpClient(loop, c);
 }
 
 fn flushClient(loop: *Loop, client: *Client) void {
@@ -681,6 +736,9 @@ fn flushClient(loop: *Loop, client: *Client) void {
 }
 
 fn tick(loop: *Loop, at: i64, idle_since: *?i64) void {
+    if (loop.deadlines.repaint_restore_at) |due| {
+        if (app_mod.nowMillis(loop.app.io) >= due) restoreRepainted(loop);
+    }
     for (loop.list.items) |*s| {
         if (s.tick(at)) loop.dirty = true;
         if (!s.master_open and loop.reapAndAnnounce(s, at)) loop.dirty = true;
@@ -742,6 +800,7 @@ fn reapDead(loop: *Loop) void {
             c.out.deinit(loop.app.gpa);
             loop.app.gpa.free(c.dec_buf);
             _ = loop.clients.orderedRemove(i);
+            renegotiate(loop);
             continue;
         }
         i += 1;
@@ -899,6 +958,23 @@ const TestConn = struct {
         return error.TestExpectedEqual;
     }
 
+    fn recvAny(self: *TestConn, budget_ms: *i32) !wire.Frame {
+        while (budget_ms.* > 0) {
+            if (try self.dec.next()) |frame| return frame;
+            var fds = [_]std.posix.pollfd{
+                .{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 },
+            };
+            const ready = std.posix.poll(&fds, 100) catch 0;
+            budget_ms.* -= 100;
+            if (ready == 0) continue;
+            const room = self.dec.writable();
+            const n = std.c.read(self.fd, room.ptr, room.len);
+            if (n <= 0) return error.TestUnexpectedResult;
+            self.dec.commit(@intCast(n));
+        }
+        return error.TestExpectedEqual;
+    }
+
     fn hello(self: *TestConn, gpa: std.mem.Allocator, budget_ms: *i32) !void {
         try self.send(gpa, .hello, wire.Hello{ .role = "control", .pid = 0 });
         _ = try self.recv(.hello, budget_ms);
@@ -921,6 +997,53 @@ fn standIn(arena: std.mem.Allocator, io: Io, base: []const u8, script: []const u
 }
 
 const stand_in_cat = "#!/bin/sh\nexec cat\n";
+
+fn awaitMark(
+    gpa: std.mem.Allocator,
+    conn: *TestConn,
+    seen: *std.ArrayList(u8),
+    mark: []const u8,
+    budget_ms: *i32,
+) !void {
+    const from = seen.items.len -| mark.len;
+    while (budget_ms.* > 0) {
+        if (std.mem.indexOfPos(u8, seen.items, from, mark) != null) return;
+        const frame = try conn.recvAny(budget_ms);
+        if (frame.type != .replay and frame.type != .output) continue;
+        try seen.appendSlice(gpa, frame.payload);
+    }
+    return error.TestExpectedEqual;
+}
+
+const stand_in_configures_terminal =
+    "#!/bin/sh\n" ++
+    "printf '\\033[?2004h\\033[?1004h\\033[>1u\\033[>4;2mREADY'\n" ++
+    "while :; do IFS= read -r line || continue; done\n";
+
+const stand_in_notes_winch =
+    "#!/bin/sh\n" ++
+    "got=0\n" ++
+    "trap 'got=1' WINCH\n" ++
+    "printf READY\n" ++
+    "while :; do\n" ++
+    "  IFS= read -r line || continue\n" ++
+    "  case \"$line\" in\n" ++
+    "    PING) printf \"PONG=$got\" ;;\n" ++
+    "    RESET) got=0; printf RESETOK ;;\n" ++
+    "    *) printf '%s' \"$line\" ;;\n" ++
+    "  esac\n" ++
+    "done\n";
+
+const stand_in_winch =
+    "#!/bin/sh\n" ++
+    "trap 'set -- $(stty size); printf \"W:$1 \"' WINCH\n" ++
+    "printf READY\n" ++
+    "while :; do IFS= read -r line || continue; done\n";
+
+const stand_in_alt_screen =
+    "#!/bin/sh\n" ++
+    "printf '\\033[?1049h\\033[2J\\033[HREADY'\n" ++
+    "while :; do IFS= read -r line || continue; done\n";
 
 test "a registered session runs, echoes, and its output survives a reconnect" {
     const gpa = testing.allocator;
@@ -1476,6 +1599,452 @@ test "a child that exits tells the attached client instead of leaving it on a de
     };
 
     try conn.send(arena, .stop, wire.Stop{ .force = true });
+}
+
+test "attaching at the size the session already has still makes the child repaint" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("LCC_WATCH_DIR", base);
+    const socket_path = watch_paths.socket(arena, &environ) catch |err| switch (err) {
+        error.SocketPathTooLong => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var daemon_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer daemon_arena.deinit();
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_w: Io.Writer = .fixed(&out_buf);
+    var err_w: Io.Writer = .fixed(&err_buf);
+    const daemon_app: app_mod.App = .{
+        .gpa = daemon_arena.allocator(),
+        .io = io,
+        .environ = &environ,
+        .ui = .{ .io = io, .out = &out_w, .err = &err_w },
+    };
+
+    const thread = try std.Thread.spawn(.{}, runForTest, .{ daemon_app, Options{
+        .foreground = true,
+        .idle_exit_seconds = 3600,
+        .repaint_settle_ms = 1000,
+    } });
+    defer thread.join();
+
+    var budget: i32 = 15_000;
+    while (budget > 0) : (budget -= 50) {
+        if (Io.Dir.cwd().statFile(io, socket_path, .{})) |_| break else |_| {}
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+
+    var conn = try TestConn.open(arena, io, socket_path);
+    defer conn.close();
+    var b: i32 = 15_000;
+    try conn.hello(arena, &b);
+
+    try conn.send(arena, .register, wire.Register{
+        .worktree = base,
+        .branch = "feature/pe-9-repaint",
+        .issue = "PE-9",
+        .repo_root = base,
+        .program = try standIn(arena, io, base, stand_in_winch),
+        .argv = &.{},
+        .env = &.{"TERM=dumb"},
+        .cols = 80,
+        .rows = 25,
+    });
+    const body = try wire.parse(wire.Registered, arena, try conn.recv(.registered, &b));
+    defer conn.send(arena, .stop, wire.Stop{ .force = true }) catch {};
+
+    var attach_conn = try TestConn.open(arena, io, socket_path);
+    defer attach_conn.close();
+    var ab: i32 = 15_000;
+    try attach_conn.send(arena, .hello, wire.Hello{ .role = "attach", .pid = 0 });
+    _ = try attach_conn.recv(.hello, &ab);
+    attach_conn.dec.role = .attach;
+
+    try attach_conn.send(arena, .attach, wire.Attach{
+        .session_id = body.session_id,
+        .cols = 80,
+        .rows = 24,
+        .replay = true,
+    });
+    _ = try attach_conn.recv(.attached, &ab);
+
+    var seen: std.ArrayList(u8) = .empty;
+    defer seen.deinit(gpa);
+    try awaitMark(gpa, &attach_conn, &seen, "READY", &ab);
+
+    try attach_conn.send(arena, .attach, wire.Attach{
+        .session_id = body.session_id,
+        .cols = 80,
+        .rows = 24,
+        .replay = false,
+    });
+    _ = try attach_conn.recv(.attached, &ab);
+
+    var after: std.ArrayList(u8) = .empty;
+    defer after.deinit(gpa);
+    while (ab > 0 and std.mem.indexOf(u8, after.items, "W:24") == null) {
+        const frame = attach_conn.recv(.output, &ab) catch break;
+        try after.appendSlice(gpa, frame.payload);
+    }
+
+    if (std.mem.indexOf(u8, after.items, "W:23") == null) {
+        std.debug.print(
+            "the child was signalled but never saw a size other than the one it already " ++
+                "had: it reported {s}. Two TIOCSWINSZ calls back to back coalesce into a " ++
+                "single delivery, and an app that reads the winsize in its handler finds " ++
+                "the original value and skips the repaint — which is what Claude Code does, " ++
+                "measured: 0 bytes back from a same-size attach against 10889 from a real " ++
+                "resize. The shrink has to stand long enough to be observed.\n",
+            .{if (after.items.len == 0) "nothing at all" else after.items},
+        );
+        return error.TestExpectedEqual;
+    }
+}
+
+test "a screen a byte replay cannot rebuild is not replayed at all" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("LCC_WATCH_DIR", base);
+    const socket_path = watch_paths.socket(arena, &environ) catch |err| switch (err) {
+        error.SocketPathTooLong => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var daemon_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer daemon_arena.deinit();
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_w: Io.Writer = .fixed(&out_buf);
+    var err_w: Io.Writer = .fixed(&err_buf);
+    const daemon_app: app_mod.App = .{
+        .gpa = daemon_arena.allocator(),
+        .io = io,
+        .environ = &environ,
+        .ui = .{ .io = io, .out = &out_w, .err = &err_w },
+    };
+
+    const thread = try std.Thread.spawn(.{}, runForTest, .{ daemon_app, Options{
+        .foreground = true,
+        .idle_exit_seconds = 3600,
+    } });
+    defer thread.join();
+
+    var budget: i32 = 15_000;
+    while (budget > 0) : (budget -= 50) {
+        if (Io.Dir.cwd().statFile(io, socket_path, .{})) |_| break else |_| {}
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+
+    var conn = try TestConn.open(arena, io, socket_path);
+    defer conn.close();
+    var b: i32 = 15_000;
+    try conn.hello(arena, &b);
+
+    try conn.send(arena, .register, wire.Register{
+        .worktree = base,
+        .branch = "feature/pe-12-alt",
+        .issue = "PE-12",
+        .repo_root = base,
+        .program = try standIn(arena, io, base, stand_in_alt_screen),
+        .argv = &.{},
+        .env = &.{"TERM=dumb"},
+        .cols = 80,
+        .rows = 24,
+    });
+    const body = try wire.parse(wire.Registered, arena, try conn.recv(.registered, &b));
+    defer conn.send(arena, .stop, wire.Stop{ .force = true }) catch {};
+
+    var first = try TestConn.open(arena, io, socket_path);
+    defer first.close();
+    var fb: i32 = 15_000;
+    try first.send(arena, .hello, wire.Hello{ .role = "attach", .pid = 0 });
+    _ = try first.recv(.hello, &fb);
+    first.dec.role = .attach;
+    try first.send(arena, .attach, wire.Attach{
+        .session_id = body.session_id,
+        .cols = 80,
+        .rows = 24,
+        .replay = true,
+    });
+    _ = try first.recv(.attached, &fb);
+
+    var seen: std.ArrayList(u8) = .empty;
+    defer seen.deinit(gpa);
+    try awaitMark(gpa, &first, &seen, "READY", &fb);
+
+    var second = try TestConn.open(arena, io, socket_path);
+    defer second.close();
+    var sb: i32 = 15_000;
+    try second.send(arena, .hello, wire.Hello{ .role = "attach", .pid = 0 });
+    _ = try second.recv(.hello, &sb);
+    second.dec.role = .attach;
+    try second.send(arena, .attach, wire.Attach{
+        .session_id = body.session_id,
+        .cols = 80,
+        .rows = 24,
+        .replay = true,
+    });
+    const attached = try wire.parse(wire.Attached, arena, try second.recv(.attached, &sb));
+
+    try testing.expect(attached.modes != null);
+    try testing.expect(std.mem.indexOf(u8, attached.modes.?, "\x1b[?1049h") != null);
+
+    var replayed: usize = 0;
+    var drain: i32 = 1_500;
+    while (drain > 0) {
+        const frame = second.recvAny(&drain) catch break;
+        if (frame.type == .replay) replayed += frame.payload.len;
+    }
+
+    if (replayed > 0) {
+        std.debug.print(
+            "{d} bytes of scrollback were replayed into an alternate screen. There is no " ++
+                "scrollback there to restore — the buffer is exactly one screen — and the " ++
+                "app that owns it paints by absolute address and rewrites only the cells it " ++
+                "believes changed. A byte history replayed from wherever the ring happens to " ++
+                "start rebuilds a screen that is not the one it thinks it is looking at, and " ++
+                "the next partial update leaves half of each stale line in place.\n",
+            .{replayed},
+        );
+        return error.TestExpectedEqual;
+    }
+}
+
+test "output lost to a lapped ring is rebuilt, not left as a hole in the screen" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("LCC_WATCH_DIR", base);
+    const socket_path = watch_paths.socket(arena, &environ) catch |err| switch (err) {
+        error.SocketPathTooLong => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var daemon_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer daemon_arena.deinit();
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_w: Io.Writer = .fixed(&out_buf);
+    var err_w: Io.Writer = .fixed(&err_buf);
+    const daemon_app: app_mod.App = .{
+        .gpa = daemon_arena.allocator(),
+        .io = io,
+        .environ = &environ,
+        .ui = .{ .io = io, .out = &out_w, .err = &err_w },
+    };
+
+    const thread = try std.Thread.spawn(.{}, runForTest, .{ daemon_app, Options{
+        .foreground = true,
+        .idle_exit_seconds = 3600,
+        .scrollback_bytes = 64,
+    } });
+    defer thread.join();
+
+    var budget: i32 = 15_000;
+    while (budget > 0) : (budget -= 50) {
+        if (Io.Dir.cwd().statFile(io, socket_path, .{})) |_| break else |_| {}
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+
+    var conn = try TestConn.open(arena, io, socket_path);
+    defer conn.close();
+    var b: i32 = 15_000;
+    try conn.hello(arena, &b);
+
+    try conn.send(arena, .register, wire.Register{
+        .worktree = base,
+        .branch = "feature/pe-10-lapped",
+        .issue = "PE-10",
+        .repo_root = base,
+        .program = try standIn(arena, io, base, stand_in_notes_winch),
+        .argv = &.{},
+        .env = &.{"TERM=dumb"},
+        .cols = 80,
+        .rows = 25,
+    });
+    const body = try wire.parse(wire.Registered, arena, try conn.recv(.registered, &b));
+    defer conn.send(arena, .stop, wire.Stop{ .force = true }) catch {};
+
+    var attach_conn = try TestConn.open(arena, io, socket_path);
+    defer attach_conn.close();
+    var ab: i32 = 15_000;
+    try attach_conn.send(arena, .hello, wire.Hello{ .role = "attach", .pid = 0 });
+    _ = try attach_conn.recv(.hello, &ab);
+    attach_conn.dec.role = .attach;
+
+    try attach_conn.send(arena, .attach, wire.Attach{
+        .session_id = body.session_id,
+        .cols = 80,
+        .rows = 24,
+        .replay = true,
+    });
+    _ = try attach_conn.recv(.attached, &ab);
+
+    var seen: std.ArrayList(u8) = .empty;
+    defer seen.deinit(gpa);
+
+    try awaitMark(gpa, &attach_conn, &seen, "READY", &ab);
+
+    try attach_conn.raw(.input, "RESET\nRESET\nRESET\n");
+    try awaitMark(gpa, &attach_conn, &seen, "RESETOK", &ab);
+
+    var flood: std.ArrayList(u8) = .empty;
+    defer flood.deinit(gpa);
+    for (0..20) |_| {
+        try flood.appendNTimes(gpa, 'F', 200);
+        try flood.append(gpa, '\n');
+    }
+    try flood.appendSlice(gpa, "FLOODEND\n");
+    try attach_conn.raw(.input, flood.items);
+    try awaitMark(gpa, &attach_conn, &seen, "FLOODEND", &ab);
+
+    try attach_conn.raw(.input, "PING\nPING\nPING\nPING\nPING\n");
+    try awaitMark(gpa, &attach_conn, &seen, "PONG=", &ab);
+
+    const at = std.mem.lastIndexOf(u8, seen.items, "PONG=").? + "PONG=".len;
+    if (at >= seen.items.len or seen.items[at] != '1') {
+        std.debug.print(
+            "the ring lapped past this client and the child was never told to repaint. " ++
+                "clamp() reports the skip and pump() has to act on it: the bytes it jumped " ++
+                "over are gone mid-escape-sequence, so the screen keeps a hole in it until " ++
+                "something makes Claude Code draw a whole frame again.\n",
+            .{},
+        );
+        return error.TestExpectedEqual;
+    }
+}
+
+test "re-attaching sets the terminal up the way the session left it" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("LCC_WATCH_DIR", base);
+    const socket_path = watch_paths.socket(arena, &environ) catch |err| switch (err) {
+        error.SocketPathTooLong => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var daemon_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer daemon_arena.deinit();
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_w: Io.Writer = .fixed(&out_buf);
+    var err_w: Io.Writer = .fixed(&err_buf);
+    const daemon_app: app_mod.App = .{
+        .gpa = daemon_arena.allocator(),
+        .io = io,
+        .environ = &environ,
+        .ui = .{ .io = io, .out = &out_w, .err = &err_w },
+    };
+
+    const thread = try std.Thread.spawn(.{}, runForTest, .{ daemon_app, Options{
+        .foreground = true,
+        .idle_exit_seconds = 3600,
+    } });
+    defer thread.join();
+
+    var budget: i32 = 15_000;
+    while (budget > 0) : (budget -= 50) {
+        if (Io.Dir.cwd().statFile(io, socket_path, .{})) |_| break else |_| {}
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+
+    var conn = try TestConn.open(arena, io, socket_path);
+    defer conn.close();
+    var b: i32 = 15_000;
+    try conn.hello(arena, &b);
+
+    try conn.send(arena, .register, wire.Register{
+        .worktree = base,
+        .branch = "feature/pe-11-modes",
+        .issue = "PE-11",
+        .repo_root = base,
+        .program = try standIn(arena, io, base, stand_in_configures_terminal),
+        .argv = &.{},
+        .env = &.{"TERM=dumb"},
+        .cols = 80,
+        .rows = 24,
+    });
+    const body = try wire.parse(wire.Registered, arena, try conn.recv(.registered, &b));
+    defer conn.send(arena, .stop, wire.Stop{ .force = true }) catch {};
+
+    var attach_conn = try TestConn.open(arena, io, socket_path);
+    defer attach_conn.close();
+    var ab: i32 = 15_000;
+    try attach_conn.send(arena, .hello, wire.Hello{ .role = "attach", .pid = 0 });
+    _ = try attach_conn.recv(.hello, &ab);
+    attach_conn.dec.role = .attach;
+
+    try attach_conn.send(arena, .attach, wire.Attach{
+        .session_id = body.session_id,
+        .cols = 80,
+        .rows = 24,
+        .replay = true,
+    });
+    _ = try attach_conn.recv(.attached, &ab);
+
+    var seen: std.ArrayList(u8) = .empty;
+    defer seen.deinit(gpa);
+    try awaitMark(gpa, &attach_conn, &seen, "READY", &ab);
+
+    try attach_conn.send(arena, .attach, wire.Attach{
+        .session_id = body.session_id,
+        .cols = 80,
+        .rows = 24,
+        .replay = false,
+    });
+    const again = try wire.parse(wire.Attached, arena, try attach_conn.recv(.attached, &ab));
+
+    const modes = again.modes orelse "";
+    for ([_][]const u8{ "\x1b[?2004h", "\x1b[?1004h", "\x1b[>4;2m", "\x1b[>1u" }) |needed| {
+        if (std.mem.indexOf(u8, modes, needed) == null) {
+            std.debug.print(
+                "attaching handed the terminal \"{f}\", missing the setup the child still " ++
+                    "believes is in force. sanitize() takes it down on detach and the child " ++
+                    "sends it once, at startup, where the replay filter drops it — so a " ++
+                    "re-attached Claude Code gets pastes a line at a time and cannot tell " ++
+                    "Shift+Enter from Enter.\n",
+                .{std.zig.fmtString(modes)},
+            );
+            return error.TestExpectedEqual;
+        }
+    }
 }
 
 test "a grandchild still holding the pty cannot hide the child's exit" {

@@ -57,6 +57,11 @@ pub fn nowSeconds(io: Io) i64 {
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
 }
 
+pub fn nowMillis(io: Io) i64 {
+    const ts = Io.Timestamp.now(io, .real);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
+}
+
 pub fn worktreeLabel(gpa: std.mem.Allocator, choice: Choice) ![]u8 {
     var line: std.ArrayList(u8) = .empty;
     const w = gpa;

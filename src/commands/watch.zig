@@ -220,6 +220,9 @@ fn dashboard(app: app_mod.App) !void {
     var confirming_kill = false;
     var key_buf: [8]u8 = undefined;
     var last_cols: u16 = 0;
+    var offset: usize = 0;
+    var notice_buf: [256]u8 = undefined;
+    var notice: []const u8 = "";
     const built = exec.selfModified(app.gpa, app.io);
 
     while (true) {
@@ -250,6 +253,14 @@ fn dashboard(app: app_mod.App) !void {
             }) catch {};
             lines += 1;
         }
+        if (notice.len > 0) {
+            const p = ui.palette();
+            out.print("  {s}✗ {s}{s}\n", .{ p.red, term.truncate(notice, dims.cols -| 4), p.reset }) catch {};
+            lines += 1;
+        }
+
+        const page = visibleRows(dims.rows, rows.len, lines);
+        offset = window(offset, page, rows.len, indexOf(rows, cursor_id));
 
         const widths = watch_table.fit(watch_table.measure(rows), dims.cols);
         if (rows.len == 0) {
@@ -258,7 +269,15 @@ fn dashboard(app: app_mod.App) !void {
             }) catch {};
             lines += 1;
         } else {
-            lines += watch_table.render(out, rows, widths, dims.cols, cursor_id, now);
+            const end = @min(offset + page, rows.len);
+            lines += watch_table.render(out, rows[offset..end], widths, dims.cols, cursor_id, now);
+            if (rows.len > page) {
+                const p = ui.palette();
+                out.print("  {s}showing {d}-{d} of {d}{s}\n", .{
+                    p.dim, offset + 1, end, rows.len, p.reset,
+                }) catch {};
+                lines += 1;
+            }
         }
 
         lines += footer(out, dims.cols, rows, cursor_id, confirming_kill);
@@ -271,6 +290,7 @@ fn dashboard(app: app_mod.App) !void {
         const ready = std.posix.poll(&fds, 1000) catch 0;
         if (ready == 0) continue;
 
+        notice = "";
         switch (term.readKey(terminal, &key_buf)) {
             .cancel => return,
             .up => cursor_id = copyId(&cursor_buf, step(rows, cursor_id, -1)),
@@ -281,7 +301,11 @@ fn dashboard(app: app_mod.App) !void {
                         row.session_id.?
                     else blk: {
                         const started = startForWorktree(app, row) catch |err| {
-                            app.ui.fail("Could not start a session: {s}", .{@errorName(err)});
+                            notice = std.fmt.bufPrint(
+                                &notice_buf,
+                                "Could not start a session: {s}",
+                                .{@errorName(err)},
+                            ) catch "Could not start a session.";
                             continue;
                         };
                         break :blk started.id;
@@ -322,6 +346,29 @@ fn dashboard(app: app_mod.App) !void {
             else => {},
         }
     }
+}
+
+pub fn visibleRows(terminal_rows: u16, row_count: usize, spent: usize) usize {
+    const chrome = spent + 2;
+    const budget = @as(usize, terminal_rows) -| (chrome + 1);
+    if (budget == 0) return 1;
+    if (row_count <= budget) return budget;
+    return @max(@as(usize, 1), budget -| 1);
+}
+
+pub fn window(offset: usize, page: usize, row_count: usize, cursor: usize) usize {
+    if (row_count <= page) return 0;
+    var at = @min(offset, row_count -| page);
+    if (cursor < at) at = cursor;
+    if (cursor >= at + page) at = cursor + 1 - page;
+    return at;
+}
+
+pub fn indexOf(rows: []const watch_table.Row, key: []const u8) usize {
+    for (rows, 0..) |row, i| {
+        if (std.mem.eql(u8, row.key, key)) return i;
+    }
+    return 0;
 }
 
 fn attachTo(
@@ -896,4 +943,45 @@ test "a worktree row shows the session that is alive, not the first one recorded
     try std.testing.expectEqualStrings("s-00000005", only_dead.id);
 
     try std.testing.expect(findSession(&.{ dead, live }, "/w/somewhere-else") == null);
+}
+
+test "the dashboard's frame stays inside the terminal, however many worktrees there are" {
+    const cases = [_]struct { rows: u16, count: usize, spent: usize }{
+        .{ .rows = 50, .count = 4, .spent = 0 },
+        .{ .rows = 50, .count = 4, .spent = 2 },
+        .{ .rows = 10, .count = 40, .spent = 0 },
+        .{ .rows = 10, .count = 40, .spent = 2 },
+        .{ .rows = 24, .count = 21, .spent = 1 },
+        .{ .rows = 8, .count = 9, .spent = 0 },
+    };
+
+    for (cases) |case| {
+        const page = visibleRows(case.rows, case.count, case.spent);
+        const shown = @min(page, case.count);
+        const truncated: usize = if (case.count > page) 1 else 0;
+        const drawn = case.spent + 1 + shown + truncated + 1;
+
+        if (drawn >= case.rows) {
+            std.debug.print(
+                "a {d}-row terminal with {d} worktrees was handed a {d}-line frame. " ++
+                    "Screen.eraseFrame walks the cursor up exactly that many lines, so a " ++
+                    "frame that scrolled erases the wrong ones — and every redraw after it " ++
+                    "eats another line of what was on the screen before lcc started.\n",
+                .{ case.rows, case.count, drawn },
+            );
+            return std.testing.expect(false);
+        }
+    }
+}
+
+test "the window follows the cursor and never runs off either end" {
+    try std.testing.expectEqual(@as(usize, 0), window(0, 10, 4, 0));
+    try std.testing.expectEqual(@as(usize, 0), window(7, 10, 4, 2));
+
+    try std.testing.expectEqual(@as(usize, 0), window(0, 5, 20, 0));
+    try std.testing.expectEqual(@as(usize, 0), window(0, 5, 20, 4));
+    try std.testing.expectEqual(@as(usize, 1), window(0, 5, 20, 5));
+    try std.testing.expectEqual(@as(usize, 15), window(0, 5, 20, 19));
+    try std.testing.expectEqual(@as(usize, 3), window(8, 5, 20, 3));
+    try std.testing.expectEqual(@as(usize, 15), window(18, 5, 20, 17));
 }
