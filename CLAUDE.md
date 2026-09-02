@@ -238,12 +238,20 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   same-size attach with a back-to-back poke returned **0 bytes**, a resize with time either
   side returned ~11 KB starting with `CSI 2J`, and the two-phase poke returns ~2 KB from a
   session that was otherwise silent. So `repaint` shrinks now, sets `repaint_pending`, and
-  `restoreRepainted` puts it back on the `repaint_restore_at` deadline
-  (`Options.repaint_settle_ms`, 400ms). It restores to the session's *current* `size` rather
-  than a captured one, so a real resize inside the window wins; `renegotiate` clears the flag
-  for the same reason. A test whose stand-in traps SIGWINCH and prints proves nothing here —
-  a shell trap fires on the signal whatever the size says. It has to report the size it
-  actually read.
+  `settleRepaint` puts it back on the `repaint_restore_at` deadline. It restores to the
+  session's *current* `size` rather than a captured one, so a real resize inside the window
+  wins; `renegotiate` clears the flag for the same reason.
+
+  How long the shrink stands is the whole of the user-visible cost: Claude Code anchors its
+  UI to the bottom row, so a frame drawn a row short and then restored *moves down a row* on
+  screen. `repaint_settle_ms` (400ms) is only the fallback for a child that never answers.
+  The real path is `reactedToRepaint`: the first output after the shrink is proof the child
+  read the new size, and it shortens the deadline to `repaint_floor_ms` (40ms). Do not settle
+  on that output *immediately* — a session that was already printing would restore before its
+  handler ever ran, and a busy session is exactly the one a ring lap pokes. Measured: the
+  child answers in ~9ms, the shrink stands ~40ms, and 400ms was plainly visible as a jump.
+  A test whose stand-in traps SIGWINCH and prints proves nothing here — a shell trap fires on
+  the signal whatever the size says. It has to report the size it actually read.
 - **Claude Code runs on the alternate screen, and a byte replay cannot rebuild one.** Its
   first bytes are `ESC 7 CSI r ESC 8 CSI ?25h CSI ?1049h CSI 2J CSI H`, and from there it
   paints by absolute address (`CSI 58;1H`) and rewrites only the cells it believes changed —

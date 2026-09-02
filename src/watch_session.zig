@@ -24,6 +24,7 @@ pub const Session = struct {
     modes: ansi.ModeState = .{},
     size: pty.Size,
     repaint_pending: bool = false,
+    repaint_at: i64 = 0,
 
     status: sessions.Status = .starting,
     status_at: i64,

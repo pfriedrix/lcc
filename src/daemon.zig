@@ -20,6 +20,7 @@ pub const Options = struct {
     max_clients_per_session: u32 = 8,
     scrollback_bytes: usize = 256 * 1024,
     repaint_settle_ms: i64 = 400,
+    repaint_floor_ms: i64 = 40,
 };
 
 pub const BindError = error{
@@ -364,9 +365,11 @@ fn serve(loop: *Loop) !void {
             const s = &loop.list.items[i];
             if (revents & std.posix.POLL.OUT != 0) s.onWritable();
             if (revents & (std.posix.POLL.IN | std.posix.POLL.HUP) != 0) {
+                const before = s.scrollback.written;
                 if (s.onReadable(at)) {
                     if (loop.reapAndAnnounce(s, at)) loop.dirty = true;
                 }
+                if (s.repaint_pending and s.scrollback.written != before) reactedToRepaint(loop, s);
             }
         }
 
@@ -655,15 +658,29 @@ fn repaint(loop: *Loop, session: *watch_session.Session) void {
     if (steps[0].rows == steps[1].rows and steps[0].cols == steps[1].cols) return;
     pty.resize(session.master, steps[0]);
     session.repaint_pending = true;
-    loop.deadlines.repaint_restore_at = app_mod.nowMillis(loop.app.io) + loop.opts.repaint_settle_ms;
+    session.repaint_at = app_mod.nowMillis(loop.app.io);
+    loop.deadlines.repaint_restore_at = session.repaint_at + loop.opts.repaint_settle_ms;
+}
+
+fn reactedToRepaint(loop: *Loop, session: *watch_session.Session) void {
+    const floor = session.repaint_at + loop.opts.repaint_floor_ms;
+    const due = loop.deadlines.repaint_restore_at orelse floor;
+    loop.deadlines.repaint_restore_at = @min(due, floor);
+}
+
+fn settleRepaint(loop: *Loop, session: *watch_session.Session) void {
+    if (!session.repaint_pending) return;
+    session.repaint_pending = false;
+    if (session.master_open) pty.resize(session.master, session.size);
+
+    for (loop.list.items) |*s| {
+        if (s.repaint_pending) return;
+    }
+    loop.deadlines.repaint_restore_at = null;
 }
 
 fn restoreRepainted(loop: *Loop) void {
-    for (loop.list.items) |*s| {
-        if (!s.repaint_pending) continue;
-        s.repaint_pending = false;
-        if (s.master_open) pty.resize(s.master, s.size);
-    }
+    for (loop.list.items) |*s| settleRepaint(loop, s);
     loop.deadlines.repaint_restore_at = null;
 }
 
