@@ -1,10 +1,14 @@
 const std = @import("std");
 
 pub const ModeFilter = struct {
-    const State = enum { text, esc, csi };
+    const State = enum { text, esc, csi, csi_verbatim };
+
+    const pending_capacity = 64;
+
+    pub const overhead = pending_capacity + 2;
 
     state: State = .text,
-    pending: [64]u8 = undefined,
+    pending: [pending_capacity]u8 = undefined,
     len: usize = 0,
 
     pub fn filter(self: *ModeFilter, chunk: []const u8, out: []u8) []const u8 {
@@ -32,29 +36,60 @@ pub const ModeFilter = struct {
                     }
                 },
                 .csi => {
-                    if (self.len < self.pending.len) {
-                        self.pending[self.len] = byte;
-                        self.len += 1;
+                    if (self.len == self.pending.len) {
+                        n += self.emitPending(out[n..]);
+                        out[n] = byte;
+                        n += 1;
+                        self.state = if (isFinal(byte)) .text else .csi_verbatim;
+                        continue;
                     }
-                    if (byte >= 0x40 and byte <= 0x7e) {
-                        if (!configures(self.pending[0..self.len])) {
-                            out[n] = 0x1b;
-                            n += 1;
-                            out[n] = '[';
-                            n += 1;
-                            @memcpy(out[n..][0..self.len], self.pending[0..self.len]);
-                            n += self.len;
-                        }
+                    self.pending[self.len] = byte;
+                    self.len += 1;
+                    if (isFinal(byte)) {
+                        if (!withheld(self.pending[0..self.len])) n += self.emitPending(out[n..]);
                         self.state = .text;
                     }
+                },
+                .csi_verbatim => {
+                    out[n] = byte;
+                    n += 1;
+                    if (isFinal(byte)) self.state = .text;
                 },
             }
         }
         return out[0..n];
     }
+
+    pub fn flush(self: *ModeFilter, out: []u8) []const u8 {
+        var n: usize = 0;
+        switch (self.state) {
+            .text, .csi_verbatim => {},
+            .esc => {
+                out[0] = 0x1b;
+                n = 1;
+            },
+            .csi => n = self.emitPending(out),
+        }
+        self.state = .text;
+        self.len = 0;
+        return out[0..n];
+    }
+
+    fn emitPending(self: *ModeFilter, out: []u8) usize {
+        out[0] = 0x1b;
+        out[1] = '[';
+        @memcpy(out[2..][0..self.len], self.pending[0..self.len]);
+        const n = 2 + self.len;
+        self.len = 0;
+        return n;
+    }
 };
 
-fn configures(body: []const u8) bool {
+fn isFinal(byte: u8) bool {
+    return byte >= 0x40 and byte <= 0x7e;
+}
+
+fn withheld(body: []const u8) bool {
     if (body.len == 0) return false;
     const final = body[body.len - 1];
     const private = body[0] == '?' or body[0] == '>' or body[0] == '<' or body[0] == '=';
@@ -63,6 +98,7 @@ fn configures(body: []const u8) bool {
         'u' => private,
         'm' => private,
         'r' => true,
+        'n', 'c' => true,
         else => false,
     };
 }
@@ -96,4 +132,90 @@ test "a mode sequence split across two frames is still dropped" {
     var out: [256]u8 = undefined;
     try testing.expectEqualStrings("a", f.filter("a\x1b[>1", &out));
     try testing.expectEqualStrings("b", f.filter("ub", &out));
+}
+
+test "a question the terminal would answer is never replayed back at it" {
+    var f: ModeFilter = .{};
+    var out: [256]u8 = undefined;
+
+    const asked = "before\x1b[6n\x1b[c\x1b[>0c\x1b[5nafter";
+    const kept = f.filter(asked, &out);
+    if (!std.mem.eql(u8, "beforeafter", kept)) {
+        std.debug.print(
+            "a device query survived the replay as \"{f}\". The terminal answers it, " ++
+                "and attach forwards everything on stdin to the pty — so the answer is " ++
+                "typed into Claude Code as if the user had entered it.\n",
+            .{std.zig.fmtString(kept)},
+        );
+        return error.TestExpectedEqual;
+    }
+
+    var g: ModeFilter = .{};
+    try testing.expectEqualStrings("\x1b[38;5;9m", g.filter("\x1b[38;5;9m", &out));
+}
+
+test "a CSI too long to judge is passed through whole, never left unterminated" {
+    var f: ModeFilter = .{};
+    var out: [1024]u8 = undefined;
+
+    const sequence = "\x1b[" ++ ("1" ** 200) ++ "m";
+
+    const kept = f.filter(sequence, &out);
+    if (!std.mem.eql(u8, sequence, kept)) {
+        std.debug.print(
+            "a {d}-byte CSI came back as \"{f}\". Truncating one drops its final byte, " ++
+                "and a terminal reading an unterminated CSI swallows every character " ++
+                "after it until the next final byte — whole lines of the agent's output " ++
+                "simply vanish.\n",
+            .{ sequence.len, std.zig.fmtString(kept) },
+        );
+        return error.TestExpectedEqual;
+    }
+    try testing.expectEqual(ModeFilter.State.text, f.state);
+}
+
+test "the tail of a sequence cut by the end of the replay is handed over, not eaten" {
+    var f: ModeFilter = .{};
+    var out: [256]u8 = undefined;
+
+    try testing.expectEqualStrings("row", f.filter("row\x1b[38;2", &out));
+
+    const tail = f.flush(&out);
+    if (!std.mem.eql(u8, "\x1b[38;2", tail)) {
+        std.debug.print(
+            "the replay ended mid-sequence and the filter kept \"{f}\" to itself. " ++
+                "The live output that follows starts with the rest of that sequence, " ++
+                "so the terminal prints it as text and loses the colour it was setting.\n",
+            .{std.zig.fmtString(tail)},
+        );
+        return error.TestExpectedEqual;
+    }
+    try testing.expectEqual(@as(usize, 0), f.flush(&out).len);
+}
+
+test "a lone escape at the end of the replay is handed over too" {
+    var f: ModeFilter = .{};
+    var out: [64]u8 = undefined;
+    try testing.expectEqualStrings("x", f.filter("x\x1b", &out));
+    try testing.expectEqualStrings("\x1b", f.flush(&out));
+}
+
+test "the filter never writes more than its stated overhead past the chunk" {
+    const gpa = testing.allocator;
+    const chunk_len = 4096;
+
+    const chunk = try gpa.alloc(u8, chunk_len);
+    defer gpa.free(chunk);
+    const out = try gpa.alloc(u8, chunk_len + ModeFilter.overhead);
+    defer gpa.free(out);
+
+    var f: ModeFilter = .{};
+    var primer: [8]u8 = undefined;
+    _ = f.filter("\x1b[" ++ ("9" ** 64), &primer);
+
+    @memset(chunk, 'a');
+    chunk[0] = 'm';
+    const kept = f.filter(chunk, out);
+    try testing.expect(kept.len <= chunk_len + ModeFilter.overhead);
+    try testing.expectEqual(@as(usize, chunk_len + ModeFilter.overhead), kept.len);
 }

@@ -12,7 +12,7 @@ is the Zig standard library plus CoreFoundation/Security.
 Run from the repo root:
 
 ```bash
-zig build test --summary all       # unit tests (~3s, 317 at last count)
+zig build test --summary all       # unit tests (~4s, 327 at last count)
 zig build                          # debug binary → zig-out/bin/lcc
 zig build -Doptimize=ReleaseFast   # what PATH should be serving
 zig build run -- list              # run without installing
@@ -177,6 +177,40 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   site written as a bare `bail(…)` is a compile error rather than a silent fall-through,
   but only because the returned error value cannot be discarded; do not "fix" that by
   ignoring it.
+- **A replay withholds a sequence; it must still hand back the half it swallowed.** The
+  replay ends at `scrollback.written` frozen at attach time — an offset that lands wherever
+  the child happened to be, so the last `.replay` frame regularly ends mid-CSI. The bytes
+  the filter has buffered are not discardable: the very next frame is `.output`, written
+  raw, and it begins with the rest of that sequence. `watch_attach` calls
+  `ModeFilter.flush` once, on the first live frame, for that reason. Without it the
+  terminal prints `1;31m` as text and the escape it belonged to is gone — which reads as
+  the agent emitting garbage rather than as a seam in lcc. The same rule is why a CSI too
+  long for `pending` is passed through verbatim instead of truncated: an unterminated CSI
+  eats every character after it until the terminal finds a final byte, so whole lines of
+  output simply vanish. `ModeFilter.overhead` is the caller's buffer bound and is exact —
+  it was one byte short of the worst case, which in ReleaseFast is a write past the end of
+  a stack array.
+- **`clamp`'s `skipped` is the only notice that a client's screen is now a lie.** When the
+  ring laps past a client the cursor jumps an arbitrary range, mid-escape-sequence, and
+  neither end can tell. Discarding the flag compiles and looks tidy, and it leaves a hole
+  in the screen that nothing ever repaints over, because Claude Code only redraws what it
+  believes changed. `pumpClient` turns a skip into a `repaint` for that reason, and it
+  queues until the ring is drained rather than one frame per poll pass — the starvation was
+  what made the ring lap in the first place.
+- **A session's pty size is measured, never defaulted.** `Handoff.size` carried 40x120 and
+  no call site overrode it, so every session was born on a terminal nobody has: the banner,
+  the prompt box and the `--resume` picker were laid out for 120 columns and *then* replayed
+  into the real terminal. `resolveSize` asks `term.currentSize()` and keeps `unmeasured_size`
+  for the case where nothing on the process has a window — a `--json` start from a tool call.
+  Anything that registers a session has to go through it.
+- **An attach that changes no size changes nothing.** `renegotiate` resizes the pty only when
+  the negotiated size differs, and re-attaching from the same terminal it was last attached
+  from differs by nothing — so Claude Code is never told to repaint and the screen keeps
+  whatever the replay painted until the next keystroke. `attachClient` compares the size
+  across `renegotiate` and pokes when it did not move; `pokeSizes` moves rows and never
+  columns, because a column change re-wraps text and causes the corruption it is meant to
+  clear. TIOCSWINSZ only signals on an actual change, which is why the poke is two calls and
+  not one.
 - **A hook event that reports no `permission_mode` must not clear the one already known.**
   Only some events carry it — `Notification` does not (see the test in `watch_hooks.zig`).
   `watch_session.setPlan` is guarded on `permission_mode.len > 0` for that reason, and

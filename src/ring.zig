@@ -4,14 +4,18 @@ pub const Ring = struct {
     buf: []u8,
     written: u64 = 0,
 
-    pub fn init(gpa: std.mem.Allocator, capacity: usize) !Ring {
-        std.debug.assert(capacity > 0);
-        return .{ .buf = try gpa.alloc(u8, capacity) };
+    pub fn init(gpa: std.mem.Allocator, bytes: usize) !Ring {
+        std.debug.assert(bytes > 0);
+        return .{ .buf = try gpa.alloc(u8, bytes) };
     }
 
     pub fn deinit(r: *Ring, gpa: std.mem.Allocator) void {
         gpa.free(r.buf);
         r.* = undefined;
+    }
+
+    pub fn capacity(r: Ring) usize {
+        return r.buf.len;
     }
 
     pub fn oldest(r: Ring) u64 {

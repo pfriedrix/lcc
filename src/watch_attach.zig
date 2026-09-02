@@ -98,21 +98,28 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
     const dump = openDump(app);
     defer if (dump) |f| f.close(app.io);
     const terminal = try term.Terminal.enterRaw();
-    var size = terminal.size();
-
-    var conn = (try watch_client.connectExisting(app, .attach)) orelse return .daemon_gone;
-
     defer {
         var exit_buf: [512]u8 = undefined;
         var out_writer: Io.File.Writer = .init(.stdout(), app.io, &exit_buf);
         term.sanitize(&out_writer.interface);
         out_writer.interface.flush() catch {};
         terminal.restore();
-        conn.close(app.io);
     }
+    var size = terminal.size();
+
+    var conn = (try watch_client.connectExisting(app, .attach)) orelse return .daemon_gone;
+    defer conn.close(app.io);
 
     var replay_filter: ansi.ModeFilter = .{};
-    var filtered: [wire.max_payload + 64]u8 = undefined;
+    var replaying = opts.replay;
+    var filtered: [wire.max_payload + ansi.ModeFilter.overhead]u8 = undefined;
+
+    {
+        var entry_buf: [128]u8 = undefined;
+        var entry_writer: Io.File.Writer = .init(.stdout(), app.io, &entry_buf);
+        term.prepare(&entry_writer.interface);
+        entry_writer.interface.flush() catch {};
+    }
 
     try conn.sendControl(app.gpa, .attach, wire.Attach{
         .session_id = opts.session_id,
@@ -165,6 +172,14 @@ pub fn run(app: app_mod.App, opts: Options) !Outcome {
                     writeAll(chunk_stdout, kept);
                 },
                 .output => {
+                    if (replaying) {
+                        replaying = false;
+                        const tail = replay_filter.flush(&filtered);
+                        if (tail.len > 0) {
+                            note(dump, app.io, "tail", tail);
+                            writeAll(chunk_stdout, tail);
+                        }
+                    }
                     note(dump, app.io, "out", frame.payload);
                     writeAll(chunk_stdout, frame.payload);
                 },
