@@ -165,6 +165,16 @@ writes nothing of its own over it. **`^\` returns to the dashboard** without
 touching the session. `^C` still reaches the agent, which is the point of not
 using it to detach. `q` quits lcc entirely and the sessions keep running.
 
+Attaching clears the screen first and asks the agent for a fresh frame, rather
+than leaving you looking at replayed scrollback and hoping it lines up. The
+session is also started at the size of the terminal that asked for it — it used
+to be born 40x120 and told the truth only once you attached, which is why the
+banner and the prompt box arrived wrapped for a terminal nobody has. And the
+setup Claude Code does once at startup — bracketed paste, the keyboard protocol
+it uses to tell Shift+Enter from Enter — is put back on the way in, so pasting
+several lines into a session you have attached to twice still arrives as one
+message.
+
 That one keybinding is the thing worth remembering, because nothing on screen
 repeats it. There was a status bar on the bottom row that did — the child was
 told the terminal was a row shorter and a scroll region kept it out of the last
