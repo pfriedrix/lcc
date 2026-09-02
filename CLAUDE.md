@@ -12,7 +12,7 @@ is the Zig standard library plus CoreFoundation/Security.
 Run from the repo root:
 
 ```bash
-zig build test --summary all       # unit tests (~5s, 334 at last count)
+zig build test --summary all       # unit tests (~5s, 336 at last count)
 zig build                          # debug binary → zig-out/bin/lcc
 zig build -Doptimize=ReleaseFast   # what PATH should be serving
 zig build run -- list              # run without installing
@@ -130,6 +130,17 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   `reserved` argument to `pageSize` is what keeps the two in step — `checkbox` passes 5 when
   it has a column header and 4 when it does not. Add a line to a frame without raising it and
   the list looks fine until the terminal is short.
+- **The dashboard is a frame like any other, so every line it prints has to be paid for.**
+  It was the one that did not: `dims.rows` was read and never used, and the table rendered a
+  row per worktree. Past the height of the terminal the frame scrolls, `Screen.eraseFrame`
+  walks the cursor up over lines that are no longer the ones it wrote, and each redraw takes
+  another line of whatever was on the screen before `lcc open` started. `visibleRows` is the
+  budget — `spent` counts the lines already drawn this frame, and it leaves one row spare so
+  the closing newline cannot scroll — and `window` keeps the cursor inside it. Anything new
+  in that frame is another argument to `spent`, not a free line. The same rule is why an
+  error there is a *counted* line in the frame rather than an `app.ui.fail`: `fail` writes
+  through a different writer and past `screen.lines`, so the next erase walks the wrong
+  distance and the frame smears.
 - **A `git` run with `cwd` inside a worktree can answer for a different repository.** Git
   discovers its repo by walking *up* from `cwd` until it finds a `.git`, and the default
   worktree template is `{repoRoot}/.lcc/worktrees/{branchLeaf}` — so a worktree that lost its
