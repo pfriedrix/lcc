@@ -126,3 +126,116 @@ test "AC-5: templateCarriesPlan agrees with expandCommand's used_plan on every t
         }
     }
 }
+
+fn argAfter(args: []const []const u8, flag: []const u8) ?[]const u8 {
+    if (args.len == 0) return null;
+    var i: usize = 0;
+    while (i + 1 < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], flag)) return args[i + 1];
+    }
+    return null;
+}
+
+test "the planning model rides the sessions that are there to plan, and no others" {
+    const gpa = std.testing.allocator;
+
+    const planning = try start.launchArgs(gpa, null, "/start-task PE-250", true, "fable");
+    defer gpa.free(planning);
+
+    const chosen = argAfter(planning, "--model");
+    if (chosen == null or !std.mem.eql(u8, chosen.?, "fable")) {
+        std.debug.print(
+            \\
+            \\a plan-mode launch went out on the session model:
+            \\  planModel: "fable"
+            \\  --model:   {s}
+            \\  cost:      the whole point of the setting is silently lost — planning runs on
+            \\             whatever the terminal happened to start with, and nothing says so
+            \\
+        , .{chosen orelse "(absent)"});
+        return error.PlanModelMissing;
+    }
+
+    if (!std.mem.eql(u8, planning[planning.len - 2], "--")) {
+        std.debug.print(
+            \\
+            \\the model landed past the separator:
+            \\  argv tail: "{s}" "{s}"
+            \\  cost:      everything after -- is the prompt, so claude reads --model as text
+            \\             and starts on the default model with a mangled opening message
+            \\
+        , .{ planning[planning.len - 2], planning[planning.len - 1] });
+        return error.PlanModelAfterSeparator;
+    }
+
+    const carried = try start.launchArgs(gpa, null, "/start-task PE-250", false, "fable");
+    defer gpa.free(carried);
+    if (argAfter(carried, "--model")) |leaked| {
+        std.debug.print(
+            \\
+            \\a session started from an existing plan took the planning model:
+            \\  --model: {s}
+            \\  cost:    --plan exists so the pipeline runs spec onward here — the model meant
+            \\           for one plan ends up paying for code, review and test as well
+            \\
+        , .{leaked});
+        return error.PlanModelLeaked;
+    }
+
+    const unset = try start.launchArgs(gpa, null, null, true, "");
+    defer gpa.free(unset);
+    if (argAfter(unset, "--model")) |empty| {
+        std.debug.print(
+            \\
+            \\an unset planModel still reached the command line:
+            \\  --model: "{s}"
+            \\  cost:    claude is handed an empty model name and refuses to start, so the
+            \\           default config stops working at all
+            \\
+        , .{empty});
+        return error.PlanModelEmpty;
+    }
+}
+
+test "a plan-mode session gets its own opening prompt, and a carried plan never does" {
+    const planning = "/plan {identifier}";
+    const pipeline = "/linear-pfx-plugin:start-task {identifier} {plan}";
+
+    const opens_planning = start.openingTemplate(planning, pipeline, true);
+    if (!std.mem.eql(u8, opens_planning, planning)) {
+        std.debug.print(
+            \\
+            \\a plan-mode session opened on the pipeline prompt:
+            \\  chose: "{s}"
+            \\  cost:  the pipeline runs spec onward in the session that was only meant to
+            \\         plan, so the planning model pays for the whole task after all
+            \\
+        , .{opens_planning});
+        return error.PlanPromptIgnored;
+    }
+
+    const carried = start.openingTemplate(planning, pipeline, false);
+    if (!std.mem.eql(u8, carried, pipeline)) {
+        std.debug.print(
+            \\
+            \\a session started from an existing plan opened on the planning prompt:
+            \\  chose: "{s}"
+            \\  cost:  {{plan}} is only in the pipeline template, so the approved plan is
+            \\         dropped and the second session re-plans what was just approved
+            \\
+        , .{carried});
+        return error.CarriedPlanPromptLost;
+    }
+
+    const unset = start.openingTemplate("", pipeline, true);
+    if (!std.mem.eql(u8, unset, pipeline)) {
+        std.debug.print(
+            \\
+            \\an unset planTaskCommand changed what a plan-mode session opens with:
+            \\  chose: "{s}"
+            \\  cost:  every existing config silently stops sending its opening prompt
+            \\
+        , .{unset});
+        return error.PlanPromptRegressed;
+    }
+}
