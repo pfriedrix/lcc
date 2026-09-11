@@ -777,6 +777,8 @@ months after anyone typed it.
 | `linkExclude` | `[".env.example", ".env.sample", ".env.template"]` | Which of those to skip |
 | `watchByDefault` | `true` | Run new sessions in the background so they outlive the terminal |
 | `planMode` | `true` | Open new sessions in plan mode. `--plan <file>` turns it off regardless |
+| `planModel` | `""` | Model for planning sessions, passed to Claude Code as `--model`. Empty leaves the session on whatever the CLI would pick. Applies only where `planMode` does, so a `--plan <file>` start runs on the default model |
+| `planTaskCommand` | `""` | Opening prompt for sessions that start in plan mode, in place of `startTaskCommand`. Empty means both use `startTaskCommand`. Together with `planModel` this is what keeps a planning model off the rest of the run: the planning session ends at its plan, and `lcc start --plan <file>` picks it up in a second session on the default model |
 | `resumeSessions` | `true` | `lcc open` resumes the worktree's last session |
 | `showTokens` | `true` | The TOKENS column in `lcc list`. Off skips reading transcripts, which is that column's whole cost |
 | `listNetwork` | `cached` | The PR and Linear columns in `lcc list`: `refresh`, `cached` or `local` |

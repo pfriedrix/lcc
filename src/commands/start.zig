@@ -131,9 +131,10 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     const carried: ?McpFact =
         if (claude_carried) |value| .{ .path = value.path, .names = value.names } else null;
 
-    const trimmed_command = std.mem.trim(u8, cfg.startTaskCommand, " \t");
+    const template = openingTemplate(cfg.planTaskCommand, cfg.startTaskCommand, plan_mode);
+    const trimmed_command = std.mem.trim(u8, template, " \t");
     const expanded = if (trimmed_command.len > 0)
-        try expandCommand(app.gpa, cfg.startTaskCommand, selected, wt.branch, plan_path)
+        try expandCommand(app.gpa, template, selected, wt.branch, plan_path)
     else
         null;
 
@@ -171,6 +172,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         if (claude_carried) |c| c.path else null,
         initial_prompt,
         plan_mode,
+        cfg.planModel,
     );
 
     if (opts.watch) {
@@ -1080,14 +1082,27 @@ test "a created worktree reports no match and its base" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"mcp\":null") != null);
 }
 
-fn launchArgs(
+pub fn openingTemplate(
+    plan_command: []const u8,
+    start_command: []const u8,
+    plan_mode: bool,
+) []const u8 {
+    if (plan_mode and plan_command.len > 0) return plan_command;
+    return start_command;
+}
+
+pub fn launchArgs(
     gpa: std.mem.Allocator,
     mcp_config: ?[]const u8,
     initial_prompt: ?[]const u8,
     plan_mode: bool,
+    plan_model: []const u8,
 ) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
-    if (plan_mode) try out.appendSlice(gpa, &.{ "--permission-mode", "plan" });
+    if (plan_mode) {
+        try out.appendSlice(gpa, &.{ "--permission-mode", "plan" });
+        if (plan_model.len > 0) try out.appendSlice(gpa, &.{ "--model", plan_model });
+    }
     if (mcp_config) |path| try out.appendSlice(gpa, &.{ "--mcp-config", path });
     if (initial_prompt) |value| {
         try out.append(gpa, "--");
@@ -1213,7 +1228,7 @@ test "launchArgs always separates the prompt from the options with --" {
 
     const opens_with_dash = "--- \n- step one";
 
-    const carried = try launchArgs(gpa, "/cfg/mcp.json", opens_with_dash, false);
+    const carried = try launchArgs(gpa, "/cfg/mcp.json", opens_with_dash, false, "");
     defer gpa.free(carried);
     try std.testing.expectEqual(@as(usize, 4), carried.len);
     try std.testing.expectEqualStrings("--mcp-config", carried[0]);
@@ -1221,17 +1236,17 @@ test "launchArgs always separates the prompt from the options with --" {
     try std.testing.expectEqualStrings("--", carried[2]);
     try std.testing.expectEqualStrings(opens_with_dash, carried[3]);
 
-    const bare = try launchArgs(gpa, null, opens_with_dash, false);
+    const bare = try launchArgs(gpa, null, opens_with_dash, false, "");
     defer gpa.free(bare);
     try std.testing.expectEqual(@as(usize, 2), bare.len);
     try std.testing.expectEqualStrings("--", bare[0]);
     try std.testing.expectEqualStrings(opens_with_dash, bare[1]);
 
-    const empty = try launchArgs(gpa, null, null, false);
+    const empty = try launchArgs(gpa, null, null, false, "");
     defer gpa.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 
-    const only_mcp = try launchArgs(gpa, "/cfg/mcp.json", null, false);
+    const only_mcp = try launchArgs(gpa, "/cfg/mcp.json", null, false, "");
     defer gpa.free(only_mcp);
     try std.testing.expectEqual(@as(usize, 2), only_mcp.len);
 }
@@ -1239,7 +1254,7 @@ test "launchArgs always separates the prompt from the options with --" {
 test "launchArgs opens in plan mode, and the mode stays ahead of the separator" {
     const gpa = std.testing.allocator;
 
-    const planning = try launchArgs(gpa, null, "/start-task PE-250", true);
+    const planning = try launchArgs(gpa, null, "/start-task PE-250", true, "");
     defer gpa.free(planning);
     try std.testing.expectEqual(@as(usize, 4), planning.len);
     try std.testing.expectEqualStrings("--permission-mode", planning[0]);
@@ -1247,7 +1262,7 @@ test "launchArgs opens in plan mode, and the mode stays ahead of the separator" 
     try std.testing.expectEqualStrings("--", planning[2]);
     try std.testing.expectEqualStrings("/start-task PE-250", planning[3]);
 
-    const with_mcp = try launchArgs(gpa, "/cfg/mcp.json", "/start-task PE-250", true);
+    const with_mcp = try launchArgs(gpa, "/cfg/mcp.json", "/start-task PE-250", true, "");
     defer gpa.free(with_mcp);
     try std.testing.expectEqual(@as(usize, 6), with_mcp.len);
     try std.testing.expectEqualStrings("--permission-mode", with_mcp[0]);
@@ -1255,7 +1270,7 @@ test "launchArgs opens in plan mode, and the mode stays ahead of the separator" 
     try std.testing.expectEqualStrings("--mcp-config", with_mcp[2]);
     try std.testing.expectEqualStrings("--", with_mcp[4]);
 
-    const no_prompt = try launchArgs(gpa, null, null, true);
+    const no_prompt = try launchArgs(gpa, null, null, true, "");
     defer gpa.free(no_prompt);
     try std.testing.expectEqual(@as(usize, 2), no_prompt.len);
     try std.testing.expectEqualStrings("--permission-mode", no_prompt[0]);
