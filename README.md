@@ -69,7 +69,7 @@ lcc issue comment PE-256 -m "done"      # add a comment
 lcc issue comment PE-256 -f plan.md     # …or read the body off disk
 lcc issue project PE-256 --assign v2.6.0   # put it in a release project
 lcc issue list --state Done --team PE   # the team's issues in one state
-lcc issue delete PE-256 --yes           # delete issues (restorable for 30 days)
+lcc issue archive PE-256                # take issues off the board, reversibly
 lcc project content v2.6.0 --get        # read a project page's markdown body
 lcc config           # every setting, in a list you move through and toggle
 lcc setup            # the same thing, under the name muscle memory reaches for
@@ -546,30 +546,32 @@ $ lcc issue list --state Done --team PE --json
 { "team": "PE", "state": "Done", "count": 81, "issues": [
   { "id": "a84802d2-…", "identifier": "PE-231", "title": "LegacyCircleDTO: make code optional",
     "url": "https://linear.app/…", "state": "Done", "completed_at": "2026-08-03T19:50:44.002Z",
-    "deleted": false, "project": { "id": "ffeedbc8-…", "name": "v2.5.1" },
+    "archived": false, "project": { "id": "ffeedbc8-…", "name": "v2.5.1" },
     "links": [ { "url": "https://github.com/…/pull/169", "title": "PE-231: …" } ] } ] }
 ```
 
 `--team` is only needed when the current branch does not carry an issue key; otherwise the key is read off the branch, the same way every other command finds one. `--project <name>` keeps only the issues in that project. Paging is internal — the whole state comes back in one answer, up to the same ten-page ceiling the rest of this module uses.
 
-`--deleted-only` inverts the selection rather than widening it: it returns the issues in that state which are *already* deleted or archived, and nothing that is still on the board. That is the half a caller needs to reconstruct what a project used to hold.
+`--archived-only` inverts the selection rather than widening it: it returns the issues in that state which are *already* archived, and nothing that is still on the board. That is the half a caller needs to reconstruct what a project used to hold.
 
-`links` are the issue's attachments — the pull request among them — because the identifier alone does not survive the issue being deleted.
+`links` are the issue's attachments — the pull request among them — because an archived issue is out of the way of anything that lists the board.
 
-#### `lcc issue delete`
+#### `lcc issue archive` / `lcc issue unarchive`
 
 ```bash
-$ lcc issue delete PE-231 PE-230 --yes --json
-{ "requested": 2, "deleted": 2, "issues": [
-  { "id": "a84802d2-…", "identifier": "PE-231", "deleted": true },
-  { "id": "77fc3b2e-…", "identifier": "PE-230", "deleted": true } ] }
+$ lcc issue archive PE-231 PE-230 --json
+{ "requested": 2, "archived": 2, "restored": 0, "issues": [
+  { "id": "a84802d2-…", "identifier": "PE-231", "changed": true },
+  { "id": "77fc3b2e-…", "identifier": "PE-230", "changed": true } ] }
 ```
 
-Takes identifiers or raw ids, in any mix: an argument shaped like `PE-231` is resolved first, anything else is passed through as an id — so a caller that already listed the issues spends no requests resolving what it just read.
+Archiving takes an issue off the board without touching anything else about it: **the state survives**. A `Done` issue archives as `Done` — only an issue that was never completed is canceled on the way out, which is Linear's rule and not this command's. It is fully reversible with `unarchive`, and on a plan with an issue ceiling an archived issue stops counting against it, which is the usual reason to reach for this.
 
-`--yes` is required. Linear keeps a deleted issue restorable for 30 days and then removes it for good, which is far enough from reversible to be worth a word.
+Both take identifiers or raw ids, in any mix: an argument shaped like `PE-231` is resolved first, anything else is passed through as an id — so a caller that already listed the issues spends no requests resolving what it just read.
 
-**Batched, so the rate limit is this command's problem and not the caller's.** Fifty deletions travel as one request with fifty aliased mutations, and ids ride as GraphQL variables rather than being interpolated into the query text. An issue whose alias Linear did not answer for comes back `"deleted": false` instead of being counted — a partial batch is reported, never assumed.
+**Batched, so the rate limit is this command's problem and not the caller's.** Fifty issues travel as one request with fifty aliased mutations, and ids ride as GraphQL variables rather than being interpolated into the query text. An issue whose alias Linear did not answer for comes back `"changed": false` instead of being counted — a partial batch is reported, never assumed.
+
+There is no delete verb. Archiving reaches the same end without the 30-day countdown, so nothing here needs a `--yes`.
 
 ### `lcc project`
 
@@ -586,7 +588,7 @@ $ lcc project content v2.6.0 --team PE --set-file page.md --json
 
 Reading is the default, and in read mode the log goes to stderr even without `--json`, so `--get > page.md` writes the page and nothing else. `--set-file` replaces the whole body; composing an edit — merging, appending, keeping a fenced section — is the caller's job, which is why the read half exists.
 
-Failures take the same shape as `lcc start --json` — JSON on stdout, the human line on stderr, exit 1. Codes shared by every subcommand: `usage`, `not_authenticated`, `keychain_unreadable`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`. `comment` adds `body_not_found`, `body_unreadable`, `body_empty`, `body_too_large`. `list` and `project content` add `team_unknown`; `project content` also `project_not_found`, `content_not_found`, `content_unreadable`, `content_too_large`; `delete` adds `not_confirmed`.
+Failures take the same shape as `lcc start --json` — JSON on stdout, the human line on stderr, exit 1. Codes shared by every subcommand: `usage`, `not_authenticated`, `keychain_unreadable`, `auth_failed`, `bad_identifier`, `issue_not_found`, `linear_failed`. `comment` adds `body_not_found`, `body_unreadable`, `body_empty`, `body_too_large`. `list` and `project content` add `team_unknown`; `project content` also `project_not_found`, `content_not_found`, `content_unreadable`, `content_too_large`; `archive` and `unarchive` add no codes of their own.
 
 ### `lcc open`
 

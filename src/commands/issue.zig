@@ -9,7 +9,7 @@ const oauth = @import("../oauth.zig");
 const release = @import("../release.zig");
 const semver = @import("../semver.zig");
 
-pub const Verb = enum { show, state, comment, project, list, delete };
+pub const Verb = enum { show, state, comment, project, list, archive, unarchive };
 
 pub fn resolveVerb(raw: []const u8) ?Verb {
     if (std.ascii.eqlIgnoreCase(raw, "show")) return .show;
@@ -17,7 +17,8 @@ pub fn resolveVerb(raw: []const u8) ?Verb {
     if (std.ascii.eqlIgnoreCase(raw, "comment")) return .comment;
     if (std.ascii.eqlIgnoreCase(raw, "project")) return .project;
     if (std.ascii.eqlIgnoreCase(raw, "list")) return .list;
-    if (std.ascii.eqlIgnoreCase(raw, "delete")) return .delete;
+    if (std.ascii.eqlIgnoreCase(raw, "archive")) return .archive;
+    if (std.ascii.eqlIgnoreCase(raw, "unarchive")) return .unarchive;
     return null;
 }
 
@@ -27,7 +28,8 @@ pub const Sub = union(enum) {
     comment: AddComment,
     project: SetProject,
     list: ListIssues,
-    delete: DeleteIssues,
+    archive: ArchiveIssues,
+    unarchive: ArchiveIssues,
 
     pub const Show = struct {};
 
@@ -53,12 +55,10 @@ pub const Sub = union(enum) {
         state: ?[]const u8 = null,
         project: ?[]const u8 = null,
         team: ?[]const u8 = null,
-        deleted_only: bool = false,
+        archived_only: bool = false,
     };
 
-    pub const DeleteIssues = struct {
-        yes: bool = false,
-    };
+    pub const ArchiveIssues = struct {};
 
     pub fn empty(verb: Verb) Sub {
         return switch (verb) {
@@ -67,7 +67,8 @@ pub const Sub = union(enum) {
             .comment => .{ .comment = .{} },
             .project => .{ .project = .{} },
             .list => .{ .list = .{} },
-            .delete => .{ .delete = .{} },
+            .archive => .{ .archive = .{} },
+            .unarchive => .{ .unarchive = .{} },
         };
     }
 };
@@ -82,7 +83,8 @@ pub const Opts = struct {
 pub fn run(app: app_mod.App, opts: Opts) !void {
     switch (opts.sub) {
         .list => |sub| return list(app, opts, sub, try authorize(app, opts)),
-        .delete => |sub| return delete(app, opts, sub, try authorize(app, opts)),
+        .archive => return setArchived(app, opts, try authorize(app, opts), true),
+        .unarchive => return setArchived(app, opts, try authorize(app, opts), false),
         else => {},
     }
 
@@ -103,7 +105,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         .state => |sub| return setState(app, opts, sub, token, ref, trimmed),
         .comment => |sub| return comment(app, opts, sub, token, ref, trimmed),
         .project => |sub| return project(app, opts, sub, token, ref, trimmed),
-        .list, .delete => unreachable,
+        .list, .archive, .unarchive => unreachable,
     }
 }
 
@@ -992,7 +994,7 @@ const ListedEntry = struct {
     url: []const u8,
     state: []const u8,
     completed_at: ?[]const u8,
-    deleted: bool,
+    archived: bool,
     project: ?ProjectEntry,
     links: []const LinkEntry,
 };
@@ -1041,7 +1043,7 @@ fn list(app: app_mod.App, opts: Opts, sub: Sub.ListIssues, token: oauth.Token) !
         token,
         team,
         state_name,
-        sub.deleted_only,
+        sub.archived_only,
     ) catch |err| bail(
         app,
         opts.json,
@@ -1052,7 +1054,7 @@ fn list(app: app_mod.App, opts: Opts, sub: Sub.ListIssues, token: oauth.Token) !
 
     var kept: std.ArrayList(ListedEntry) = .empty;
     for (found) |issue| {
-        if (sub.deleted_only != issue.archived) continue;
+        if (sub.archived_only != issue.archived) continue;
         if (sub.project) |wanted| {
             const proj = issue.project orelse continue;
             if (!std.mem.eql(u8, proj.name, wanted)) continue;
@@ -1068,7 +1070,7 @@ fn list(app: app_mod.App, opts: Opts, sub: Sub.ListIssues, token: oauth.Token) !
             .url = issue.url,
             .state = issue.state_name,
             .completed_at = issue.completed_at,
-            .deleted = issue.archived,
+            .archived = issue.archived,
             .project = if (issue.project) |proj| .{ .id = proj.id, .name = proj.name } else null,
             .links = links,
         });
@@ -1101,24 +1103,25 @@ fn list(app: app_mod.App, opts: Opts, sub: Sub.ListIssues, token: oauth.Token) !
     app.ui.flush();
 }
 
-const DeletedReport = struct {
+const ArchivedReport = struct {
     requested: usize,
-    deleted: usize,
-    issues: []const DeletedEntry,
+    archived: usize,
+    restored: usize,
+    issues: []const ArchivedEntry,
 };
 
-const DeletedEntry = struct {
+const ArchivedEntry = struct {
     id: []const u8,
     identifier: ?[]const u8,
-    deleted: bool,
+    changed: bool,
 };
 
-fn resolveDeletable(app: app_mod.App, opts: Opts, token: oauth.Token, named: []const u8) DeletedEntry {
+fn resolveTarget(app: app_mod.App, opts: Opts, token: oauth.Token, named: []const u8) ArchivedEntry {
     const trimmed = std.mem.trim(u8, named, " \t");
     const ref = linear.refFromBranch(trimmed) orelse return .{
         .id = trimmed,
         .identifier = null,
-        .deleted = false,
+        .changed = false,
     };
 
     const found = linear.fetchIssue(app.gpa, app.io, token, ref) catch |err| bail(
@@ -1129,53 +1132,47 @@ fn resolveDeletable(app: app_mod.App, opts: Opts, token: oauth.Token, named: []c
         .{ @errorName(err), linear.last_status, linear.last_message },
     );
     const issue = found orelse bail(app, opts.json, "issue_not_found", "No issue {s} in Linear.", .{trimmed});
-    return .{ .id = issue.id, .identifier = issue.identifier, .deleted = false };
+    return .{ .id = issue.id, .identifier = issue.identifier, .changed = false };
 }
 
-fn delete(app: app_mod.App, opts: Opts, sub: Sub.DeleteIssues, token: oauth.Token) !void {
+fn setArchived(app: app_mod.App, opts: Opts, token: oauth.Token, archived: bool) !void {
     if (opts.issues.len == 0) bail(
         app,
         opts.json,
         "usage",
-        "issue delete needs at least one issue: lcc issue delete PE-42 --yes",
-        .{},
-    );
-    if (!sub.yes) bail(
-        app,
-        opts.json,
-        "not_confirmed",
-        "Deleting {d} issue(s) is not reversible after 30 days. Pass --yes to go ahead.",
-        .{opts.issues.len},
+        "issue {s} needs at least one issue: lcc issue {s} PE-42",
+        .{ if (archived) "archive" else "unarchive", if (archived) "archive" else "unarchive" },
     );
 
-    const targets = try app.gpa.alloc(DeletedEntry, opts.issues.len);
-    for (opts.issues, 0..) |named, i| targets[i] = resolveDeletable(app, opts, token, named);
+    const targets = try app.gpa.alloc(ArchivedEntry, opts.issues.len);
+    for (opts.issues, 0..) |named, i| targets[i] = resolveTarget(app, opts, token, named);
 
     const ids = try app.gpa.alloc([]const u8, targets.len);
     for (targets, 0..) |target, i| ids[i] = target.id;
 
     if (!opts.json) {
-        app.ui.step("Deleting {d} issue(s)...", .{ids.len});
+        app.ui.step("{s} {d} issue(s)...", .{ if (archived) "Archiving" else "Restoring", ids.len });
         app.ui.flush();
     }
 
-    const outcomes = linear.deleteIssues(app.gpa, app.io, token, ids) catch |err| bail(
+    const outcomes = linear.setIssuesArchived(app.gpa, app.io, token, ids, archived) catch |err| bail(
         app,
         opts.json,
         "linear_failed",
-        "Linear refused the delete ({s}, HTTP {d}): {s}",
+        "Linear refused the change ({s}, HTTP {d}): {s}",
         .{ @errorName(err), linear.last_status, linear.last_message },
     );
 
-    var deleted: usize = 0;
+    var changed: usize = 0;
     for (outcomes, 0..) |outcome, i| {
-        targets[i].deleted = outcome.success;
-        if (outcome.success) deleted += 1;
+        targets[i].changed = outcome.success;
+        if (outcome.success) changed += 1;
     }
 
-    const value: DeletedReport = .{
+    const value: ArchivedReport = .{
         .requested = targets.len,
-        .deleted = deleted,
+        .archived = if (archived) changed else 0,
+        .restored = if (archived) 0 else changed,
         .issues = targets,
     };
 
@@ -1186,10 +1183,14 @@ fn delete(app: app_mod.App, opts: Opts, sub: Sub.DeleteIssues, token: oauth.Toke
         return;
     }
     for (value.issues) |issue| {
-        if (issue.deleted) continue;
-        app.ui.warn("{s} was not deleted.", .{issue.identifier orelse issue.id});
+        if (issue.changed) continue;
+        app.ui.warn("{s} did not change.", .{issue.identifier orelse issue.id});
     }
-    app.ui.success("Deleted {d} of {d} issue(s). Linear keeps them restorable for 30 days.", .{ value.deleted, value.requested });
+    app.ui.success("{s} {d} of {d} issue(s).", .{
+        if (archived) "Archived" else "Restored",
+        changed,
+        value.requested,
+    });
     app.ui.flush();
 }
 

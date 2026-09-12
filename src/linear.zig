@@ -257,10 +257,11 @@ fn fromRaw(issue: RawIssue) Issue {
 }
 
 const issue_query =
-    \\query LccIssue($number: Float!, $team: String!) {
+    \\query LccIssue($number: Float!, $team: String!, $archived: Boolean!) {
     \\  issues(
     \\    filter: { number: { eq: $number }, team: { key: { eq: $team } } }
     \\    first: 1
+    \\    includeArchived: $archived
     \\  ) {
     \\    nodes {
     \\      id
@@ -291,6 +292,7 @@ pub fn fetchIssue(
     const data = try query(OneIssueData, gpa, io, token, issue_query, .{
         .number = ref.number,
         .team = team,
+        .archived = true,
     });
     if (data.issues.nodes.len == 0) return null;
     return fromRaw(data.issues.nodes[0]);
@@ -1127,30 +1129,31 @@ pub fn fetchIssuesByState(
     return found.toOwnedSlice(gpa);
 }
 
-const delete_batch_size = 50;
+const archive_batch_size = 50;
 
-pub const DeleteOutcome = struct {
+pub const ArchiveOutcome = struct {
     id: []const u8,
     success: bool,
 };
 
-fn deleteMutationText(gpa: std.mem.Allocator, count: usize) ![]u8 {
+fn archiveMutationText(gpa: std.mem.Allocator, count: usize, archived: bool) ![]u8 {
+    const verb = if (archived) "issueArchive" else "issueUnarchive";
     var text: std.ArrayList(u8) = .empty;
-    try text.appendSlice(gpa, "mutation LccDeleteIssues(");
+    try text.appendSlice(gpa, "mutation LccArchiveIssues(");
     for (0..count) |i| {
         if (i > 0) try text.appendSlice(gpa, ", ");
         try text.print(gpa, "$i{d}: String!", .{i});
     }
     try text.appendSlice(gpa, ") {\n");
     for (0..count) |i| {
-        try text.print(gpa, "  d{d}: issueDelete(id: $i{d}) {{ success }}\n", .{ i, i });
+        try text.print(gpa, "  a{d}: {s}(id: $i{d}) {{ success }}\n", .{ i, verb, i });
     }
     try text.appendSlice(gpa, "}");
     return text.toOwnedSlice(gpa);
 }
 
-fn deleteBatchBody(gpa: std.mem.Allocator, ids: []const []const u8) ![]u8 {
-    const text = try deleteMutationText(gpa, ids.len);
+fn archiveBatchBody(gpa: std.mem.Allocator, ids: []const []const u8, archived: bool) ![]u8 {
+    const text = try archiveMutationText(gpa, ids.len, archived);
 
     var variables: std.json.ObjectMap = .empty;
     for (ids, 0..) |id, i| {
@@ -1165,14 +1168,14 @@ fn deleteBatchBody(gpa: std.mem.Allocator, ids: []const []const u8) ![]u8 {
     return std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = root }, .{}) catch Error.HttpFailed;
 }
 
-fn readDeleteBatch(gpa: std.mem.Allocator, raw: []const u8, ids: []const []const u8, out: []DeleteOutcome) Error!void {
+fn readArchiveBatch(gpa: std.mem.Allocator, raw: []const u8, ids: []const []const u8, out: []ArchiveOutcome) Error!void {
     const data = try unwrap(std.json.Value, gpa, raw);
     if (data != .object) {
-        last_message = "Linear returned no result for the delete batch";
+        last_message = "Linear returned no result for the archive batch";
         return Error.GraphQLFailed;
     }
     for (ids, 0..) |id, i| {
-        const key = std.fmt.allocPrint(gpa, "d{d}", .{i}) catch return Error.GraphQLFailed;
+        const key = std.fmt.allocPrint(gpa, "a{d}", .{i}) catch return Error.GraphQLFailed;
         const entry = data.object.get(key);
         const ok = blk: {
             const node = entry orelse break :blk false;
@@ -1184,32 +1187,34 @@ fn readDeleteBatch(gpa: std.mem.Allocator, raw: []const u8, ids: []const []const
     }
 }
 
-pub fn deleteIssues(
+pub fn setIssuesArchived(
     gpa: std.mem.Allocator,
     io: Io,
     token: oauth.Token,
     ids: []const []const u8,
-) Error![]DeleteOutcome {
-    const out = try gpa.alloc(DeleteOutcome, ids.len);
+    archived: bool,
+) Error![]ArchiveOutcome {
+    const out = try gpa.alloc(ArchiveOutcome, ids.len);
     var start: usize = 0;
     while (start < ids.len) {
-        const end = @min(start + delete_batch_size, ids.len);
+        const end = @min(start + archive_batch_size, ids.len);
         const batch = ids[start..end];
-        const raw = try post(gpa, io, token, try deleteBatchBody(gpa, batch));
-        try readDeleteBatch(gpa, raw, batch, out[start..end]);
+        const raw = try post(gpa, io, token, try archiveBatchBody(gpa, batch, archived));
+        try readArchiveBatch(gpa, raw, batch, out[start..end]);
         start = end;
     }
     return out;
 }
 
 const project_page_query =
-    \\query LccProjectPage($team: String!, $name: String!, $limit: Int!) {
+    \\query LccProjectPage($team: String!, $name: String!, $limit: Int!, $archived: Boolean!) {
     \\  projects(
     \\    filter: {
     \\      name: { eq: $name }
     \\      accessibleTeams: { some: { key: { eq: $team } } }
     \\    }
     \\    first: $limit
+    \\    includeArchived: $archived
     \\  ) { nodes { id name content } }
     \\}
 ;
@@ -1258,12 +1263,45 @@ pub fn fetchProjectPage(
         .team = team_key,
         .name = name,
         .limit = max_named_projects,
+        .archived = true,
     });
     for (data.projects.nodes) |node| {
         if (std.mem.eql(u8, std.mem.trim(u8, node.name, " \t"), name)) return pageFromRaw(node);
     }
     if (data.projects.nodes.len == 0) return null;
     return pageFromRaw(data.projects.nodes[0]);
+}
+
+const archive_project_mutation =
+    \\mutation LccArchiveProject($id: String!) {
+    \\  payload: projectArchive(id: $id) {
+    \\    success
+    \\    entity: entity { id name }
+    \\  }
+    \\}
+;
+
+const unarchive_project_mutation =
+    \\mutation LccUnarchiveProject($id: String!) {
+    \\  payload: projectUnarchive(id: $id) {
+    \\    success
+    \\    entity: entity { id name }
+    \\  }
+    \\}
+;
+
+pub fn setProjectArchived(
+    gpa: std.mem.Allocator,
+    io: Io,
+    token: oauth.Token,
+    project_id: []const u8,
+    archived: bool,
+) Error!ProjectPage {
+    const raw = if (archived)
+        try mutate(RawProjectPage, gpa, io, token, archive_project_mutation, .{ .id = project_id })
+    else
+        try mutate(RawProjectPage, gpa, io, token, unarchive_project_mutation, .{ .id = project_id });
+    return pageFromRaw(raw);
 }
 
 pub fn setProjectContent(
@@ -1373,55 +1411,78 @@ test "every mutation carries the aliases its reader needs and names its input fi
     try std.testing.expect(std.mem.indexOf(u8, issues_by_state_query, "attachments(first: $links)") != null);
     try std.testing.expect(std.mem.indexOf(u8, issues_by_state_query, "includeArchived: $archived") != null);
     try std.testing.expect(std.mem.indexOf(u8, project_page_query, "first: $limit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_page_query, "includeArchived: $archived") != null);
+    try std.testing.expect(std.mem.indexOf(u8, issue_query, "includeArchived: $archived") != null);
     try std.testing.expect(std.mem.indexOf(u8, set_project_content_mutation, "content: $content") != null);
+
+    for ([_][]const u8{ archive_project_mutation, unarchive_project_mutation }) |text| {
+        try std.testing.expect(std.mem.indexOf(u8, text, "payload:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "entity:") != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, archive_project_mutation, "projectArchive(id: $id)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unarchive_project_mutation, "projectUnarchive(id: $id)") != null);
 }
 
-test "a delete batch names every issue as a variable, so an id cannot be read as query text" {
+test "an archive batch names every issue as a variable, so an id cannot be read as query text" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const ids = [_][]const u8{ "uuid-a", "he said \"go\"" };
-    const body = try deleteBatchBody(arena, &ids);
+    const body = try archiveBatchBody(arena, &ids, true);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "$i0: String!") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "$i1: String!") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "d0: issueDelete(id: $i0)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "d1: issueDelete(id: $i1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "a0: issueArchive(id: $i0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "a1: issueArchive(id: $i1)") != null);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"i0\":\"uuid-a\"") != null);
-    if (std.mem.indexOf(u8, body, "issueDelete(id: \"") != null) {
+    if (std.mem.indexOf(u8, body, "issueArchive(id: \"") != null) {
         return error.IdInterpolatedIntoTheQuery;
     }
     try std.testing.expect(std.mem.indexOf(u8, body, "\\\"go\\\"") != null);
 }
 
-test "a batch of two is one request, and fifty-one is two" {
-    try std.testing.expectEqual(@as(usize, 50), delete_batch_size);
+test "unarchiving is the same batch with the opposite verb, not a flag Linear has to read" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ids = [_][]const u8{"uuid-a"};
+
+    const back = try archiveBatchBody(arena, &ids, false);
+    try std.testing.expect(std.mem.indexOf(u8, back, "issueUnarchive(id: $i0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, back, "issueArchive(") == null);
+
+    const away = try archiveBatchBody(arena, &ids, true);
+    try std.testing.expect(std.mem.indexOf(u8, away, "issueUnarchive(") == null);
+}
+
+test "a batch of fifty is one request, and the fifty-first starts another" {
+    try std.testing.expectEqual(@as(usize, 50), archive_batch_size);
 
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const text = try deleteMutationText(arena, delete_batch_size);
+    const text = try archiveMutationText(arena, archive_batch_size, true);
     var aliases: usize = 0;
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, text, i, ": issueDelete(")) |hit| : (i = hit + 1) aliases += 1;
-    try std.testing.expectEqual(delete_batch_size, aliases);
+    while (std.mem.indexOfPos(u8, text, i, ": issueArchive(")) |hit| : (i = hit + 1) aliases += 1;
+    try std.testing.expectEqual(archive_batch_size, aliases);
 }
 
-test "an alias Linear answered for is the only one reported deleted" {
+test "an alias Linear answered for is the only one reported archived" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const ids = [_][]const u8{ "a", "b", "c" };
-    var out: [3]DeleteOutcome = undefined;
+    var out: [3]ArchiveOutcome = undefined;
 
     const raw =
-        \\{"data": {"d0": {"success": true}, "d2": {"success": false}}}
+        \\{"data": {"a0": {"success": true}, "a2": {"success": false}}}
     ;
-    try readDeleteBatch(arena, raw, &ids, &out);
+    try readArchiveBatch(arena, raw, &ids, &out);
 
     try std.testing.expect(out[0].success);
     try std.testing.expect(!out[1].success);
@@ -1438,7 +1499,7 @@ test "a project page with no body reads as empty, not as a missing project" {
     try std.testing.expectEqualStrings("## Shipped", written.content);
 }
 
-test "an issue is deleted when Linear dates it, which a state name never says" {
+test "an issue is archived when Linear dates it, which a state name never says" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

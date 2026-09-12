@@ -5,10 +5,12 @@ const config = @import("../config.zig");
 const linear = @import("../linear.zig");
 const oauth = @import("../oauth.zig");
 
-pub const Verb = enum { content };
+pub const Verb = enum { content, archive, unarchive };
 
 pub fn resolveVerb(raw: []const u8) ?Verb {
     if (std.ascii.eqlIgnoreCase(raw, "content")) return .content;
+    if (std.ascii.eqlIgnoreCase(raw, "archive")) return .archive;
+    if (std.ascii.eqlIgnoreCase(raw, "unarchive")) return .unarchive;
     return null;
 }
 
@@ -68,6 +70,12 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         .{ name, team },
     );
 
+    switch (opts.verb) {
+        .archive => return setArchived(app, opts, token, page, true),
+        .unarchive => return setArchived(app, opts, token, page, false),
+        .content => {},
+    }
+
     if (opts.set_file) |path| return write(app, opts, token, page, path);
     return read(app, opts, page);
 }
@@ -126,6 +134,41 @@ fn write(
         return;
     }
     app.ui.success("{s}: page is now {d} bytes.", .{ saved.name, saved.content.len });
+    app.ui.flush();
+}
+
+const ArchiveReport = struct {
+    project: ProjectEntry,
+    archived: bool,
+};
+
+fn setArchived(
+    app: app_mod.App,
+    opts: Opts,
+    token: oauth.Token,
+    page: linear.ProjectPage,
+    archived: bool,
+) !void {
+    const saved = linear.setProjectArchived(app.gpa, app.io, token, page.id, archived) catch |err| bail(
+        app,
+        opts.json,
+        "linear_failed",
+        "Linear refused the change ({s}, HTTP {d}): {s}",
+        .{ @errorName(err), linear.last_status, linear.last_message },
+    );
+
+    const value: ArchiveReport = .{
+        .project = .{ .id = saved.id, .name = saved.name },
+        .archived = archived,
+    };
+
+    if (opts.json) {
+        const body = try std.json.Stringify.valueAlloc(app.gpa, value, .{ .whitespace = .indent_2 });
+        app.ui.payload("{s}\n", .{body});
+        app.ui.flush();
+        return;
+    }
+    app.ui.success("{s} is now {s}.", .{ saved.name, if (archived) "archived" else "active" });
     app.ui.flush();
 }
 
@@ -204,6 +247,8 @@ fn bail(
 test "resolveVerb takes the subcommand however it is cased, and nothing else" {
     try std.testing.expectEqual(Verb.content, resolveVerb("content").?);
     try std.testing.expectEqual(Verb.content, resolveVerb("CONTENT").?);
+    try std.testing.expectEqual(Verb.archive, resolveVerb("archive").?);
+    try std.testing.expectEqual(Verb.unarchive, resolveVerb("Unarchive").?);
     try std.testing.expect(resolveVerb("contents") == null);
     try std.testing.expect(resolveVerb("") == null);
 }
