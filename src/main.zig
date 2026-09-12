@@ -7,6 +7,7 @@ const clean_cmd = @import("commands/clean.zig");
 const config_cmd = @import("commands/config.zig");
 const daemon_cmd = @import("commands/daemon.zig");
 const issue_cmd = @import("commands/issue.zig");
+const project_cmd = @import("commands/project.zig");
 const list_cmd = @import("commands/list.zig");
 const open_cmd = @import("commands/open.zig");
 const remove_cmd = @import("commands/remove.zig");
@@ -53,6 +54,17 @@ const usage =
     \\      --force              move it out of a project it is already in
     \\    project --resolve      work out which release it targets — read-only
     \\      --fetch              refresh the view of origin first
+    \\    list --state "<name>"  the team's issues in one workflow state
+    \\      --team <key>         which team, when the branch does not say
+    \\      --project <name>     keep only the ones in that project
+    \\      --deleted-only       list the deleted and archived ones instead
+    \\    delete PE-N [PE-M ...] delete issues — Linear restores them for 30 days
+    \\      --yes                required; the delete is not reversible after that
+    \\    --json                 print the result instead of a human summary
+    \\  project content <name>   Read or write a project page's markdown body
+    \\    --get                  print the page — the default
+    \\    --set-file <path>      replace the page with the contents of a file
+    \\    --team <key>           which team, when the branch does not say
     \\    --json                 print the result instead of a human summary
     \\  auth                     Authenticate with Linear (OAuth browser flow)
     \\    --logout               remove stored token
@@ -155,6 +167,7 @@ fn dispatch(app: app_mod.App, args: []const []const u8) !void {
     if (eq(first, "remove") or eq(first, "rm")) return removeCommand(app, args[1..]);
     if (eq(first, "clean")) return cleanCommand(app, args[1..]);
     if (eq(first, "issue")) return issueCommand(app, args[1..]);
+    if (eq(first, "project")) return projectCommand(app, args[1..]);
     if (eq(first, "start")) return startCommand(app, args[1..]);
     if (eq(first, "stats")) return statsCommand(app, args[1..]);
     if (eq(first, "watch-hook")) return watchHookCommand(app, args[1..]);
@@ -220,11 +233,12 @@ fn issueCommand(app: app_mod.App, args: []const []const u8) !void {
     if (args.len == 0) return error.MissingIssueSubcommand;
 
     const verb = issue_cmd.resolveVerb(args[0]) orelse {
-        app.ui.fail("Unknown issue subcommand '{s}'. Use one of: show, state, comment, project.", .{args[0]});
+        app.ui.fail("Unknown issue subcommand '{s}'. Use one of: show, state, comment, project, list, delete.", .{args[0]});
         std.process.exit(1);
     };
 
     var opts: issue_cmd.Opts = .{ .sub = issue_cmd.Sub.empty(verb) };
+    var named: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -280,8 +294,46 @@ fn issueCommand(app: app_mod.App, args: []const []const u8) !void {
                     continue;
                 }
             },
+            .list => |*sub| {
+                if (eq(arg, "--state")) {
+                    i += 1;
+                    if (i >= args.len) return error.MissingOptionValue;
+                    sub.state = args[i];
+                    continue;
+                }
+                if (eq(arg, "--project")) {
+                    i += 1;
+                    if (i >= args.len) return error.MissingOptionValue;
+                    sub.project = args[i];
+                    continue;
+                }
+                if (eq(arg, "--team")) {
+                    i += 1;
+                    if (i >= args.len) return error.MissingOptionValue;
+                    sub.team = args[i];
+                    continue;
+                }
+                if (eq(arg, "--deleted-only")) {
+                    sub.deleted_only = true;
+                    continue;
+                }
+            },
+            .delete => |*sub| {
+                if (eq(arg, "--yes") or eq(arg, "-y")) {
+                    sub.yes = true;
+                    continue;
+                }
+            },
         }
         if (std.mem.startsWith(u8, arg, "-")) return error.UnknownOption;
+        switch (opts.sub) {
+            .delete => {
+                try named.append(app.gpa, arg);
+                continue;
+            },
+            .list => return error.TooManyArguments,
+            else => {},
+        }
         if (opts.issue == null) {
             opts.issue = arg;
         } else switch (opts.sub) {
@@ -292,7 +344,11 @@ fn issueCommand(app: app_mod.App, args: []const []const u8) !void {
             else => return error.TooManyArguments,
         }
     }
-    if (opts.issue == null) return error.MissingIssueIdentifier;
+    opts.issues = named.items;
+    switch (opts.sub) {
+        .list, .delete => {},
+        else => if (opts.issue == null) return error.MissingIssueIdentifier,
+    }
     switch (opts.sub) {
         .show => {},
         .state => |sub| if (sub.name == null) return error.MissingStateName,
@@ -304,11 +360,57 @@ fn issueCommand(app: app_mod.App, args: []const []const u8) !void {
             if (sub.assign != null and sub.resolve) return error.ConflictingProjectAction;
             if (sub.assign == null and !sub.resolve) return error.MissingProjectAction;
         },
+        .list => |sub| if (sub.state == null) return error.MissingListState,
+        .delete => if (opts.issues.len == 0) return error.MissingDeleteTargets,
     }
 
     var machine = app;
     machine.ui.divert = opts.json;
     return issue_cmd.run(machine, opts);
+}
+
+fn projectCommand(app: app_mod.App, args: []const []const u8) !void {
+    if (args.len == 0) return error.MissingProjectSubcommand;
+
+    const verb = project_cmd.resolveVerb(args[0]) orelse {
+        app.ui.fail("Unknown project subcommand '{s}'. Use: content.", .{args[0]});
+        std.process.exit(1);
+    };
+
+    var opts: project_cmd.Opts = .{ .verb = verb };
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (eq(arg, "--json")) {
+            opts.json = true;
+            continue;
+        }
+        if (eq(arg, "--get")) {
+            opts.get = true;
+            continue;
+        }
+        if (eq(arg, "--set-file")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.set_file = args[i];
+            continue;
+        }
+        if (eq(arg, "--team")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.team = args[i];
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "-")) return error.UnknownOption;
+        if (opts.name != null) return error.TooManyArguments;
+        opts.name = arg;
+    }
+    if (opts.name == null) return error.MissingProjectName;
+    if (opts.get and opts.set_file != null) return error.ConflictingContentAction;
+
+    var machine = app;
+    machine.ui.divert = opts.json or opts.set_file == null;
+    return project_cmd.run(machine, opts);
 }
 
 fn authCommand(app: app_mod.App, args: []const []const u8) !void {
@@ -608,6 +710,7 @@ test {
     _ = @import("commands/issue.zig");
     _ = @import("commands/list.zig");
     _ = @import("commands/open.zig");
+    _ = @import("commands/project.zig");
     _ = @import("commands/remove.zig");
     _ = @import("commands/setup.zig");
     _ = @import("commands/start.zig");
@@ -625,7 +728,12 @@ fn describe(err: anyerror) []const u8 {
         error.UnknownOption => "Unknown option. Run `lcc --help`.",
         error.MissingOptionValue => "Missing value for option. Run `lcc --help`.",
         error.MissingClientId => "auth setup requires --client-id <id>.",
-        error.MissingIssueSubcommand => "issue needs a subcommand: show, state, comment, project.",
+        error.MissingIssueSubcommand => "issue needs a subcommand: show, state, comment, project, list, delete.",
+        error.MissingProjectSubcommand => "project needs a subcommand: content.",
+        error.MissingProjectName => "`lcc project content` needs a project name, e.g. `lcc project content v2.6.0 --get`.",
+        error.ConflictingContentAction => "`lcc project content` takes --get or --set-file, not both.",
+        error.MissingListState => "`lcc issue list` needs --state <name>, e.g. `lcc issue list --state Done --team PE`.",
+        error.MissingDeleteTargets => "`lcc issue delete` needs at least one issue, e.g. `lcc issue delete PE-42 --yes`.",
         error.MissingProjectAction => "`lcc issue project` needs --assign <vX.Y.Z> or --resolve.",
         error.ConflictingProjectAction => "`lcc issue project` takes --assign or --resolve, not both.",
         error.MissingIssueIdentifier => "issue needs an identifier, e.g. `lcc issue show PE-42`.",
