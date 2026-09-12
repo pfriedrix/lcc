@@ -1475,8 +1475,8 @@ test "the show payload keeps the shape a caller parses" {
         .issue = .{
             .id = "uuid-1",
             .identifier = "PE-250",
-            .title = "Fix CLVisit capture",
-            .branch_name = "feature/pe-250-fix-clvisit-capture",
+            .title = "Fix background refresh",
+            .branch_name = "feature/pe-250-fix-background-refresh",
             .state_name = "In Progress",
             .state_type = "started",
             .priority = 2,

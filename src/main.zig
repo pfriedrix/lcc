@@ -76,7 +76,8 @@ const usage =
     \\    --status               show current authentication state
     \\    --token <pat>          headless fallback: store a personal API token directly
     \\  auth setup --client-id <id>
-    \\                           Configure OAuth client_id (one-time)
+    \\                           Point lcc at your Linear OAuth application (one-time,
+    \\                           required before `lcc auth`)
     \\  setup                    Interactively configure lcc
     \\  config [<setting>] [<value>]
     \\                           Read or write one setting — no prompt, unlike setup

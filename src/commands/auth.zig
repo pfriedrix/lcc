@@ -38,6 +38,7 @@ pub fn setup(app: app_mod.App, client_id: []const u8) !void {
 
 fn login(app: app_mod.App) !void {
     const cfg = try config.load(app.gpa, app.io, app.environ);
+    if (cfg.clientId.len == 0) return reportAuthError(app, error.NoClientId);
     const pkce = try oauth.generatePkce(app.gpa, app.io);
     const state = try oauth.generateState(app.gpa, app.io);
     const url = try oauth.buildAuthorizeUrl(app.gpa, cfg.clientId, state, pkce.challenge);
@@ -92,6 +93,7 @@ fn status(app: app_mod.App) !void {
         .unreadable => |why| {
             app.ui.fail("The Linear token is stored, but reading it failed: {s}", .{why});
             app.ui.hint("Answer `Always Allow` if macOS asks again; `lcc auth` re-stores it if it stays refused.", .{});
+            app.ui.flush();
             std.process.exit(1);
         },
     };
@@ -131,6 +133,16 @@ fn reportAuthError(app: app_mod.App, err: anyerror) noreturn {
         error.CallbackTimedOut => app.ui.fail("Timed out waiting for browser authorization", .{}),
         error.AuthorizationDenied => app.ui.fail("Linear returned error: {s}", .{detail}),
         error.NotAuthenticated => app.ui.fail("Not authenticated. Run `lcc auth` first.", .{}),
+        error.NoClientId => {
+            app.ui.fail("No Linear OAuth application configured.", .{});
+            app.ui.hint(
+                "Create one at linear.app/settings/api/applications with redirect URI\n" ++
+                    "    {s}\n" ++
+                    "  then run `lcc auth setup --client-id <id>`.",
+                .{config.redirect_uri},
+            );
+            app.ui.hint("Or skip OAuth entirely: `lcc auth --token <personal-api-token>`.", .{});
+        },
         error.KeychainUnreadable => app.ui.fail(
             "The Linear token is stored, but reading it failed: {s}",
             .{detail},
@@ -146,6 +158,7 @@ fn reportAuthError(app: app_mod.App, err: anyerror) noreturn {
             detail,
         }),
     }
+    app.ui.flush();
     std.process.exit(1);
 }
 

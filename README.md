@@ -12,7 +12,7 @@ $ lcc start
 > PE-47   M   Todo          Backfill missing receipt categories
   feature/pe-47-backfill-receipts — https://linear.app/…/PE-47/…
   3/165 · ↑↓ move · enter select · esc cancel
-✓ Worktree created: /Users/me/Documents/Projects/Pantry/.lcc/worktrees/PE-47-backfill-receipts
+✓ Worktree created: /Users/me/Documents/Projects/App/.lcc/worktrees/PE-47-backfill-receipts
 ✓ Linked .claude/settings.local.json
 ✓ Linked .env
 ✓ Linked .env.local
@@ -43,14 +43,24 @@ Editing anything under `src/` changes nothing on your `PATH` until you re-run `z
 
 ## Authenticate
 
+`lcc` authorizes against **your** Linear OAuth application, not one baked into this
+repository — so there is a one-time registration first:
+
+1. Create an application at
+   [linear.app/settings/api/applications](https://linear.app/settings/api/applications).
+   The name is only ever shown to you.
+2. Set its redirect URI to exactly `http://localhost:39126/oauth/callback`.
+3. Hand `lcc` the client ID it gives you.
+
 ```bash
+lcc auth setup --client-id <id>   # once
 lcc auth
 # Browser opens → click Authorize → done.
 ```
 
-`lcc` uses OAuth 2.0 with PKCE — like `gh auth login`. No API keys pasted into the terminal, no shell history secrets. The token is stored in the macOS Keychain and refreshed automatically when it expires. The callback listener gives up after five minutes if you never finish in the browser.
+`lcc` uses OAuth 2.0 with PKCE — like `gh auth login`. No API keys pasted into the terminal, no shell history secrets. There is no client secret anywhere in the flow, so the client ID is not something to guard; a *shared* one would still be worth avoiding, because it ties every install's rate limits, consent screen and abuse history to whoever published it. One registration buys you your own. The token is stored in the macOS Keychain and refreshed automatically when it expires. The callback listener gives up after five minutes if you never finish in the browser.
 
-For headless machines, `lcc auth --token <pat>` stores a Linear personal API token instead.
+For headless machines — or to skip the registration entirely — `lcc auth --token <pat>` stores a Linear personal API token instead. A personal token never refreshes, so it needs no application at all.
 
 ## Usage
 
@@ -374,13 +384,13 @@ One Linear issue, named by its identifier. Unlike every other command here it ne
 
 ```bash
 $ lcc issue show PE-250
-PE-250  Fix CLVisit capture: dropped visits, lost headless writes, no departure
+PE-250  Fix background refresh: dropped updates, lost headless writes, no retry
   State     In Build
   Project   v2.6.0
-  Assignee  Danylo Krysevych
+  Assignee  Sam Rivera
   Labels    for/team, source/self, type/bug
-  Branch    feature/pe-250-fix-clvisit-capture-dropped-visits-lost-headless-writes-no
-  https://linear.app/pfx-lab/issue/PE-250/fix-clvisit-capture-…
+  Branch    feature/pe-250-fix-background-refresh-dropped-updates-lost-headless-write
+  https://linear.app/x/issue/PE-250/fix-background-refresh-…
 ```
 
 `show` is the read-only probe that `lcc start --json` deliberately is not: `start` cuts a branch and a worktree on the way to its answer, and a caller that only wanted to look has to undo them.
@@ -544,7 +554,7 @@ The team's issues in one workflow state, named by the board's own word for it �
 ```bash
 $ lcc issue list --state Done --team PE --json
 { "team": "PE", "state": "Done", "count": 81, "issues": [
-  { "id": "a84802d2-…", "identifier": "PE-231", "title": "LegacyCircleDTO: make code optional",
+  { "id": "a84802d2-…", "identifier": "PE-231", "title": "LegacyUserDTO: make code optional",
     "url": "https://linear.app/…", "state": "Done", "completed_at": "2026-08-03T19:50:44.002Z",
     "archived": false, "project": { "id": "ffeedbc8-…", "name": "v2.5.1" },
     "links": [ { "url": "https://github.com/…/pull/169", "title": "PE-231: …" } ] } ] }
@@ -779,7 +789,7 @@ $ lcc clean
 14 GB in 31 folders whose worktree no longer exists.
 Session transcripts are what `claude --resume` replays — check before deleting.
 ? Select what to delete (space toggles, enter confirms):
-❯ ◉  2.4 GB  build data  LocationTracker-fmqzbi…  ~/…/pe-224-history-empty-states
+❯ ◉  2.4 GB  build data  App-fmqzbi…  ~/…/pe-224-history-empty-states
   ◉   12 MB  sessions    -Users-…-pe-224-history  ~/…/pe-224-history-empty-states
 ```
 
@@ -841,7 +851,7 @@ months after anyone typed it.
 | `keepBranch`, `keepDerivedData`, `keepXcode` | `false` | What `lcc remove` leaves behind |
 | `xcodeApp` | absent — ask | Which Xcode `lcc open xcode` launches: its name, version, build, or the path to the `.app` |
 | `mcpCarry` | absent — all of them | Which local-scope MCP servers to carry into Claude; setup accepts a comma-separated list, `all`, or `none` |
-| `clientId` | built-in | Linear OAuth application. Override with `LCC_CLIENT_ID` or `lcc auth setup --client-id <id>` |
+| `clientId` | absent — required by `lcc auth` | Your Linear OAuth application. Set it with `lcc auth setup --client-id <id>`, or `LCC_CLIENT_ID` for a single run |
 
 `{repoRoot}` and `{repoParent}` always resolve against the **main** worktree, so running `lcc` from inside a worktree puts the next one beside its siblings instead of nesting it one level deeper.
 

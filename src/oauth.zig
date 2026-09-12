@@ -17,6 +17,7 @@ pub const Token = struct {
 
 pub const Error = error{
     NotAuthenticated,
+    NoClientId,
     KeychainUnreadable,
     TokenExpiredNoRefresh,
     TokenEndpointFailed,
@@ -445,6 +446,11 @@ test "a token the Keychain would not give up is a different answer from never ha
     }
 }
 
+pub fn needsRefresh(token: Token, now: i64) bool {
+    if (token.is_pat orelse false) return false;
+    return if (token.expires_at) |at| at <= now else false;
+}
+
 pub fn ensureFreshToken(gpa: std.mem.Allocator, io: Io, client_id: []const u8) Error!Token {
     const token = switch (readToken(gpa)) {
         .token => |t| t,
@@ -454,13 +460,26 @@ pub fn ensureFreshToken(gpa: std.mem.Allocator, io: Io, client_id: []const u8) E
             return Error.KeychainUnreadable;
         },
     };
-    if (token.is_pat orelse false) return token;
-
-    const expired = if (token.expires_at) |at| at <= nowSeconds(io) else false;
-    if (!expired) return token;
+    if (!needsRefresh(token, nowSeconds(io))) return token;
+    if (client_id.len == 0) return Error.NoClientId;
 
     const refresh = token.refresh_token orelse return Error.TokenExpiredNoRefresh;
     const refreshed = try refreshAccessToken(gpa, io, client_id, refresh);
     setToken(gpa, refreshed) catch {};
     return refreshed;
+}
+
+test "a personal token needs no OAuth application, whatever the clock says" {
+    const pat: Token = .{ .access_token = "lin_api_x", .is_pat = true, .expires_at = 0 };
+    try std.testing.expect(!needsRefresh(pat, 1_000_000));
+}
+
+test "an OAuth token is refreshed only once it has actually expired" {
+    const live: Token = .{ .access_token = "x", .expires_at = 1_000 };
+    try std.testing.expect(!needsRefresh(live, 999));
+    try std.testing.expect(needsRefresh(live, 1_000));
+    try std.testing.expect(needsRefresh(live, 1_001));
+
+    const no_expiry: Token = .{ .access_token = "x" };
+    try std.testing.expect(!needsRefresh(no_expiry, 1_000_000));
 }

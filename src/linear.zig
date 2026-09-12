@@ -1673,8 +1673,8 @@ test "refFromBranch finds the issue key wherever it sits" {
 
 test "sameIssue survives a renamed issue and refuses branches with no issue" {
     try std.testing.expect(sameIssue(
-        "feature/pe-250-fix-clvisit-handling-dedupe-arrivaldeparture-double-writes",
-        "feature/pe-250-fix-clvisit-capture-dropped-visits-lost-headless-writes-no",
+        "feature/pe-250-fix-background-handling-dedupe-stale-entries-double-writes",
+        "feature/pe-250-fix-background-refresh-dropped-updates-lost-headless-write",
     ));
     try std.testing.expect(sameIssue("feature/PE-250-a", "feature/pe-250-b"));
 

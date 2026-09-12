@@ -883,7 +883,7 @@ test "findWorktree prefers the exact branch, then the issue behind it" {
         .{ .path = "/r", .branch = "main", .head = "a", .locked = false, .prunable = false, .is_main = true },
         .{
             .path = "/wt/old",
-            .branch = "feature/pe-250-fix-clvisit-handling-dedupe-arrivaldeparture-double-writes",
+            .branch = "feature/pe-250-fix-background-handling-dedupe-stale-entries-double-writes",
             .head = "b",
             .locked = false,
             .prunable = false,
@@ -892,23 +892,23 @@ test "findWorktree prefers the exact branch, then the issue behind it" {
         .{ .path = "/wt/other", .branch = "feature/pe-9-unrelated", .head = "c", .locked = false, .prunable = false, .is_main = false },
     };
 
-    const renamed = findWorktree(&entries, "feature/pe-250-fix-clvisit-capture-dropped-visits").?;
+    const renamed = findWorktree(&entries, "feature/pe-250-fix-background-refresh-dropped-updates").?;
     try std.testing.expectEqualStrings("/wt/old", renamed.entry.path);
     try std.testing.expectEqual(MatchedBy.issue, renamed.by);
 
-    const exact = findWorktree(&entries, "feature/pe-250-fix-clvisit-handling-dedupe-arrivaldeparture-double-writes").?;
+    const exact = findWorktree(&entries, "feature/pe-250-fix-background-handling-dedupe-stale-entries-double-writes").?;
     try std.testing.expectEqualStrings("/wt/old", exact.entry.path);
     try std.testing.expectEqual(MatchedBy.branch, exact.by);
 
     const both = entries ++ [_]git.WorktreeEntry{.{
         .path = "/wt/new",
-        .branch = "feature/pe-250-fix-clvisit-capture-dropped-visits",
+        .branch = "feature/pe-250-fix-background-refresh-dropped-updates",
         .head = "d",
         .locked = false,
         .prunable = false,
         .is_main = false,
     }};
-    const preferred = findWorktree(&both, "feature/pe-250-fix-clvisit-capture-dropped-visits").?;
+    const preferred = findWorktree(&both, "feature/pe-250-fix-background-refresh-dropped-updates").?;
     try std.testing.expectEqualStrings("/wt/new", preferred.entry.path);
     try std.testing.expectEqual(MatchedBy.branch, preferred.by);
 
@@ -937,8 +937,8 @@ test "the --json payload keeps the shape a caller parses" {
     const issue: linear.Issue = .{
         .id = "uuid-1",
         .identifier = "PE-250",
-        .title = "Fix CLVisit capture",
-        .branch_name = "feature/pe-250-fix-clvisit-capture-dropped-visits",
+        .title = "Fix background refresh",
+        .branch_name = "feature/pe-250-fix-background-refresh-dropped-updates",
         .state_name = "In Progress",
         .state_type = "started",
         .priority = 2,
@@ -948,7 +948,7 @@ test "the --json payload keeps the shape a caller parses" {
         .team_key = "PE",
     };
     const wt: Bootstrapped = .{
-        .branch = "feature/pe-250-fix-clvisit-handling-dedupe",
+        .branch = "feature/pe-250-fix-background-handling-dedupe",
         .path = "/wt/old",
         .status = .existing,
         .matched_by = .issue,
@@ -960,9 +960,9 @@ test "the --json payload keeps the shape a caller parses" {
     };
 
     const value = buildReport(issue, issue.branch_name, wt, .{
-        .current_branch = "feature/pe-250-fix-clvisit-handling-dedupe",
+        .current_branch = "feature/pe-250-fix-background-handling-dedupe",
         .branch_status = .{
-            .branch = "feature/pe-250-fix-clvisit-handling-dedupe",
+            .branch = "feature/pe-250-fix-background-handling-dedupe",
             .upstream = null,
             .ahead = 3,
             .behind = 1,
@@ -1020,7 +1020,7 @@ test "the --json payload keeps the shape a caller parses" {
     const parsed = try std.json.parseFromSliceLeaky(Schema, arena_state.allocator(), body, .{});
 
     try std.testing.expectEqualStrings("PE-250", parsed.issue.identifier);
-    try std.testing.expectEqualStrings("feature/pe-250-fix-clvisit-handling-dedupe", parsed.branch.name);
+    try std.testing.expectEqualStrings("feature/pe-250-fix-background-handling-dedupe", parsed.branch.name);
     try std.testing.expectEqualStrings(issue.branch_name, parsed.branch.suggested);
     try std.testing.expect(parsed.branch.renamed);
     try std.testing.expect(!parsed.branch.pushed);
@@ -1200,7 +1200,7 @@ test "expandCommand fills the placeholders and leaves anything else alone" {
     const issue: linear.Issue = .{
         .id = "uuid-1",
         .identifier = "PE-250",
-        .title = "Fix CLVisit capture",
+        .title = "Fix background refresh",
         .branch_name = "feature/pe-250-suggested",
         .state_name = "In Progress",
         .state_type = "started",

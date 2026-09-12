@@ -7,8 +7,6 @@ pub const authorize_url = "https://linear.app/oauth/authorize";
 pub const token_url = "https://api.linear.app/oauth/token";
 pub const default_scopes = "read,write";
 
-pub const default_client_id = "6bf6dd7b761b5ce6539cf5a9ed99b4fb";
-
 const default_worktree_template = "{repoRoot}/.lcc/worktrees/{branchLeaf}";
 const default_link_patterns = [_][]const u8{
     ".env",
@@ -143,12 +141,8 @@ pub fn load(
     environ: *const std.process.Environ.Map,
 ) !Config {
     const stored = try loadStored(gpa, io, environ);
-    const env_client_id = blk: {
-        const v = environ.get("LCC_CLIENT_ID") orelse break :blk null;
-        break :blk if (v.len > 0) v else null;
-    };
     return .{
-        .clientId = env_client_id orelse stored.clientId orelse default_client_id,
+        .clientId = resolveClientId(stored, environ),
         .worktreeTemplate = stored.worktreeTemplate orelse default_worktree_template,
         .linkPatterns = stored.linkPatterns orelse stored.envPatterns orelse &default_link_patterns,
         .linkExclude = stored.linkExclude orelse stored.envExclude orelse &default_link_exclude,
@@ -231,6 +225,13 @@ pub fn save(
     try writer.interface.flush();
 }
 
+fn resolveClientId(stored: Stored, environ: *const std.process.Environ.Map) []const u8 {
+    if (environ.get("LCC_CLIENT_ID")) |v| {
+        if (v.len > 0) return v;
+    }
+    return stored.clientId orelse "";
+}
+
 fn resolveLinkPatterns(stored: Stored) []const []const u8 {
     return stored.linkPatterns orelse stored.envPatterns orelse &default_link_patterns;
 }
@@ -257,4 +258,36 @@ test "the defaults carry Claude Code's own files, not just secrets" {
     try std.testing.expect(hasPattern(defaults, ".claude/settings.local.json"));
     try std.testing.expect(hasPattern(defaults, "CLAUDE.md"));
     try std.testing.expect(hasPattern(defaults, "CLAUDE.local.md"));
+}
+
+test "an unset clientId resolves to nothing, rather than to an application lcc ships" {
+    const gpa = std.testing.allocator;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var environ: std.process.Environ.Map = .init(arena);
+
+    try std.testing.expectEqualStrings("", resolveClientId(.{}, &environ));
+}
+
+test "LCC_CLIENT_ID outranks the stored one, and an empty env var is not an answer" {
+    const gpa = std.testing.allocator;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var environ: std.process.Environ.Map = .init(arena);
+    const stored: Stored = .{ .clientId = "from-config" };
+
+    try std.testing.expectEqualStrings("from-config", resolveClientId(stored, &environ));
+
+    try environ.put("LCC_CLIENT_ID", "from-env");
+    try std.testing.expectEqualStrings("from-env", resolveClientId(stored, &environ));
+
+    try environ.put("LCC_CLIENT_ID", "");
+    try std.testing.expectEqualStrings("from-config", resolveClientId(stored, &environ));
+    try std.testing.expectEqualStrings("", resolveClientId(.{}, &environ));
 }
