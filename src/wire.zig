@@ -200,6 +200,7 @@ pub const Register = struct {
     env: []const []const u8,
     cols: u16,
     rows: u16,
+    post_plan_input: ?[]const u8 = null,
 };
 
 pub const Registered = struct {

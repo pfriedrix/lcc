@@ -36,6 +36,8 @@ pub const Session = struct {
     input: [input_capacity]u8 = undefined,
     input_len: usize = 0,
     input_dropped: u32 = 0,
+    post_plan_input: []const u8 = "",
+    post_plan_fired: bool = false,
 
     dirty: bool = true,
 
@@ -45,6 +47,7 @@ pub const Session = struct {
         branch: []const u8,
         issue: ?[]const u8,
         repo_root: []const u8,
+        post_plan_input: []const u8 = "",
     };
 
     pub fn start(
@@ -63,6 +66,7 @@ pub const Session = struct {
             .branch = meta.branch,
             .issue = meta.issue,
             .repo_root = meta.repo_root,
+            .post_plan_input = meta.post_plan_input,
             .pid = spawned.pid,
             .master = spawned.master,
             .scrollback = scrollback,
@@ -155,10 +159,18 @@ pub const Session = struct {
         return self.master_open and self.input_len > 0;
     }
 
+    fn handBack(self: *Session) void {
+        if (self.post_plan_fired or self.post_plan_input.len == 0) return;
+        self.post_plan_fired = true;
+        self.queueInput(self.post_plan_input);
+    }
+
     pub fn note(self: *Session, event: watch_hooks.Event, permission_mode: []const u8, now: i64) bool {
         const before = self.shown();
+        const was_planning = self.plan;
         self.last_event_at = now;
         if (permission_mode.len > 0) self.setPlan(watch_hooks.isPlan(permission_mode), now);
+        if (was_planning and !self.plan) self.handBack();
         self.setStatus(watch_status.apply(self.status, event), now);
         return before != self.shown();
     }
@@ -395,4 +407,69 @@ test "a change no reader can see costs no registry write" {
 
     try testing.expect(s.note(.idle, "acceptEdits", 2000));
     try testing.expectEqualStrings("idle", s.entry().status);
+}
+
+test "leaving plan mode hands the session back, once and only once" {
+    const gpa = testing.allocator;
+    var scratch = try ring.Ring.init(gpa, 64);
+    defer scratch.deinit(gpa);
+    var s = stubSession(&scratch);
+    const handback = "/model opus[1m]\r/linear-pfx-plugin:start-task PE-250\r";
+    s.post_plan_input = handback;
+
+    _ = s.note(.active, "plan", 1001);
+    if (s.input_len != 0) {
+        std.debug.print(
+            \\
+            \\the hand-back fired while the session was still planning:
+            \\  queued: "{s}"
+            \\  cost:   /model lands mid-plan and the opening command re-runs the task
+            \\          before its plan has been approved
+            \\
+        , .{s.input[0..s.input_len]});
+        return error.HandbackFiredEarly;
+    }
+
+    _ = s.note(.active, "default", 1002);
+    if (!std.mem.eql(u8, s.input[0..s.input_len], handback)) {
+        std.debug.print(
+            \\
+            \\approving the plan did not hand the session back:
+            \\  queued: "{s}"
+            \\  cost:   spec, code, test and review all run on the planning model, and
+            \\          nothing in the session says so
+            \\
+        , .{s.input[0..s.input_len]});
+        return error.HandbackNeverFired;
+    }
+
+    var never = stubSession(&scratch);
+    never.post_plan_input = handback;
+    _ = never.note(.active, "default", 1001);
+    if (never.input_len != 0) {
+        std.debug.print(
+            \\
+            \\a session that never planned was handed back anyway:
+            \\  queued: "{s}"
+            \\  cost:   the opening command is submitted to a session that is already
+            \\          running the task, starting it a second time on top of itself
+            \\
+        , .{never.input[0..never.input_len]});
+        return error.HandbackFiredUnplanned;
+    }
+
+    const settled = s.input_len;
+    _ = s.note(.active, "plan", 1003);
+    _ = s.note(.active, "default", 1004);
+    if (s.input_len != settled) {
+        std.debug.print(
+            \\
+            \\re-entering plan mode armed the hand-back a second time:
+            \\  queued {d} bytes, expected {d}
+            \\  cost:  every shift+tab back into plan mode replays the opening command,
+            \\         so the task is started again on top of itself
+            \\
+        , .{ s.input_len, settled });
+        return error.HandbackRearmed;
+    }
 }

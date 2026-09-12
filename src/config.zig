@@ -45,6 +45,7 @@ pub const Stored = struct {
     planMode: ?bool = null,
     planModel: ?[]const u8 = null,
     planTaskCommand: ?[]const u8 = null,
+    postPlanModel: ?[]const u8 = null,
     resumeSessions: ?bool = null,
     showTokens: ?bool = null,
     listNetwork: ?[]const u8 = null,
@@ -72,6 +73,7 @@ pub const Patch = struct {
     planMode: ?bool = null,
     planModel: ?[]const u8 = null,
     planTaskCommand: ?[]const u8 = null,
+    postPlanModel: ?[]const u8 = null,
     resumeSessions: ?bool = null,
     showTokens: ?bool = null,
     listNetwork: ?ListNetwork = null,
@@ -94,6 +96,7 @@ pub const Config = struct {
     planMode: bool,
     planModel: []const u8,
     planTaskCommand: []const u8,
+    postPlanModel: []const u8,
     resumeSessions: bool,
     showTokens: bool,
     listNetwork: ListNetwork,
@@ -156,6 +159,7 @@ pub fn load(
         .planMode = stored.planMode orelse true,
         .planModel = stored.planModel orelse "",
         .planTaskCommand = stored.planTaskCommand orelse "",
+        .postPlanModel = stored.postPlanModel orelse "",
         .resumeSessions = stored.resumeSessions orelse true,
         .showTokens = stored.showTokens orelse true,
         .listNetwork = if (stored.listNetwork) |v| (ListNetwork.parse(v) orelse .cached) else .cached,
@@ -190,6 +194,7 @@ pub fn save(
     if (patch.planMode) |v| merged.planMode = v;
     if (patch.planModel) |v| merged.planModel = v;
     if (patch.planTaskCommand) |v| merged.planTaskCommand = v;
+    if (patch.postPlanModel) |v| merged.postPlanModel = v;
     if (patch.resumeSessions) |v| merged.resumeSessions = v;
     if (patch.showTokens) |v| merged.showTokens = v;
     if (patch.listNetwork) |v| merged.listNetwork = @tagName(v);

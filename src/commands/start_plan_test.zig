@@ -239,3 +239,48 @@ test "a plan-mode session gets its own opening prompt, and a carried plan never 
         return error.PlanPromptRegressed;
     }
 }
+
+test "the hand-back is composed only when there is a model to hand back to" {
+    const gpa = std.testing.allocator;
+    const command = "/linear-pfx-plugin:start-task PE-250";
+
+    const full = try start.postPlanInput(gpa, "opus[1m]", command);
+    defer if (full) |v| gpa.free(v);
+    if (full == null or !std.mem.eql(u8, full.?, "/model opus[1m]\r" ++ command ++ "\r")) {
+        std.debug.print(
+            \\
+            \\the post-plan hand-back came out wrong:
+            \\  got:  "{s}"
+            \\  cost: the session stays on the planning model for spec onward, which is the
+            \\        one thing this whole path exists to prevent
+            \\
+        , .{full orelse "(null)"});
+        return error.HandbackMiscomposed;
+    }
+
+    const off = try start.postPlanInput(gpa, "", command);
+    defer if (off) |v| gpa.free(v);
+    if (off != null) {
+        std.debug.print(
+            \\
+            \\an unset postPlanModel still produced input to inject:
+            \\  got:  "{s}"
+            \\  cost: every session that never asked for this starts typing into itself
+            \\
+        , .{off.?});
+        return error.HandbackNotOptIn;
+    }
+
+    const bare = try start.postPlanInput(gpa, "opus[1m]", "");
+    defer if (bare) |v| gpa.free(v);
+    if (bare == null or !std.mem.eql(u8, bare.?, "/model opus[1m]\r")) {
+        std.debug.print(
+            \\
+            \\an empty opening command did not reduce to the model switch alone:
+            \\  got:  "{s}"
+            \\  cost: a bare carriage return is submitted to the agent as an empty turn
+            \\
+        , .{bare orelse "(null)"});
+        return error.HandbackTrailingReturn;
+    }
+}

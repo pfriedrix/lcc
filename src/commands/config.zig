@@ -28,6 +28,7 @@ pub const keys = [_]Key{
     .{ .name = "planMode", .kind = .boolean, .label = "Start in plan mode" },
     .{ .name = "planModel", .kind = .text, .label = "Model for planning sessions" },
     .{ .name = "planTaskCommand", .kind = .text, .label = "Opening prompt when planning" },
+    .{ .name = "postPlanModel", .kind = .text, .label = "Model to return to after a plan" },
     .{ .name = "resumeSessions", .kind = .boolean, .label = "Resume last session on open" },
     .{ .name = "allIssues", .kind = .boolean, .label = "Offer every assigned issue" },
     .{ .name = "showTokens", .kind = .boolean, .label = "Token column in list" },
@@ -75,6 +76,7 @@ fn list(app: app_mod.App, opts: Opts) !void {
             .planMode = cfg.planMode,
             .planModel = cfg.planModel,
             .planTaskCommand = cfg.planTaskCommand,
+            .postPlanModel = cfg.postPlanModel,
             .resumeSessions = cfg.resumeSessions,
             .showTokens = cfg.showTokens,
             .listNetwork = @tagName(cfg.listNetwork),
@@ -311,6 +313,7 @@ fn applyText(patch: *config.Patch, name: []const u8, raw: []const u8) void {
     if (std.mem.eql(u8, name, "xcodeApp")) patch.xcodeApp = raw;
     if (std.mem.eql(u8, name, "planModel")) patch.planModel = raw;
     if (std.mem.eql(u8, name, "planTaskCommand")) patch.planTaskCommand = raw;
+    if (std.mem.eql(u8, name, "postPlanModel")) patch.postPlanModel = raw;
 }
 
 fn applyList(patch: *config.Patch, name: []const u8, items: []const []const u8) void {
@@ -357,6 +360,9 @@ fn render(app: app_mod.App, cfg: config.Config, key: Key) ![]const u8 {
     }
     if (std.mem.eql(u8, key.name, "planTaskCommand")) {
         return if (cfg.planTaskCommand.len == 0) "(startTaskCommand)" else cfg.planTaskCommand;
+    }
+    if (std.mem.eql(u8, key.name, "postPlanModel")) {
+        return if (cfg.postPlanModel.len == 0) "(stay)" else cfg.postPlanModel;
     }
     if (std.mem.eql(u8, key.name, "activeStates")) return std.mem.join(app.gpa, ", ", cfg.activeStates);
     if (std.mem.eql(u8, key.name, "linkPatterns")) return std.mem.join(app.gpa, ", ", cfg.linkPatterns);

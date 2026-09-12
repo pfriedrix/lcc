@@ -140,6 +140,15 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
 
     const initial_prompt: ?[]const u8 = if (expanded) |e| e.text else null;
 
+    const post_plan_input: ?[]const u8 = if (plan_mode) blk: {
+        const pipeline = std.mem.trim(u8, cfg.startTaskCommand, " \t");
+        const command = if (pipeline.len > 0)
+            (try expandCommand(app.gpa, cfg.startTaskCommand, selected, wt.branch, plan_path)).text
+        else
+            "";
+        break :blk try postPlanInput(app.gpa, cfg.postPlanModel, command);
+    } else null;
+
     if (opts.json) {
         try report(app, repo, selected, suggested, wt, carried, initial_prompt);
         return;
@@ -183,6 +192,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
             .repo_root = repo.root,
             .program = try claude.resolvePath(app.gpa, app.io),
             .argv = args,
+            .post_plan_input = post_plan_input,
         })) |started| {
             if (opts.no_attach) {
                 app.ui.success("Session {s} running in the background.", .{started.id});
@@ -1080,6 +1090,17 @@ test "a created worktree reports no match and its base" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"upstream\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"start_task_command\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"mcp\":null") != null);
+}
+
+pub fn postPlanInput(
+    gpa: std.mem.Allocator,
+    post_plan_model: []const u8,
+    opening_command: []const u8,
+) !?[]const u8 {
+    if (post_plan_model.len == 0) return null;
+    if (opening_command.len == 0)
+        return try std.fmt.allocPrint(gpa, "/model {s}\r", .{post_plan_model});
+    return try std.fmt.allocPrint(gpa, "/model {s}\r{s}\r", .{ post_plan_model, opening_command });
 }
 
 pub fn openingTemplate(

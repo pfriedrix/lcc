@@ -546,6 +546,7 @@ fn registerSession(loop: *Loop, client: *Client, frame: wire.Frame, at: i64) voi
         .branch = body.branch,
         .issue = body.issue,
         .repo_root = body.repo_root,
+        .post_plan_input = body.post_plan_input orelse "",
     }, .{
         .program = body.program,
         .argv = argv.items,
