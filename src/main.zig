@@ -57,13 +57,18 @@ const usage =
     \\    list --state "<name>"  the team's issues in one workflow state
     \\      --team <key>         which team, when the branch does not say
     \\      --project <name>     keep only the ones in that project
-    \\      --deleted-only       list the deleted and archived ones instead
-    \\    delete PE-N [PE-M ...] delete issues — Linear restores them for 30 days
-    \\      --yes                required; the delete is not reversible after that
+    \\      --archived-only      list the archived ones instead
+    \\    archive PE-N [PE-M ...]
+    \\                           archive issues — they leave the board and stop
+    \\                           counting, keeping their state
+    \\    unarchive PE-N [...]   bring them back
     \\    --json                 print the result instead of a human summary
-    \\  project content <name>   Read or write a project page's markdown body
+    \\  project <sub> <name>     Read or write a project, by its name
+    \\    content                markdown body of the project page
     \\    --get                  print the page — the default
     \\    --set-file <path>      replace the page with the contents of a file
+    \\    archive                archive it — an archived project refuses writes
+    \\    unarchive              bring it back so it can be written to
     \\    --team <key>           which team, when the branch does not say
     \\    --json                 print the result instead of a human summary
     \\  auth                     Authenticate with Linear (OAuth browser flow)
@@ -233,7 +238,7 @@ fn issueCommand(app: app_mod.App, args: []const []const u8) !void {
     if (args.len == 0) return error.MissingIssueSubcommand;
 
     const verb = issue_cmd.resolveVerb(args[0]) orelse {
-        app.ui.fail("Unknown issue subcommand '{s}'. Use one of: show, state, comment, project, list, delete.", .{args[0]});
+        app.ui.fail("Unknown issue subcommand '{s}'. Use one of: show, state, comment, project, list, archive, unarchive.", .{args[0]});
         std.process.exit(1);
     };
 
@@ -313,21 +318,16 @@ fn issueCommand(app: app_mod.App, args: []const []const u8) !void {
                     sub.team = args[i];
                     continue;
                 }
-                if (eq(arg, "--deleted-only")) {
-                    sub.deleted_only = true;
+                if (eq(arg, "--archived-only")) {
+                    sub.archived_only = true;
                     continue;
                 }
             },
-            .delete => |*sub| {
-                if (eq(arg, "--yes") or eq(arg, "-y")) {
-                    sub.yes = true;
-                    continue;
-                }
-            },
+            .archive, .unarchive => {},
         }
         if (std.mem.startsWith(u8, arg, "-")) return error.UnknownOption;
         switch (opts.sub) {
-            .delete => {
+            .archive, .unarchive => {
                 try named.append(app.gpa, arg);
                 continue;
             },
@@ -346,7 +346,7 @@ fn issueCommand(app: app_mod.App, args: []const []const u8) !void {
     }
     opts.issues = named.items;
     switch (opts.sub) {
-        .list, .delete => {},
+        .list, .archive, .unarchive => {},
         else => if (opts.issue == null) return error.MissingIssueIdentifier,
     }
     switch (opts.sub) {
@@ -361,7 +361,7 @@ fn issueCommand(app: app_mod.App, args: []const []const u8) !void {
             if (sub.assign == null and !sub.resolve) return error.MissingProjectAction;
         },
         .list => |sub| if (sub.state == null) return error.MissingListState,
-        .delete => if (opts.issues.len == 0) return error.MissingDeleteTargets,
+        .archive, .unarchive => if (opts.issues.len == 0) return error.MissingArchiveTargets,
     }
 
     var machine = app;
@@ -373,7 +373,7 @@ fn projectCommand(app: app_mod.App, args: []const []const u8) !void {
     if (args.len == 0) return error.MissingProjectSubcommand;
 
     const verb = project_cmd.resolveVerb(args[0]) orelse {
-        app.ui.fail("Unknown project subcommand '{s}'. Use: content.", .{args[0]});
+        app.ui.fail("Unknown project subcommand '{s}'. Use one of: content, archive, unarchive.", .{args[0]});
         std.process.exit(1);
     };
 
@@ -407,9 +407,10 @@ fn projectCommand(app: app_mod.App, args: []const []const u8) !void {
     }
     if (opts.name == null) return error.MissingProjectName;
     if (opts.get and opts.set_file != null) return error.ConflictingContentAction;
+    if (opts.verb != .content and (opts.get or opts.set_file != null)) return error.ConflictingContentAction;
 
     var machine = app;
-    machine.ui.divert = opts.json or opts.set_file == null;
+    machine.ui.divert = opts.json or (opts.verb == .content and opts.set_file == null);
     return project_cmd.run(machine, opts);
 }
 
@@ -728,12 +729,12 @@ fn describe(err: anyerror) []const u8 {
         error.UnknownOption => "Unknown option. Run `lcc --help`.",
         error.MissingOptionValue => "Missing value for option. Run `lcc --help`.",
         error.MissingClientId => "auth setup requires --client-id <id>.",
-        error.MissingIssueSubcommand => "issue needs a subcommand: show, state, comment, project, list, delete.",
-        error.MissingProjectSubcommand => "project needs a subcommand: content.",
+        error.MissingIssueSubcommand => "issue needs a subcommand: show, state, comment, project, list, archive, unarchive.",
+        error.MissingProjectSubcommand => "project needs a subcommand: content, archive, unarchive.",
         error.MissingProjectName => "`lcc project content` needs a project name, e.g. `lcc project content v2.6.0 --get`.",
         error.ConflictingContentAction => "`lcc project content` takes --get or --set-file, not both.",
         error.MissingListState => "`lcc issue list` needs --state <name>, e.g. `lcc issue list --state Done --team PE`.",
-        error.MissingDeleteTargets => "`lcc issue delete` needs at least one issue, e.g. `lcc issue delete PE-42 --yes`.",
+        error.MissingArchiveTargets => "`lcc issue archive` needs at least one issue, e.g. `lcc issue archive PE-42`.",
         error.MissingProjectAction => "`lcc issue project` needs --assign <vX.Y.Z> or --resolve.",
         error.ConflictingProjectAction => "`lcc issue project` takes --assign or --resolve, not both.",
         error.MissingIssueIdentifier => "issue needs an identifier, e.g. `lcc issue show PE-42`.",
