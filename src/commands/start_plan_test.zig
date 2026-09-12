@@ -199,7 +199,7 @@ test "the planning model rides the sessions that are there to plan, and no other
 
 test "a plan-mode session gets its own opening prompt, and a carried plan never does" {
     const planning = "/plan {identifier}";
-    const pipeline = "/linear-pfx-plugin:start-task {identifier} {plan}";
+    const pipeline = "/lwp:start-task {identifier} {plan}";
 
     const opens_planning = start.openingTemplate(planning, pipeline, true);
     if (!std.mem.eql(u8, opens_planning, planning)) {
@@ -242,7 +242,7 @@ test "a plan-mode session gets its own opening prompt, and a carried plan never 
 
 test "the hand-back is composed only when there is a model to hand back to" {
     const gpa = std.testing.allocator;
-    const command = "/linear-pfx-plugin:start-task PE-250";
+    const command = "/lwp:start-task PE-250";
 
     const full = try start.postPlanInput(gpa, "opus[1m]", command);
     defer if (full) |v| gpa.free(v);

@@ -414,7 +414,7 @@ test "leaving plan mode hands the session back, once and only once" {
     var scratch = try ring.Ring.init(gpa, 64);
     defer scratch.deinit(gpa);
     var s = stubSession(&scratch);
-    const handback = "/model opus[1m]\r/linear-pfx-plugin:start-task PE-250\r";
+    const handback = "/model opus[1m]\r/lwp:start-task PE-250\r";
     s.post_plan_input = handback;
 
     _ = s.note(.active, "plan", 1001);
