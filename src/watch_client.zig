@@ -135,6 +135,7 @@ pub const Handoff = struct {
     program: []const u8,
     argv: []const []const u8,
     size: ?term.Size = null,
+    post_plan_input: ?[]const u8 = null,
 };
 
 pub const unmeasured_size: term.Size = .{ .rows = 40, .cols = 120 };
@@ -159,6 +160,7 @@ pub fn startSession(app: app_mod.App, handoff: Handoff) Error!Started {
         .env = try environSlice(app),
         .cols = size.cols,
         .rows = size.rows,
+        .post_plan_input = handoff.post_plan_input,
     });
 
     const frame = try conn.recv();
