@@ -1118,6 +1118,11 @@ const ArchivedEntry = struct {
 
 fn resolveTarget(app: app_mod.App, opts: Opts, token: oauth.Token, named: []const u8) ArchivedEntry {
     const trimmed = std.mem.trim(u8, named, " \t");
+    if (linear.looksLikeUuid(trimmed)) return .{
+        .id = trimmed,
+        .identifier = null,
+        .changed = false,
+    };
     const ref = linear.refFromBranch(trimmed) orelse return .{
         .id = trimmed,
         .identifier = null,

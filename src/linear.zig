@@ -902,6 +902,17 @@ pub const Ref = struct {
 
 const max_team_key = 8;
 
+pub fn looksLikeUuid(text: []const u8) bool {
+    if (text.len != 36) return false;
+    for (text, 0..) |c, i| {
+        const dash = i == 8 or i == 13 or i == 18 or i == 23;
+        if (dash) {
+            if (c != '-') return false;
+        } else if (!std.ascii.isHex(c)) return false;
+    }
+    return true;
+}
+
 pub fn refFromBranch(branch: []const u8) ?Ref {
     var i: usize = 0;
     while (i < branch.len) {
@@ -1625,6 +1636,16 @@ test "unwrap reads a 200 that carries errors as a failure, in Linear's own words
 
     try std.testing.expectError(Error.GraphQLFailed, unwrap(Viewer, arena, "<html>502 Bad Gateway</html>"));
     try std.testing.expect(std.mem.indexOf(u8, last_message, "502") != null);
+}
+
+test "a uuid is an id, not an identifier that happens to read like one" {
+    try std.testing.expect(looksLikeUuid("054874e3-25a6-465a-aadd-4a7749997e4c"));
+    try std.testing.expect(refFromBranch("054874e3-25a6-465a-aadd-4a7749997e4c") != null);
+
+    try std.testing.expect(!looksLikeUuid("PE-231"));
+    try std.testing.expect(!looksLikeUuid("054874e3-25a6-465a-aadd-4a7749997e4"));
+    try std.testing.expect(!looksLikeUuid("054874e3_25a6_465a_aadd_4a7749997e4c"));
+    try std.testing.expect(!looksLikeUuid("054874e3-25a6-465a-aadd-4a7749997e4z"));
 }
 
 test "refFromBranch finds the issue key wherever it sits" {
