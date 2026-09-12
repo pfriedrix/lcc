@@ -9,13 +9,15 @@ const oauth = @import("../oauth.zig");
 const release = @import("../release.zig");
 const semver = @import("../semver.zig");
 
-pub const Verb = enum { show, state, comment, project };
+pub const Verb = enum { show, state, comment, project, list, delete };
 
 pub fn resolveVerb(raw: []const u8) ?Verb {
     if (std.ascii.eqlIgnoreCase(raw, "show")) return .show;
     if (std.ascii.eqlIgnoreCase(raw, "state")) return .state;
     if (std.ascii.eqlIgnoreCase(raw, "comment")) return .comment;
     if (std.ascii.eqlIgnoreCase(raw, "project")) return .project;
+    if (std.ascii.eqlIgnoreCase(raw, "list")) return .list;
+    if (std.ascii.eqlIgnoreCase(raw, "delete")) return .delete;
     return null;
 }
 
@@ -24,6 +26,8 @@ pub const Sub = union(enum) {
     state: SetState,
     comment: AddComment,
     project: SetProject,
+    list: ListIssues,
+    delete: DeleteIssues,
 
     pub const Show = struct {};
 
@@ -45,23 +49,43 @@ pub const Sub = union(enum) {
         force: bool = false,
     };
 
+    pub const ListIssues = struct {
+        state: ?[]const u8 = null,
+        project: ?[]const u8 = null,
+        team: ?[]const u8 = null,
+        deleted_only: bool = false,
+    };
+
+    pub const DeleteIssues = struct {
+        yes: bool = false,
+    };
+
     pub fn empty(verb: Verb) Sub {
         return switch (verb) {
             .show => .{ .show = .{} },
             .state => .{ .state = .{} },
             .comment => .{ .comment = .{} },
             .project => .{ .project = .{} },
+            .list => .{ .list = .{} },
+            .delete => .{ .delete = .{} },
         };
     }
 };
 
 pub const Opts = struct {
     issue: ?[]const u8 = null,
+    issues: []const []const u8 = &.{},
     json: bool = false,
     sub: Sub = .{ .show = .{} },
 };
 
 pub fn run(app: app_mod.App, opts: Opts) !void {
+    switch (opts.sub) {
+        .list => |sub| return list(app, opts, sub, try authorize(app, opts)),
+        .delete => |sub| return delete(app, opts, sub, try authorize(app, opts)),
+        else => {},
+    }
+
     const raw = opts.issue orelse bail(app, opts.json, "usage", "issue needs an identifier, e.g. `lcc issue show PE-42`.", .{});
     const trimmed = std.mem.trim(u8, raw, " \t");
     const ref = linear.refFromBranch(trimmed) orelse bail(
@@ -79,6 +103,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         .state => |sub| return setState(app, opts, sub, token, ref, trimmed),
         .comment => |sub| return comment(app, opts, sub, token, ref, trimmed),
         .project => |sub| return project(app, opts, sub, token, ref, trimmed),
+        .list, .delete => unreachable,
     }
 }
 
@@ -950,6 +975,221 @@ fn renderShow(app: app_mod.App, value: ShowReport) void {
     }
     app.ui.info("  Branch    {s}", .{value.issue.branch_name});
     app.ui.info("  {s}", .{value.issue.url});
+    app.ui.flush();
+}
+
+const ListedReport = struct {
+    team: []const u8,
+    state: []const u8,
+    count: usize,
+    issues: []const ListedEntry,
+};
+
+const ListedEntry = struct {
+    id: []const u8,
+    identifier: []const u8,
+    title: []const u8,
+    url: []const u8,
+    state: []const u8,
+    completed_at: ?[]const u8,
+    deleted: bool,
+    project: ?ProjectEntry,
+    links: []const LinkEntry,
+};
+
+const ProjectEntry = struct {
+    id: []const u8,
+    name: []const u8,
+};
+
+const LinkEntry = struct {
+    url: []const u8,
+    title: []const u8,
+};
+
+fn teamFromBranch(app: app_mod.App) ?[]const u8 {
+    const repo = app.repo() catch return null;
+    const branch = (repo.currentBranch() catch return null) orelse return null;
+    const ref = linear.refFromBranch(branch) orelse return null;
+    return ref.team;
+}
+
+fn list(app: app_mod.App, opts: Opts, sub: Sub.ListIssues, token: oauth.Token) !void {
+    const state_name = sub.state orelse bail(
+        app,
+        opts.json,
+        "usage",
+        "issue list needs a state: lcc issue list --state \"Done\" --team PE",
+        .{},
+    );
+    const team = sub.team orelse teamFromBranch(app) orelse bail(
+        app,
+        opts.json,
+        "team_unknown",
+        "Nothing names a team here. Pass --team, or run this from a branch carrying an issue key.",
+        .{},
+    );
+
+    if (!opts.json) {
+        app.ui.step("Fetching {s} issues in {s}...", .{ state_name, team });
+        app.ui.flush();
+    }
+
+    const found = linear.fetchIssuesByState(
+        app.gpa,
+        app.io,
+        token,
+        team,
+        state_name,
+        sub.deleted_only,
+    ) catch |err| bail(
+        app,
+        opts.json,
+        "linear_failed",
+        "Linear request failed ({s}, HTTP {d}): {s}",
+        .{ @errorName(err), linear.last_status, linear.last_message },
+    );
+
+    var kept: std.ArrayList(ListedEntry) = .empty;
+    for (found) |issue| {
+        if (sub.deleted_only != issue.archived) continue;
+        if (sub.project) |wanted| {
+            const proj = issue.project orelse continue;
+            if (!std.mem.eql(u8, proj.name, wanted)) continue;
+        }
+
+        const links = try app.gpa.alloc(LinkEntry, issue.links.len);
+        for (issue.links, 0..) |link, i| links[i] = .{ .url = link.url, .title = link.title };
+
+        try kept.append(app.gpa, .{
+            .id = issue.id,
+            .identifier = issue.identifier,
+            .title = issue.title,
+            .url = issue.url,
+            .state = issue.state_name,
+            .completed_at = issue.completed_at,
+            .deleted = issue.archived,
+            .project = if (issue.project) |proj| .{ .id = proj.id, .name = proj.name } else null,
+            .links = links,
+        });
+    }
+
+    const value: ListedReport = .{
+        .team = team,
+        .state = state_name,
+        .count = kept.items.len,
+        .issues = kept.items,
+    };
+
+    if (opts.json) {
+        const body = try std.json.Stringify.valueAlloc(app.gpa, value, .{ .whitespace = .indent_2 });
+        app.ui.payload("{s}\n", .{body});
+        app.ui.flush();
+        return;
+    }
+
+    if (value.count == 0) {
+        app.ui.info("No {s} issues in {s}.", .{ state_name, team });
+        app.ui.flush();
+        return;
+    }
+    for (value.issues) |issue| {
+        const where = if (issue.project) |proj| proj.name else "—";
+        app.ui.info("{s}  {s}  [{s}]", .{ issue.identifier, issue.title, where });
+    }
+    app.ui.success("{d} {s} issue(s) in {s}.", .{ value.count, state_name, team });
+    app.ui.flush();
+}
+
+const DeletedReport = struct {
+    requested: usize,
+    deleted: usize,
+    issues: []const DeletedEntry,
+};
+
+const DeletedEntry = struct {
+    id: []const u8,
+    identifier: ?[]const u8,
+    deleted: bool,
+};
+
+fn resolveDeletable(app: app_mod.App, opts: Opts, token: oauth.Token, named: []const u8) DeletedEntry {
+    const trimmed = std.mem.trim(u8, named, " \t");
+    const ref = linear.refFromBranch(trimmed) orelse return .{
+        .id = trimmed,
+        .identifier = null,
+        .deleted = false,
+    };
+
+    const found = linear.fetchIssue(app.gpa, app.io, token, ref) catch |err| bail(
+        app,
+        opts.json,
+        "linear_failed",
+        "Linear request failed ({s}, HTTP {d}): {s}",
+        .{ @errorName(err), linear.last_status, linear.last_message },
+    );
+    const issue = found orelse bail(app, opts.json, "issue_not_found", "No issue {s} in Linear.", .{trimmed});
+    return .{ .id = issue.id, .identifier = issue.identifier, .deleted = false };
+}
+
+fn delete(app: app_mod.App, opts: Opts, sub: Sub.DeleteIssues, token: oauth.Token) !void {
+    if (opts.issues.len == 0) bail(
+        app,
+        opts.json,
+        "usage",
+        "issue delete needs at least one issue: lcc issue delete PE-42 --yes",
+        .{},
+    );
+    if (!sub.yes) bail(
+        app,
+        opts.json,
+        "not_confirmed",
+        "Deleting {d} issue(s) is not reversible after 30 days. Pass --yes to go ahead.",
+        .{opts.issues.len},
+    );
+
+    const targets = try app.gpa.alloc(DeletedEntry, opts.issues.len);
+    for (opts.issues, 0..) |named, i| targets[i] = resolveDeletable(app, opts, token, named);
+
+    const ids = try app.gpa.alloc([]const u8, targets.len);
+    for (targets, 0..) |target, i| ids[i] = target.id;
+
+    if (!opts.json) {
+        app.ui.step("Deleting {d} issue(s)...", .{ids.len});
+        app.ui.flush();
+    }
+
+    const outcomes = linear.deleteIssues(app.gpa, app.io, token, ids) catch |err| bail(
+        app,
+        opts.json,
+        "linear_failed",
+        "Linear refused the delete ({s}, HTTP {d}): {s}",
+        .{ @errorName(err), linear.last_status, linear.last_message },
+    );
+
+    var deleted: usize = 0;
+    for (outcomes, 0..) |outcome, i| {
+        targets[i].deleted = outcome.success;
+        if (outcome.success) deleted += 1;
+    }
+
+    const value: DeletedReport = .{
+        .requested = targets.len,
+        .deleted = deleted,
+        .issues = targets,
+    };
+
+    if (opts.json) {
+        const body = try std.json.Stringify.valueAlloc(app.gpa, value, .{ .whitespace = .indent_2 });
+        app.ui.payload("{s}\n", .{body});
+        app.ui.flush();
+        return;
+    }
+    for (value.issues) |issue| {
+        if (issue.deleted) continue;
+        app.ui.warn("{s} was not deleted.", .{issue.identifier orelse issue.id});
+    }
+    app.ui.success("Deleted {d} of {d} issue(s). Linear keeps them restorable for 30 days.", .{ value.deleted, value.requested });
     app.ui.flush();
 }
 

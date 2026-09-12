@@ -982,6 +982,304 @@ pub fn statusForBranch(statuses: []const IssueStatus, branch: []const u8) ?Issue
     return null;
 }
 
+const issues_by_state_query =
+    \\query LccIssuesByState($team: String!, $state: String!, $after: String, $archived: Boolean!, $limit: Int!, $links: Int!) {
+    \\  issues(
+    \\    filter: { team: { key: { eq: $team } }, state: { name: { eq: $state } } }
+    \\    first: $limit
+    \\    after: $after
+    \\    includeArchived: $archived
+    \\  ) {
+    \\    nodes {
+    \\      id
+    \\      identifier
+    \\      title
+    \\      url
+    \\      completedAt
+    \\      archivedAt
+    \\      state { name type }
+    \\      project { id name }
+    \\      attachments(first: $links) { nodes { url title } }
+    \\    }
+    \\    pageInfo { hasNextPage endCursor }
+    \\  }
+    \\}
+;
+
+const issues_page_size = 100;
+
+const max_links_per_issue = 5;
+
+pub const IssueLink = struct {
+    url: []const u8,
+    title: []const u8,
+};
+
+pub const ProjectRef = struct {
+    id: []const u8,
+    name: []const u8,
+};
+
+pub const ListedIssue = struct {
+    id: []const u8,
+    identifier: []const u8,
+    title: []const u8,
+    url: []const u8,
+    completed_at: ?[]const u8,
+    archived: bool,
+    state_name: []const u8,
+    state_type: []const u8,
+    project: ?ProjectRef,
+    links: []const IssueLink,
+};
+
+const RawAttachment = struct {
+    url: []const u8,
+    title: ?[]const u8 = null,
+};
+
+const AttachmentConnection = struct { nodes: []RawAttachment };
+
+const RawProjectRef = struct {
+    id: []const u8,
+    name: []const u8,
+};
+
+const RawListedIssue = struct {
+    id: []const u8,
+    identifier: []const u8,
+    title: []const u8,
+    url: []const u8,
+    completedAt: ?[]const u8 = null,
+    archivedAt: ?[]const u8 = null,
+    state: ?State = null,
+    project: ?RawProjectRef = null,
+    attachments: ?AttachmentConnection = null,
+};
+
+const ListedIssueConnection = struct {
+    nodes: []RawListedIssue,
+    pageInfo: PageInfo,
+};
+
+const ListedIssuesData = struct { issues: ListedIssueConnection };
+
+fn linksFromRaw(gpa: std.mem.Allocator, raw: ?AttachmentConnection) ![]IssueLink {
+    const nodes = if (raw) |conn| conn.nodes else return &[_]IssueLink{};
+    const out = try gpa.alloc(IssueLink, nodes.len);
+    for (nodes, 0..) |node, i| {
+        out[i] = .{
+            .url = node.url,
+            .title = std.mem.trim(u8, node.title orelse "", " \t"),
+        };
+    }
+    return out;
+}
+
+fn listedFromRaw(gpa: std.mem.Allocator, raw: RawListedIssue) !ListedIssue {
+    return .{
+        .id = raw.id,
+        .identifier = raw.identifier,
+        .title = std.mem.trim(u8, raw.title, " \t"),
+        .url = raw.url,
+        .completed_at = raw.completedAt,
+        .archived = raw.archivedAt != null,
+        .state_name = if (raw.state) |st| std.mem.trim(u8, st.name, " \t") else "",
+        .state_type = if (raw.state) |st| st.type else "unknown",
+        .project = if (raw.project) |proj| .{
+            .id = proj.id,
+            .name = std.mem.trim(u8, proj.name, " \t"),
+        } else null,
+        .links = try linksFromRaw(gpa, raw.attachments),
+    };
+}
+
+pub fn fetchIssuesByState(
+    gpa: std.mem.Allocator,
+    io: Io,
+    token: oauth.Token,
+    team_key: []const u8,
+    state_name: []const u8,
+    include_archived: bool,
+) Error![]ListedIssue {
+    var found: std.ArrayList(ListedIssue) = .empty;
+    var cursor: ?[]const u8 = null;
+    var page: usize = 0;
+
+    while (page < max_pages) : (page += 1) {
+        const data = try query(ListedIssuesData, gpa, io, token, issues_by_state_query, .{
+            .team = team_key,
+            .state = state_name,
+            .after = cursor,
+            .archived = include_archived,
+            .limit = issues_page_size,
+            .links = max_links_per_issue,
+        });
+
+        for (data.issues.nodes) |node| {
+            try found.append(gpa, try listedFromRaw(gpa, node));
+        }
+
+        if (!data.issues.pageInfo.hasNextPage) break;
+        cursor = data.issues.pageInfo.endCursor orelse break;
+    }
+
+    return found.toOwnedSlice(gpa);
+}
+
+const delete_batch_size = 50;
+
+pub const DeleteOutcome = struct {
+    id: []const u8,
+    success: bool,
+};
+
+fn deleteMutationText(gpa: std.mem.Allocator, count: usize) ![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(gpa, "mutation LccDeleteIssues(");
+    for (0..count) |i| {
+        if (i > 0) try text.appendSlice(gpa, ", ");
+        try text.print(gpa, "$i{d}: String!", .{i});
+    }
+    try text.appendSlice(gpa, ") {\n");
+    for (0..count) |i| {
+        try text.print(gpa, "  d{d}: issueDelete(id: $i{d}) {{ success }}\n", .{ i, i });
+    }
+    try text.appendSlice(gpa, "}");
+    return text.toOwnedSlice(gpa);
+}
+
+fn deleteBatchBody(gpa: std.mem.Allocator, ids: []const []const u8) ![]u8 {
+    const text = try deleteMutationText(gpa, ids.len);
+
+    var variables: std.json.ObjectMap = .empty;
+    for (ids, 0..) |id, i| {
+        const key = try std.fmt.allocPrint(gpa, "i{d}", .{i});
+        try variables.put(gpa, key, .{ .string = id });
+    }
+
+    var root: std.json.ObjectMap = .empty;
+    try root.put(gpa, "query", .{ .string = text });
+    try root.put(gpa, "variables", .{ .object = variables });
+
+    return std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = root }, .{}) catch Error.HttpFailed;
+}
+
+fn readDeleteBatch(gpa: std.mem.Allocator, raw: []const u8, ids: []const []const u8, out: []DeleteOutcome) Error!void {
+    const data = try unwrap(std.json.Value, gpa, raw);
+    if (data != .object) {
+        last_message = "Linear returned no result for the delete batch";
+        return Error.GraphQLFailed;
+    }
+    for (ids, 0..) |id, i| {
+        const key = std.fmt.allocPrint(gpa, "d{d}", .{i}) catch return Error.GraphQLFailed;
+        const entry = data.object.get(key);
+        const ok = blk: {
+            const node = entry orelse break :blk false;
+            if (node != .object) break :blk false;
+            const flag = node.object.get("success") orelse break :blk false;
+            break :blk flag == .bool and flag.bool;
+        };
+        out[i] = .{ .id = id, .success = ok };
+    }
+}
+
+pub fn deleteIssues(
+    gpa: std.mem.Allocator,
+    io: Io,
+    token: oauth.Token,
+    ids: []const []const u8,
+) Error![]DeleteOutcome {
+    const out = try gpa.alloc(DeleteOutcome, ids.len);
+    var start: usize = 0;
+    while (start < ids.len) {
+        const end = @min(start + delete_batch_size, ids.len);
+        const batch = ids[start..end];
+        const raw = try post(gpa, io, token, try deleteBatchBody(gpa, batch));
+        try readDeleteBatch(gpa, raw, batch, out[start..end]);
+        start = end;
+    }
+    return out;
+}
+
+const project_page_query =
+    \\query LccProjectPage($team: String!, $name: String!, $limit: Int!) {
+    \\  projects(
+    \\    filter: {
+    \\      name: { eq: $name }
+    \\      accessibleTeams: { some: { key: { eq: $team } } }
+    \\    }
+    \\    first: $limit
+    \\  ) { nodes { id name content } }
+    \\}
+;
+
+const set_project_content_mutation =
+    \\mutation LccSetProjectContent($id: String!, $content: String!) {
+    \\  payload: projectUpdate(id: $id, input: { content: $content }) {
+    \\    success
+    \\    entity: project { id name content }
+    \\  }
+    \\}
+;
+
+const max_named_projects = 5;
+
+pub const ProjectPage = struct {
+    id: []const u8,
+    name: []const u8,
+    content: []const u8,
+};
+
+const RawProjectPage = struct {
+    id: []const u8,
+    name: []const u8,
+    content: ?[]const u8 = null,
+};
+
+const ProjectPageData = struct { projects: struct { nodes: []RawProjectPage } };
+
+fn pageFromRaw(raw: RawProjectPage) ProjectPage {
+    return .{
+        .id = raw.id,
+        .name = std.mem.trim(u8, raw.name, " \t"),
+        .content = raw.content orelse "",
+    };
+}
+
+pub fn fetchProjectPage(
+    gpa: std.mem.Allocator,
+    io: Io,
+    token: oauth.Token,
+    team_key: []const u8,
+    name: []const u8,
+) Error!?ProjectPage {
+    const data = try query(ProjectPageData, gpa, io, token, project_page_query, .{
+        .team = team_key,
+        .name = name,
+        .limit = max_named_projects,
+    });
+    for (data.projects.nodes) |node| {
+        if (std.mem.eql(u8, std.mem.trim(u8, node.name, " \t"), name)) return pageFromRaw(node);
+    }
+    if (data.projects.nodes.len == 0) return null;
+    return pageFromRaw(data.projects.nodes[0]);
+}
+
+pub fn setProjectContent(
+    gpa: std.mem.Allocator,
+    io: Io,
+    token: oauth.Token,
+    project_id: []const u8,
+    content: []const u8,
+) Error!ProjectPage {
+    const raw = try mutate(RawProjectPage, gpa, io, token, set_project_content_mutation, .{
+        .id = project_id,
+        .content = content,
+    });
+    return pageFromRaw(raw);
+}
+
 test "a read with no variables sends an object, because an array is refused" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1050,6 +1348,7 @@ test "every mutation carries the aliases its reader needs and names its input fi
         set_state_mutation,
         set_project_mutation,
         create_project_mutation,
+        set_project_content_mutation,
     }) |text| {
         try std.testing.expect(std.mem.indexOf(u8, text, "payload:") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "entity:") != null);
@@ -1069,6 +1368,105 @@ test "every mutation carries the aliases its reader needs and names its input fi
     try std.testing.expect(std.mem.indexOf(u8, release_projects_query, "status { name type }") != null);
 
     try std.testing.expect(std.mem.indexOf(u8, create_project_mutation, "teamIds: [$team]") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, issues_by_state_query, "first: $limit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, issues_by_state_query, "attachments(first: $links)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, issues_by_state_query, "includeArchived: $archived") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_page_query, "first: $limit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set_project_content_mutation, "content: $content") != null);
+}
+
+test "a delete batch names every issue as a variable, so an id cannot be read as query text" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ids = [_][]const u8{ "uuid-a", "he said \"go\"" };
+    const body = try deleteBatchBody(arena, &ids);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "$i0: String!") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "$i1: String!") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "d0: issueDelete(id: $i0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "d1: issueDelete(id: $i1)") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"i0\":\"uuid-a\"") != null);
+    if (std.mem.indexOf(u8, body, "issueDelete(id: \"") != null) {
+        return error.IdInterpolatedIntoTheQuery;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\\"go\\\"") != null);
+}
+
+test "a batch of two is one request, and fifty-one is two" {
+    try std.testing.expectEqual(@as(usize, 50), delete_batch_size);
+
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const text = try deleteMutationText(arena, delete_batch_size);
+    var aliases: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, text, i, ": issueDelete(")) |hit| : (i = hit + 1) aliases += 1;
+    try std.testing.expectEqual(delete_batch_size, aliases);
+}
+
+test "an alias Linear answered for is the only one reported deleted" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ids = [_][]const u8{ "a", "b", "c" };
+    var out: [3]DeleteOutcome = undefined;
+
+    const raw =
+        \\{"data": {"d0": {"success": true}, "d2": {"success": false}}}
+    ;
+    try readDeleteBatch(arena, raw, &ids, &out);
+
+    try std.testing.expect(out[0].success);
+    try std.testing.expect(!out[1].success);
+    try std.testing.expect(!out[2].success);
+    try std.testing.expectEqualStrings("b", out[1].id);
+}
+
+test "a project page with no body reads as empty, not as a missing project" {
+    const page = pageFromRaw(.{ .id = "p1", .name = "  v2.6.0 ", .content = null });
+    try std.testing.expectEqualStrings("v2.6.0", page.name);
+    try std.testing.expectEqualStrings("", page.content);
+
+    const written = pageFromRaw(.{ .id = "p1", .name = "v2.6.0", .content = "## Shipped" });
+    try std.testing.expectEqualStrings("## Shipped", written.content);
+}
+
+test "an issue is deleted when Linear dates it, which a state name never says" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const live = try listedFromRaw(arena, .{
+        .id = "i1",
+        .identifier = "PE-1",
+        .title = " Fix it ",
+        .url = "u",
+        .state = .{ .name = "Done", .type = "completed" },
+    });
+    try std.testing.expect(!live.archived);
+    try std.testing.expectEqualStrings("Fix it", live.title);
+    try std.testing.expect(live.project == null);
+    try std.testing.expectEqual(@as(usize, 0), live.links.len);
+
+    const gone = try listedFromRaw(arena, .{
+        .id = "i2",
+        .identifier = "PE-2",
+        .title = "Old",
+        .url = "u",
+        .archivedAt = "2026-09-01T00:00:00.000Z",
+        .state = .{ .name = "Done", .type = "completed" },
+        .attachments = .{ .nodes = @constCast(&[_]RawAttachment{.{ .url = "https://github.com/x/y/pull/7" }}) },
+    });
+    try std.testing.expect(gone.archived);
+    try std.testing.expectEqual(@as(usize, 1), gone.links.len);
+    try std.testing.expectEqualStrings("", gone.links[0].title);
 }
 
 test "states list in board order, which position alone does not give" {
