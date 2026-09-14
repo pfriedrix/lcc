@@ -11,11 +11,13 @@ const watch_attach = @import("../watch_attach.zig");
 const watch_hooks = @import("../watch_hooks.zig");
 const watch_state = @import("../watch_state.zig");
 const disk = @import("../disk.zig");
+const git = @import("../git.zig");
 const claude = @import("../claude.zig");
 const claude_projects = @import("../claude_projects.zig");
 const linear = @import("../linear.zig");
 const mcp = @import("../mcp.zig");
 const start_cmd = @import("start.zig");
+const watch_git = @import("../watch_git.zig");
 const watch_table = @import("../watch_table.zig");
 const wire = @import("../wire.zig");
 
@@ -37,6 +39,7 @@ pub const Row = struct {
     branch: []const u8,
     worktree: []const u8,
     status: []const u8,
+    doing: []const u8,
     pid: i32,
     started_at: i64,
     last_activity_at: i64,
@@ -75,10 +78,15 @@ fn snapshotOnce(app: app_mod.App, opts: Opts) !void {
     const now = app_mod.nowSeconds(app.io);
     const outdated = outdatedDaemon(app, app.gpa, exec.selfModified(app.gpa, app.io));
 
+    const states = watch_state.load(app.gpa, app.io, app.environ);
+
     if (live) |list| {
         const present = try onDisk(app.io, app.gpa, list);
         const rows = try app.gpa.alloc(Row, present.len);
-        for (present, 0..) |s, i| rows[i] = toRow(s, false);
+        for (present, 0..) |s, i| {
+            rows[i] = toRow(s, false);
+            rows[i].doing = doingAt(app, app.gpa, states, s.worktree);
+        }
         return emit(app, opts, rows, true, outdated, now);
     }
 
@@ -88,6 +96,7 @@ fn snapshotOnce(app: app_mod.App, opts: Opts) !void {
     for (resolved, 0..) |r, i| {
         var row = toRow(r.session, r.stale);
         row.status = @tagName(r.status);
+        row.doing = doingAt(app, app.gpa, states, r.session.worktree);
         rows[i] = row;
     }
     return emit(app, opts, rows, false, outdated, now);
@@ -133,6 +142,7 @@ fn toRow(s: sessions.Session, stale: bool) Row {
         .branch = s.branch,
         .worktree = s.worktree,
         .status = s.status,
+        .doing = "",
         .pid = s.pid,
         .started_at = s.started_at,
         .last_activity_at = s.last_activity_at,
@@ -223,6 +233,7 @@ fn dashboard(app: app_mod.App) !void {
     var offset: usize = 0;
     var notice_buf: [256]u8 = undefined;
     var notice: []const u8 = "";
+    var git_cache: watch_git.Cache = .{};
     const built = exec.selfModified(app.gpa, app.io);
 
     while (true) {
@@ -236,7 +247,7 @@ fn dashboard(app: app_mod.App) !void {
             last_cols = dims.cols;
         }
 
-        const rows = try collect(app, arena, now);
+        const rows = try collect(app, arena, now, &git_cache);
         if (rows.len > 0 and findRow(rows, cursor_id) == null) {
             cursor_id = copyId(&cursor_buf, rows[0].key);
         }
@@ -262,7 +273,7 @@ fn dashboard(app: app_mod.App) !void {
         const page = visibleRows(dims.rows, rows.len, lines);
         offset = window(offset, page, rows.len, indexOf(rows, cursor_id));
 
-        const widths = watch_table.fit(watch_table.measure(rows), dims.cols);
+        const widths = watch_table.fit(watch_table.measure(rows, now), dims.cols);
         if (rows.len == 0) {
             out.print("  {s}No sessions yet — press n to start one.{s}\n", .{
                 ui.palette().dim, ui.palette().reset,
@@ -330,7 +341,7 @@ fn dashboard(app: app_mod.App) !void {
                     'j' => cursor_id = copyId(&cursor_buf, step(rows, cursor_id, 1)),
                     'k' => cursor_id = copyId(&cursor_buf, step(rows, cursor_id, -1)),
                     'x' => confirming_kill = if (findRow(rows, cursor_id)) |row| row.attachable() else false,
-                    'r' => {},
+                    'r' => git_cache.invalidate(),
                     '1'...'9' => {
                         const index = key - '1';
                         if (index < rows.len) {
@@ -437,7 +448,12 @@ fn footer(
     return 1;
 }
 
-fn collect(app: app_mod.App, arena: std.mem.Allocator, now: i64) ![]watch_table.Row {
+fn collect(
+    app: app_mod.App,
+    arena: std.mem.Allocator,
+    now: i64,
+    git_cache: *watch_git.Cache,
+) ![]watch_table.Row {
     var scoped = app;
     scoped.gpa = arena;
 
@@ -467,6 +483,11 @@ fn collect(app: app_mod.App, arena: std.mem.Allocator, now: i64) ![]watch_table.
             const branch = choice.entry.branch orelse app_mod.shortHead(choice.entry.head);
             try rows.append(arena, rowAt(scoped, arena, &states, live, choice.entry.path, branch, stale));
         }
+        refreshGit(repo, arena, git_cache, rows.items, now);
+        for (rows.items) |*row| {
+            var buf: [64]u8 = undefined;
+            row.git = arena.dupe(u8, watch_git.cell(&buf, git_cache.get(row.worktree))) catch "";
+        }
     } else |_| {}
 
     for (live) |s| {
@@ -475,6 +496,33 @@ fn collect(app: app_mod.App, arena: std.mem.Allocator, now: i64) ![]watch_table.
     }
 
     return rows.toOwnedSlice(arena);
+}
+
+fn refreshGit(
+    repo: git.Repo,
+    arena: std.mem.Allocator,
+    cache: *watch_git.Cache,
+    rows: []const watch_table.Row,
+    now: i64,
+) void {
+    if (cache.dueForSync(now)) {
+        cache.synced(now);
+        if (repo.branchStatuses()) |statuses| {
+            for (rows) |row| {
+                for (statuses) |status| {
+                    if (!std.mem.eql(u8, status.branch, row.branch)) continue;
+                    cache.setSync(row.worktree, status);
+                    break;
+                }
+            }
+        } else |_| {}
+    }
+
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (rows) |row| paths.append(arena, row.worktree) catch return;
+
+    const due = cache.stalest(paths.items, now, watch_git.dirtyInterval(rows.len)) orelse return;
+    cache.note(due, repo.dirtyCount(due), now);
 }
 
 fn rowAt(
@@ -487,11 +535,24 @@ fn rowAt(
     stale: bool,
 ) watch_table.Row {
     const found = findSession(live, path);
-    const recovered: ?watch_state.Resolved = if (liveMatch(found) != null) null else recover: {
-        if (states.* == null) states.* = watch_state.load(arena, app.io, app.environ);
-        break :recover watch_state.statusFor(states.*.?, disk.realPath(arena, app.io, path));
-    };
-    return rowFor(arena, path, branch, found, recovered, stale);
+    if (states.* == null) states.* = watch_state.load(arena, app.io, app.environ);
+    const real = disk.realPath(arena, app.io, path);
+
+    const recovered: ?watch_state.Resolved = if (liveMatch(found) != null)
+        null
+    else
+        watch_state.statusFor(states.*.?, real);
+
+    return rowFor(arena, path, branch, found, recovered, watch_state.doingFor(states.*.?, real), stale);
+}
+
+fn doingAt(
+    app: app_mod.App,
+    arena: std.mem.Allocator,
+    states: []const watch_state.Record,
+    path: []const u8,
+) []const u8 {
+    return watch_state.doingFor(states, disk.realPath(arena, app.io, path));
 }
 
 pub fn rowFor(
@@ -500,6 +561,7 @@ pub fn rowFor(
     branch: []const u8,
     found: ?sessions.Session,
     recovered: ?watch_state.Resolved,
+    doing: []const u8,
     stale: bool,
 ) watch_table.Row {
     const match = liveMatch(found);
@@ -513,7 +575,14 @@ pub fn rowFor(
             break :issue issueOf(arena, branch);
         },
         .branch = branch,
+        .task = watch_table.taskFrom(arena, branch),
+        .doing = doing: {
+            if (doing.len > 0) break :doing doing;
+            if (recovered) |r| break :doing r.doing;
+            break :doing "";
+        },
         .worktree = path,
+        .status_at = if (match) |m| m.status_at else 0,
         .last_activity_at = activity: {
             if (match) |m| break :activity m.last_activity_at;
             if (recovered) |r| break :activity r.last_activity_at;
@@ -609,7 +678,7 @@ pub fn hook(app: app_mod.App, opts: HookOpts) !void {
     const payload = watch_hooks.parsePayload(app.gpa, raw) orelse return;
     if (payload.cwd.len == 0) return;
 
-    recordState(app, opts, payload, event);
+    recordState(app, opts, payload, event, watch_hooks.describe(app.gpa, raw));
 
     watch_client.report(
         app,
@@ -627,6 +696,7 @@ fn recordState(
     opts: HookOpts,
     payload: watch_hooks.Payload,
     event: []const u8,
+    doing: []const u8,
 ) void {
     const parsed = watch_hooks.Event.parse(event) orelse return;
     if (parsed == .ended) {
@@ -639,6 +709,7 @@ fn recordState(
         .claude_session = payload.session_id,
         .lcc_session = opts.session orelse "",
         .permission_mode = payload.permission_mode,
+        .doing = doing,
         .at = app_mod.nowSeconds(app.io),
     });
 }
@@ -677,7 +748,8 @@ test "a worktree the daemon lost still wears the status its hooks last reported"
         "/w/pe-290",
         "feature/pe-290-relocate-chat-thread-state",
         null,
-        .{ .status = .waiting, .last_activity_at = 1700 },
+        .{ .status = .waiting, .last_activity_at = 1700, .doing = "needs permission" },
+        "",
         false,
     );
 
@@ -714,7 +786,7 @@ test "a live session outranks anything left on disk for the same worktree" {
         .last_activity_at = 9000,
     };
 
-    const row = rowFor(arena, "/w/pe-290", "feature/pe-290", live, null, false);
+    const row = rowFor(arena, "/w/pe-290", "feature/pe-290", live, null, "Edit git.zig", false);
     try std.testing.expectEqual(sessions.Status.active, row.status.?);
     try std.testing.expectEqualStrings("s-00000004", row.session_id.?);
     try std.testing.expectEqual(@as(i64, 9000), row.last_activity_at);
@@ -783,6 +855,7 @@ test "a row left behind by a dead daemon does not outrank what the hooks reporte
         "feature/pe-290",
         leftover,
         .{ .status = .waiting, .last_activity_at = 1700 },
+        "",
         false,
     );
     try std.testing.expectEqual(sessions.Status.waiting, row.status.?);
@@ -819,7 +892,7 @@ test "a registry row that is only bookkeeping still dates the worktree and names
         .last_activity_at = 1200,
     };
 
-    const row = rowFor(arena, "/w/tidy", "chore/tidy-up", leftover, null, false);
+    const row = rowFor(arena, "/w/tidy", "chore/tidy-up", leftover, null, "", false);
 
     try std.testing.expect(row.status == null);
     try std.testing.expect(row.session_id == null);
@@ -901,7 +974,7 @@ test "a worktree with neither a session nor a report still reads as having none"
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const row = rowFor(arena, "/w/quiet", "feature/pe-9-unrelated", null, null, true);
+    const row = rowFor(arena, "/w/quiet", "feature/pe-9-unrelated", null, null, "", true);
     try std.testing.expect(row.status == null);
     try std.testing.expect(row.session_id == null);
     try std.testing.expectEqual(@as(i64, 0), row.last_activity_at);
@@ -948,6 +1021,9 @@ test "a worktree row shows the session that is alive, not the first one recorded
 test "the dashboard's frame stays inside the terminal, however many worktrees there are" {
     const cases = [_]struct { rows: u16, count: usize, spent: usize }{
         .{ .rows = 50, .count = 4, .spent = 0 },
+        .{ .rows = 6, .count = 1, .spent = 2 },
+        .{ .rows = 12, .count = 11, .spent = 2 },
+        .{ .rows = 40, .count = 32, .spent = 1 },
         .{ .rows = 50, .count = 4, .spent = 2 },
         .{ .rows = 10, .count = 40, .spent = 0 },
         .{ .rows = 10, .count = 40, .spent = 2 },
@@ -984,4 +1060,86 @@ test "the window follows the cursor and never runs off either end" {
     try std.testing.expectEqual(@as(usize, 15), window(0, 5, 20, 19));
     try std.testing.expectEqual(@as(usize, 3), window(8, 5, 20, 3));
     try std.testing.expectEqual(@as(usize, 15), window(18, 5, 20, 17));
+}
+
+test "a live session takes its status from the daemon and its activity from the hook record" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const live: sessions.Session = .{
+        .id = "s-00000004",
+        .worktree = "/w/pe-290",
+        .branch = "feature/pe-290-relocate-chat",
+        .issue = "PE-290",
+        .status = "active",
+        .status_at = 8800,
+        .last_activity_at = 9000,
+    };
+
+    const row = rowFor(arena, "/w/pe-290", live.branch, live, null, "Edit watch.zig", false);
+
+    try std.testing.expectEqual(sessions.Status.active, row.status.?);
+    try std.testing.expectEqual(@as(i64, 8800), row.status_at);
+    try std.testing.expectEqualStrings("s-00000004", row.session_id.?);
+    try std.testing.expect(row.attachable());
+
+    if (!std.mem.eql(u8, row.doing, "Edit watch.zig")) {
+        std.debug.print(
+            "the row came back doing \"{s}\": the hook record is consulted only for worktrees " ++
+                "the daemon lost, so DOING is blank for exactly the live sessions it is there " ++
+                "to describe.\n",
+            .{row.doing},
+        );
+        return error.TestExpectedEqual;
+    }
+    try std.testing.expectEqualStrings("Relocate chat", row.task);
+}
+
+test "a recovered row keeps the last thing its session was doing" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const row = rowFor(
+        arena,
+        "/w/pe-290",
+        "feature/pe-290-relocate-chat",
+        null,
+        .{ .status = .waiting, .last_activity_at = 1700, .doing = "needs permission" },
+        "",
+        false,
+    );
+
+    try std.testing.expectEqual(sessions.Status.waiting, row.status.?);
+    try std.testing.expect(!row.attachable());
+    try std.testing.expectEqualStrings("needs permission", row.doing);
+    try std.testing.expectEqual(@as(i64, 0), row.status_at);
+}
+
+test "the --json sessions say what the table says they are doing" {
+    const gpa = std.testing.allocator;
+
+    const body = try snapshotJson(gpa, &.{.{
+        .id = "s-1",
+        .issue = "PE-256",
+        .branch = "feature/pe-256",
+        .worktree = "/w",
+        .status = "waiting",
+        .doing = "needs permission",
+        .pid = 4242,
+        .started_at = 900,
+        .last_activity_at = 1000,
+        .exit_code = null,
+        .stale = false,
+    }}, true, false);
+    defer gpa.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"doing\": \"needs permission\"") != null);
+
+    const empty = try snapshotJson(gpa, &.{}, true, false);
+    defer gpa.free(empty);
+    try std.testing.expect(std.mem.indexOf(u8, empty, "\"sessions\": []") != null);
 }

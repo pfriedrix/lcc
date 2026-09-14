@@ -114,14 +114,57 @@ whatever is running in each. Enter opens one — attaching if a session is
 already there, starting one if not.
 
 ```
-  ISSUE   STATUS        BRANCH                              AGE
-❯ PE-256  ● waiting     feature/pe-256-app-hangs-on-launch  4s
-  PE-270  ◐ active      feature/pe-270-crash-in-mapview     12s
-  PE-301  ◈ plan        feature/pe-301-widget-refresh       31s
-  PE-9    · no session  feature/pe-9-unrelated              —
+  ISSUE   STATUS         TASK                 DOING               GIT
+❯ PE-256  ● waiting 15m  App hangs on launch  needs permission    3 dirty ↑2
+  PE-270  ◐ active now   Crash in mapview     Edit MapView.swift  clean
+  PE-301  ◈ plan 30m     Widget refresh       Bash swift test     clean ↑1
+  PE-9    · no session   Unrelated                                2 dirty
 
   ↑↓ move · enter opens · n new issue · x kill · q quit
 ```
+
+| Column | What it is |
+|---|---|
+| `ISSUE` | the issue the branch names, parsed out of the branch itself |
+| `STATUS` | what the session is doing, and how long it has been doing it |
+| `TASK` | the branch, read as a sentence: prefix dropped, issue dropped, dashes spaced |
+| `DOING` | the tool the agent last reached for, or what it is blocked on |
+| `GIT` | uncommitted files, and the drift from the upstream branch |
+
+The branch itself is not a column. `feature/pe-256-app-hangs-on-launch` spends
+most of its width on a prefix that never varies and an issue that is already in
+the first column, and the rest of it *is* the task name with dashes in it — so
+that is what `TASK` shows. Where the branch is the thing being named rather than
+a label for the work, it is still spelled in full: the confirmation `x` puts in
+front of killing a session names the branch, not the task.
+
+`AGE` is not a column either. It belongs against the status it measures, so it
+is part of it: `● waiting 15m` is a question that has been waiting a quarter of
+an hour, and `· no session` gets no number at all rather than a `—` in a column
+of its own.
+
+**`DOING` comes from the same hooks as the status**, not from reading Claude
+Code's screen — `Edit MapView.swift`, `Bash swift test`, `Grep pageSize`. A
+blocked session says what it is blocked on instead (`needs permission`, `asks a
+question`), which is the whole question a `● waiting` row raises. A session that
+has finished keeps the last thing it did, because "what did it get to" is worth
+more than a blank. The text is the agent's own, so it is stripped of anything
+that could move the cursor before it reaches the frame, and cut to fit.
+
+**`GIT` is measured one worktree per frame.** The dirty count is a `git status`
+per worktree and the dashboard redraws once a second, so re-reading every row
+every second would be a git process per worktree per tick. Instead each frame
+refreshes the row that has waited longest, and the drift (`↑2 ↓14`, `gone`)
+comes from one `for-each-ref` over every branch at once, every five seconds. A
+row therefore shows an answer up to a rotation old, and `r` asks for all of them
+again rather than waiting the rotation out. A worktree whose `.git` went missing
+reads `missing`, never `clean` — `clean` there would be the main checkout
+answering for it.
+
+Columns come off the right as the terminal narrows — first `WORKTREE`, then
+`GIT`, then `DOING`, then `ISSUE` — and `TASK` is cut before any of them goes,
+because the tail of a name is worth less than a fact. `STATUS` is never dropped.
+A column with nothing in it anywhere is not drawn at all.
 
 Shortcuts are key *positions*, not characters, so they work on any keyboard
 layout — on Ukrainian ЙЦУКЕН the key labelled `n` prints `т` and still means
@@ -604,7 +647,7 @@ Failures take the same shape as `lcc start --json` — JSON on stdout, the human
 
 Bare `lcc open` is the dashboard above; `lcc open claude` names that target explicitly and `lcc open xcode` picks the other one, case-insensitively.
 
-`--json` prints the sessions as a one-shot instead of drawing the dashboard, and `--stop-all` (with `--force` to kill rather than ask) ends every background session. Both are non-interactive, so both work from a script or a tool call, where the dashboard cannot. Neither means anything to `lcc open xcode`, which rejects them rather than ignoring them — and `--xcode` means nothing to `lcc open claude`, which rejects it the same way.
+`--json` prints the sessions as a one-shot instead of drawing the dashboard — carrying `doing`, the same activity the table's `DOING` column shows — and `--stop-all` (with `--force` to kill rather than ask) ends every background session. Both are non-interactive, so both work from a script or a tool call, where the dashboard cannot. Neither means anything to `lcc open xcode`, which rejects them rather than ignoring them — and `--xcode` means nothing to `lcc open claude`, which rejects it the same way.
 
 ### `lcc open xcode`
 
