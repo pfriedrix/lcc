@@ -17,6 +17,7 @@ pub const Record = struct {
     claude_session: []const u8 = "",
     lcc_session: []const u8 = "",
     permission_mode: []const u8 = "",
+    doing: []const u8 = "",
     at: i64 = 0,
 };
 
@@ -45,12 +46,21 @@ pub fn newestFor(records: []const Record, cwd: []const u8) ?Record {
 pub fn statusFor(records: []const Record, cwd: []const u8) ?Resolved {
     const record = newestFor(records, cwd) orelse return null;
     const status = recover(record) orelse return null;
-    return .{ .status = status, .last_activity_at = record.at };
+    return .{ .status = status, .last_activity_at = record.at, .doing = record.doing };
+}
+
+pub fn doingFor(records: []const Record, cwd: []const u8) []const u8 {
+    const record = newestFor(records, cwd) orelse return "";
+    if (watch_hooks.Event.parse(record.event)) |event| {
+        if (event == .ended) return "";
+    }
+    return record.doing;
 }
 
 pub const Resolved = struct {
     status: sessions.Status,
     last_activity_at: i64,
+    doing: []const u8 = "",
 };
 
 pub fn write(
@@ -64,8 +74,11 @@ pub fn write(
 
     var merged = record;
     merged.version = version;
-    if (merged.permission_mode.len == 0) {
-        if (readAt(gpa, io, file_path)) |previous| merged.permission_mode = previous.permission_mode;
+    if (merged.permission_mode.len == 0 or merged.doing.len == 0) {
+        if (readAt(gpa, io, file_path)) |previous| {
+            if (merged.permission_mode.len == 0) merged.permission_mode = previous.permission_mode;
+            if (merged.doing.len == 0) merged.doing = previous.doing;
+        }
     }
 
     const body = std.json.Stringify.valueAlloc(gpa, merged, .{ .whitespace = .indent_2 }) catch return;
@@ -422,4 +435,104 @@ test "nothing in the watch directory but a state file is read as one" {
     }
 
     try testing.expectEqual(@as(usize, 0), load(arena, io, &environ).len);
+}
+
+test "a turn that ends without naming a tool keeps what the session was last doing" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    var environ = try testEnviron(arena, base);
+
+    write(arena, io, &environ, .{
+        .event = "active",
+        .cwd = base,
+        .claude_session = "uuid-1",
+        .doing = "Bash swift test",
+        .at = 1000,
+    });
+    write(arena, io, &environ, .{
+        .event = "idle",
+        .cwd = base,
+        .claude_session = "uuid-1",
+        .at = 1010,
+    });
+
+    const records = load(arena, io, &environ);
+    try testing.expectEqual(@as(usize, 1), records.len);
+    if (records[0].doing.len == 0) {
+        std.debug.print(
+            "the activity was blanked by a Stop that reports no tool_name, which is every Stop " ++
+                "there is. The DOING column would then be empty for exactly the sessions that " ++
+                "finished a turn, so the last thing an agent did is unreadable the moment it " ++
+                "stops doing it.\n",
+            .{},
+        );
+        return error.TestExpectedEqual;
+    }
+    try testing.expectEqualStrings("Bash swift test", records[0].doing);
+    try testing.expectEqualStrings("Bash swift test", doingFor(records, base));
+}
+
+test "a tool that is reported replaces the one remembered, rather than sticking" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    var environ = try testEnviron(arena, base);
+
+    write(arena, io, &environ, .{
+        .event = "active",
+        .cwd = base,
+        .claude_session = "uuid-1",
+        .doing = "Read git.zig",
+        .at = 1000,
+    });
+    write(arena, io, &environ, .{
+        .event = "active",
+        .cwd = base,
+        .claude_session = "uuid-1",
+        .doing = "Edit watch.zig",
+        .at = 1010,
+    });
+
+    const records = load(arena, io, &environ);
+    try testing.expectEqual(@as(usize, 1), records.len);
+    try testing.expectEqualStrings("Edit watch.zig", records[0].doing);
+}
+
+test "a session that ended is doing nothing, whatever its last tool call was" {
+    const records = [_]Record{.{
+        .version = version,
+        .event = "ended",
+        .cwd = "/w",
+        .doing = "Bash swift test",
+        .at = 1000,
+    }};
+    try testing.expectEqualStrings("", doingFor(&records, "/w"));
+    try testing.expectEqualStrings("", doingFor(&records, "/elsewhere"));
+}
+
+test "a recovered row carries the activity alongside the status" {
+    const records = [_]Record{.{
+        .version = version,
+        .event = "waiting",
+        .cwd = "/w",
+        .doing = "needs permission",
+        .at = 1700,
+    }};
+    const resolved = statusFor(&records, "/w").?;
+    try testing.expectEqual(sessions.Status.waiting, resolved.status);
+    try testing.expectEqual(@as(i64, 1700), resolved.last_activity_at);
+    try testing.expectEqualStrings("needs permission", resolved.doing);
 }

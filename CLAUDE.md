@@ -311,6 +311,40 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   `app.gpa` and the dashboard grows a git spawn's output plus a parsed snapshot per frame in
   the process arena, which is never freed, until an overnight `lcc open` is measured in
   hundreds of megabytes.
+- **The dashboard's git facts cannot be recomputed per frame, and cannot live in the frame
+  arena either.** `collect` already pays three git spawns a second (`repo()` is two, `listWorktrees`
+  one), and `dirtyCount` is one spawn *per worktree* — so re-reading every row every tick is a git
+  process per worktree per second on a repo where `git status` is the slow call. `watch_git.Cache`
+  is the budget: one `for-each-ref` for every branch's drift at once every five seconds, and one
+  `git status` per frame for whichever row has waited longest, so the per-frame cost stays O(1)
+  however many worktrees there are. The cache is a fixed-capacity value owned by `dashboard`
+  precisely because `frame_arena` is reset every tick and `app.gpa` is the process arena that is
+  never freed — allocating its paths from either is how an overnight `lcc open` either loses the
+  cache every second or grows without bound. Rows from *another* repository are left blank rather
+  than `—`: there is no repo handle to measure them with, so "not yet" would be a promise nothing
+  will keep.
+- **`describe` parses the hook payload a second time on purpose.** Folding `tool_name` and
+  `tool_input` into `watch_hooks.Payload` compiles and reads tidier, and it makes the whole parse
+  fail on a `tool_input` shaped in a way lcc does not model — which takes `cwd` and
+  `permission_mode` down with it, so the session stops reporting its status at all and the
+  dashboard reads `no session` for a live agent. A separate parse that returns `""` on any error
+  cannot do that. The text it produces is the *agent's own*, and `term.truncate` counts codepoints
+  and strips nothing, so it is stripped of every byte below 0x20 before it can reach a raw-mode
+  frame: an escape in a Bash command moves the cursor, and `Screen.eraseFrame` then walks up over
+  lines it never wrote.
+- **`rowAt` reads the hook record for every row, and may take only one thing from it.** It used to
+  load `watch_state` solely for worktrees with no live session; `DOING` needs it for live ones too,
+  because the hook writes that file *before* it reports to the socket. The status and the session
+  id must still come from the live session — `liveMatch` is what keeps a dead daemon's row from
+  going `attachable`, and the recovered status is deliberately the *older* answer. Taking the
+  record's status "while we are in there" undoes both.
+- **A dropped column costs more than a cut name.** `fit` drops whole columns, and `TASK` is prose:
+  a branch slug like `feature/pe-338-keep-error-observation-alive-after-the-main-sheet-is` measures
+  over fifty columns, so dropping before shrinking took `GIT` and `DOING` off an 80-column terminal
+  to spell out a name whose first twenty characters had already identified the row. `fit` therefore
+  drops `WORKTREE`, then shrinks `TASK` toward `task_floor`, and only then drops the fact columns —
+  and `measure` caps `TASK` and `DOING` outright, since neither is worth an unbounded share of the
+  row. `STATUS` is still never dropped.
 - **A session's hook settings file is per session, not per daemon.** `watch_paths.hooksFor`
   names it `hooks-<session id>.json` and `watch_hooks.settingsJson` bakes that id into every
   hook command line, so a report says which session it came from. Collapsing them back into

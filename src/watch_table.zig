@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const linear = @import("linear.zig");
 const sessions = @import("sessions.zig");
 const term = @import("term.zig");
 const ui = @import("ui.zig");
@@ -10,7 +11,11 @@ pub const Row = struct {
     status: ?sessions.Status,
     issue: ?[]const u8,
     branch: []const u8,
+    task: []const u8 = "",
+    doing: []const u8 = "",
+    git: []const u8 = "",
     worktree: []const u8,
+    status_at: i64 = 0,
     last_activity_at: i64,
     exit_code: ?i32,
     stale: bool,
@@ -49,8 +54,9 @@ fn paint(status: ?sessions.Status, palette: ui.Palette) []const u8 {
 pub const Widths = struct {
     issue: usize = 0,
     status: usize = 0,
-    branch: usize = 0,
-    age: usize = 0,
+    task: usize = 0,
+    doing: usize = 0,
+    git: usize = 0,
     worktree: usize = 0,
 
     pub fn total(self: Widths) usize {
@@ -68,42 +74,124 @@ pub const Widths = struct {
     }
 };
 
-const headers = .{ .issue = "ISSUE", .status = "STATUS", .branch = "BRANCH", .age = "AGE", .worktree = "WORKTREE" };
+const headers = .{
+    .issue = "ISSUE",
+    .status = "STATUS",
+    .task = "TASK",
+    .doing = "DOING",
+    .git = "GIT",
+    .worktree = "WORKTREE",
+};
 
-pub fn measure(rows: []const Row) Widths {
+pub const task_ceiling = 36;
+pub const doing_ceiling = 28;
+
+pub fn measure(rows: []const Row, now: i64) Widths {
     var w: Widths = .{
         .issue = headers.issue.len,
         .status = headers.status.len,
-        .branch = headers.branch.len,
-        .age = headers.age.len,
+        .task = headers.task.len,
         .worktree = headers.worktree.len,
     };
+    var buf: [status_limit]u8 = undefined;
     for (rows) |row| {
         w.issue = @max(w.issue, ui.displayWidth(row.issue orelse "—"));
-        w.status = @max(w.status, ui.displayWidth(statusText(row.status)) + 2);
-        w.branch = @max(w.branch, ui.displayWidth(row.branch));
+        w.status = @max(w.status, ui.displayWidth(statusCell(&buf, row, now)));
+        w.task = @max(w.task, ui.displayWidth(row.task));
+        w.doing = @max(w.doing, ui.displayWidth(row.doing));
+        w.git = @max(w.git, ui.displayWidth(row.git));
         w.worktree = @max(w.worktree, ui.displayWidth(row.worktree));
     }
+    w.task = @min(w.task, task_ceiling);
+    w.doing = @min(w.doing, doing_ceiling);
+    if (w.doing > 0) w.doing = @max(w.doing, headers.doing.len);
+    if (w.git > 0) w.git = @max(w.git, headers.git.len);
     return w;
 }
 
-pub const drop_order = [_][]const u8{ "worktree", "age", "issue" };
+pub const drop_order = [_][]const u8{ "worktree", "git", "doing", "issue" };
 
-const branch_floor = 12;
+const task_floor = 12;
 
 pub fn fit(widths: Widths, cols: usize) Widths {
     var out = widths;
     if (out.total() <= cols) return out;
 
-    inline for (drop_order) |name| {
+    out.worktree = 0;
+    shrinkTask(&out, cols);
+
+    inline for (drop_order[1..]) |name| {
         if (out.total() > cols) @field(out, name) = 0;
     }
 
-    if (out.total() > cols) {
-        const over = out.total() - cols;
-        out.branch = if (out.branch > over + branch_floor) out.branch - over else branch_floor;
-    }
+    shrinkTask(&out, cols);
     return out;
+}
+
+fn shrinkTask(out: *Widths, cols: usize) void {
+    if (out.total() <= cols) return;
+    const over = out.total() - cols;
+    out.task = if (out.task > over + task_floor) out.task - over else task_floor;
+}
+
+pub const status_limit = 64;
+
+pub fn statusCell(buf: []u8, row: Row, now: i64) []const u8 {
+    var w: Io.Writer = .fixed(buf);
+    w.print("{s} {s}", .{ glyph(row.status), statusText(row.status) }) catch
+        return statusText(row.status);
+    if (row.stale) w.writeAll("~") catch {};
+
+    const status = row.status orelse return w.buffered();
+    if (status == .exited) {
+        if (row.exit_code) |code| w.print(" {d}", .{code}) catch {};
+    }
+
+    const at = if (row.status_at > 0) row.status_at else row.last_activity_at;
+    if (at > 0) w.print(" {f}", .{ui.age(now - at)}) catch {};
+    return w.buffered();
+}
+
+pub fn taskFrom(gpa: std.mem.Allocator, branch: []const u8) []const u8 {
+    const leaf = if (std.mem.lastIndexOfScalar(u8, branch, '/')) |at| branch[at + 1 ..] else branch;
+    if (leaf.len == 0) return branch;
+    if (verbatim(leaf)) return leaf;
+
+    const body = withoutRef(leaf);
+    const text = if (body.len == 0) leaf else body;
+
+    const out = gpa.dupe(u8, text) catch return text;
+    for (out) |*byte| {
+        if (byte.* == '-' or byte.* == '_') byte.* = ' ';
+    }
+    out[0] = std.ascii.toUpper(out[0]);
+    return out;
+}
+
+fn verbatim(leaf: []const u8) bool {
+    if (std.mem.eql(u8, leaf, "master") or std.mem.eql(u8, leaf, "main")) return true;
+    if (leaf.len < 7) return false;
+    for (leaf) |byte| {
+        if (!std.ascii.isHex(byte)) return false;
+    }
+    return true;
+}
+
+fn withoutRef(leaf: []const u8) []const u8 {
+    const ref = linear.refFromBranch(leaf) orelse return leaf;
+
+    var end: usize = 0;
+    while (end < leaf.len and std.ascii.isAlphabetic(leaf[end])) end += 1;
+    if (end == 0 or end >= leaf.len or leaf[end] != '-') return leaf;
+    if (!std.ascii.eqlIgnoreCase(ref.team, leaf[0..end])) return leaf;
+
+    var digits = end + 1;
+    while (digits < leaf.len and std.ascii.isDigit(leaf[digits])) digits += 1;
+    if (digits == end + 1) return leaf;
+    if ((std.fmt.parseInt(u32, leaf[end + 1 .. digits], 10) catch return leaf) != ref.number) return leaf;
+
+    if (digits < leaf.len and (leaf[digits] == '-' or leaf[digits] == '_')) digits += 1;
+    return leaf[digits..];
 }
 
 pub fn tooNarrow(widths: Widths, cols: usize) bool {
@@ -125,28 +213,19 @@ pub fn render(
     writeRow(out, cols, "  ", p.dim, headerCells(widths), p.reset);
     lines += 1;
 
-    var age_buf: [16]u8 = undefined;
     for (rows) |row| {
         const selected = std.mem.eql(u8, row.key, cursor_id);
         const gutter = if (selected) "❯ " else "  ";
-        const age = if (row.last_activity_at == 0)
-            "—"
-        else
-            std.fmt.bufPrint(&age_buf, "{f}", .{ui.age(now - row.last_activity_at)}) catch "—";
 
-        var cells: [5]Cell = .{
+        var status_buf: [status_limit]u8 = undefined;
+        const cells: [6]Cell = .{
             .{ .text = row.issue orelse "—", .width = widths.issue, .colour = "" },
-            .{ .text = "", .width = widths.status, .colour = paint(row.status, p) },
-            .{ .text = row.branch, .width = widths.branch, .colour = if (selected) p.bold else "" },
-            .{ .text = age, .width = widths.age, .colour = p.dim },
+            .{ .text = statusCell(&status_buf, row, now), .width = widths.status, .colour = paint(row.status, p) },
+            .{ .text = row.task, .width = widths.task, .colour = if (selected) p.bold else "" },
+            .{ .text = row.doing, .width = widths.doing, .colour = p.dim },
+            .{ .text = row.git, .width = widths.git, .colour = p.dim },
             .{ .text = row.worktree, .width = widths.worktree, .colour = p.dim },
         };
-        var status_buf: [64]u8 = undefined;
-        cells[1].text = std.fmt.bufPrint(&status_buf, "{s} {s}{s}", .{
-            glyph(row.status),
-            statusText(row.status),
-            if (row.stale) "~" else "",
-        }) catch statusText(row.status);
 
         writeRow(out, cols, gutter, "", &cells, p.reset);
         lines += 1;
@@ -162,13 +241,14 @@ const Cell = struct { text: []const u8, width: usize, colour: []const u8 };
 
 fn headerCells(widths: Widths) []const Cell {
     const S = struct {
-        var cells: [5]Cell = undefined;
+        var cells: [6]Cell = undefined;
     };
     S.cells = .{
         .{ .text = headers.issue, .width = widths.issue, .colour = "" },
         .{ .text = headers.status, .width = widths.status, .colour = "" },
-        .{ .text = headers.branch, .width = widths.branch, .colour = "" },
-        .{ .text = headers.age, .width = widths.age, .colour = "" },
+        .{ .text = headers.task, .width = widths.task, .colour = "" },
+        .{ .text = headers.doing, .width = widths.doing, .colour = "" },
+        .{ .text = headers.git, .width = widths.git, .colour = "" },
         .{ .text = headers.worktree, .width = widths.worktree, .colour = "" },
     };
     return &S.cells;
@@ -214,7 +294,7 @@ fn renderNarrow(out: *Io.Writer, rows: []const Row, cols: usize, cursor_id: []co
         const gutter = if (std.mem.eql(u8, row.key, cursor_id)) "❯ " else "  ";
         const text = std.fmt.bufPrint(&buf, "{s} {s}", .{
             glyph(row.status),
-            row.issue orelse row.branch,
+            row.issue orelse row.task,
         }) catch continue;
         out.print("{s}{s}{s}{s}\n", .{
             gutter,
@@ -237,8 +317,12 @@ fn testRows() []const Row {
                 .session_id = "s-1",
                 .issue = "PE-256",
                 .branch = "feature/pe-256-app-hangs-on-launch",
+                .task = "App hangs on launch",
+                .doing = "Bash swift test",
+                .git = "3 dirty ↑2",
                 .worktree = "/r/.lcc/worktrees/pe-256",
                 .status = .waiting,
+                .status_at = 900,
                 .last_activity_at = 900,
                 .exit_code = null,
                 .stale = true,
@@ -248,8 +332,12 @@ fn testRows() []const Row {
                 .session_id = null,
                 .issue = null,
                 .branch = "feature/no-issue-here",
+                .task = "No issue here",
+                .doing = "",
+                .git = "clean",
                 .worktree = "/r/.lcc/worktrees/other",
                 .status = null,
+                .status_at = 0,
                 .last_activity_at = 600,
                 .exit_code = null,
                 .stale = false,
@@ -260,18 +348,52 @@ fn testRows() []const Row {
 }
 
 test "measure sizes every column to its widest cell, headers included" {
-    const w = measure(testRows());
-    try testing.expectEqual(ui.displayWidth("feature/pe-256-app-hangs-on-launch"), w.branch);
+    const w = measure(testRows(), 1000);
+    try testing.expectEqual(ui.displayWidth("App hangs on launch"), w.task);
     try testing.expectEqual(ui.displayWidth("PE-256"), w.issue);
-    try testing.expectEqual(ui.displayWidth("no session") + 2, w.status);
+    try testing.expectEqual(ui.displayWidth("Bash swift test"), w.doing);
+    try testing.expectEqual(ui.displayWidth("3 dirty ↑2"), w.git);
+    try testing.expect(w.status >= ui.displayWidth("· no session"));
 
-    try testing.expectEqual(@as(usize, "AGE".len), w.age);
-    const empty = measure(&.{});
-    try testing.expectEqual(@as(usize, "BRANCH".len), empty.branch);
+    const empty = measure(&.{}, 1000);
+    try testing.expectEqual(@as(usize, "TASK".len), empty.task);
+}
+
+test "a column with nothing in it is not drawn at all" {
+    const rows = [_]Row{.{
+        .key = "/w",
+        .session_id = null,
+        .status = null,
+        .issue = "PE-9",
+        .branch = "feature/pe-9-unrelated",
+        .task = "Unrelated",
+        .worktree = "/w",
+        .last_activity_at = 0,
+        .exit_code = null,
+        .stale = false,
+    }};
+
+    const w = measure(&rows, 1000);
+    if (w.doing != 0 or w.git != 0) {
+        std.debug.print(
+            "DOING measured {d} and GIT {d} with nothing to put in either: two headers and " ++
+                "four columns of separator are spent on empty cells, on exactly the narrow " ++
+                "terminal where that width is what pushes TASK below its floor.\n",
+            .{ w.doing, w.git },
+        );
+        return error.TestExpectedEqual;
+    }
+
+    var buf: [4096]u8 = undefined;
+    var out: Io.Writer = .fixed(&buf);
+    ui.setColor(false);
+    _ = render(&out, &rows, fit(w, 120), 120, "/w", 1000);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "DOING") == null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "GIT") == null);
 }
 
 test "fit drops columns in order and never drops the status" {
-    const full = measure(testRows());
+    const full = measure(testRows(), 1000);
     try testing.expect(full.total() > 60);
 
     try testing.expectEqual(full, fit(full, full.total()));
@@ -282,18 +404,23 @@ test "fit drops columns in order and never drops the status" {
 
     const narrower = fit(full, 40);
     try testing.expectEqual(@as(usize, 0), narrower.worktree);
-    try testing.expectEqual(@as(usize, 0), narrower.age);
+    try testing.expectEqual(@as(usize, 0), narrower.git);
+    try testing.expectEqual(@as(usize, 0), narrower.doing);
 
     for ([_]usize{ 120, 80, 60, 40, 20, 10 }) |cols| {
         try testing.expect(fit(full, cols).status > 0);
     }
 }
 
-test "the branch shrinks rather than the row wrapping" {
-    const full = measure(testRows());
-    const fitted = fit(full, 46);
-    try testing.expect(fitted.branch < full.branch);
-    try testing.expect(fitted.branch >= branch_floor);
+test "the task shrinks rather than the row wrapping" {
+    const full = measure(testRows(), 1000);
+
+    const fitted = fit(full, 30);
+    try testing.expect(fitted.task < full.task);
+    try testing.expect(fitted.task >= task_floor);
+
+    const squeezed = fit(full, 18);
+    try testing.expectEqual(@as(usize, task_floor), squeezed.task);
 }
 
 test "render returns exactly the number of lines it drew" {
@@ -302,7 +429,7 @@ test "render returns exactly the number of lines it drew" {
     ui.setColor(false);
 
     const rows = testRows();
-    const widths = fit(measure(rows), 120);
+    const widths = fit(measure(rows, 1000), 120);
     const lines = render(&w, rows, widths, 120, "/r/.lcc/worktrees/pe-256", 1000);
 
     const drawn = std.mem.count(u8, w.buffered(), "\n");
@@ -312,7 +439,7 @@ test "render returns exactly the number of lines it drew" {
 
 test "no rendered line is wider than the terminal, at any width" {
     const rows = testRows();
-    const full = measure(rows);
+    const full = measure(rows, 1000);
     ui.setColor(false);
 
     for ([_]usize{ 200, 120, 80, 60, 46, 30, 20, 10 }) |cols| {
@@ -344,6 +471,7 @@ test "a row is attachable only when something is actually behind it" {
         .status = .active,
         .issue = null,
         .branch = "b",
+        .task = "B",
         .worktree = "/w",
         .last_activity_at = 0,
         .exit_code = null,
@@ -372,6 +500,7 @@ test "a status recovered from disk is read, but never offered as a session to at
             .status = status,
             .issue = "PE-290",
             .branch = "feature/pe-290",
+            .task = "Pe 290",
             .worktree = "/w",
             .last_activity_at = 900,
             .exit_code = null,
@@ -403,12 +532,13 @@ test "a planning row says plan, not active" {
         .status = .plan,
         .issue = "PE-256",
         .branch = "feature/pe-256",
+        .task = "Pe 256",
         .worktree = "/w",
         .last_activity_at = 900,
         .exit_code = null,
         .stale = false,
     }};
-    _ = render(&w, &rows, fit(measure(&rows), 120), 120, "/w", 1000);
+    _ = render(&w, &rows, fit(measure(&rows, 1000), 120), 120, "/w", 1000);
 
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "◈ plan") != null);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "active") == null);
@@ -419,9 +549,9 @@ test "a worktree with nothing running shows no age, not one measured from the ep
     var w: Io.Writer = .fixed(&buf);
     ui.setColor(false);
     const rows = testRows();
-    _ = render(&w, rows, fit(measure(rows), 120), 120, rows[0].key, 1_800_000_000);
+    _ = render(&w, rows, fit(measure(rows, 1_800_000_000), 120), 120, rows[0].key, 1_800_000_000);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "56y") == null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "—") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "no session") != null);
 }
 
 test "a stale row is marked rather than silently believed" {
@@ -429,7 +559,7 @@ test "a stale row is marked rather than silently believed" {
     var w: Io.Writer = .fixed(&buf);
     ui.setColor(false);
     const rows = testRows();
-    _ = render(&w, rows, fit(measure(rows), 120), 120, "/r/.lcc/worktrees/pe-256", 1000);
+    _ = render(&w, rows, fit(measure(rows, 1000), 120), 120, "/r/.lcc/worktrees/pe-256", 1000);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "no session") != null);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "waiting~") != null);
 }
@@ -439,7 +569,7 @@ test "the selected row is the one whose id matches, not a row index" {
     var w: Io.Writer = .fixed(&buf);
     ui.setColor(false);
     const rows = testRows();
-    _ = render(&w, rows, fit(measure(rows), 120), 120, "/r/.lcc/worktrees/other", 1000);
+    _ = render(&w, rows, fit(measure(rows, 1000), 120), 120, "/r/.lcc/worktrees/other", 1000);
 
     var it = std.mem.splitScalar(u8, w.buffered(), '\n');
     _ = it.next();
@@ -447,4 +577,193 @@ test "the selected row is the one whose id matches, not a row index" {
     const second = it.next().?;
     try testing.expect(!std.mem.startsWith(u8, first, "❯"));
     try testing.expect(std.mem.startsWith(u8, second, "❯"));
+}
+
+test "a status ten months old says months, not minutes" {
+    const month = 30 * 24 * 60 * 60;
+    const row: Row = .{
+        .key = "/w",
+        .session_id = null,
+        .status = .idle,
+        .issue = "PE-1",
+        .branch = "feature/pe-1-old",
+        .task = "Old",
+        .worktree = "/w",
+        .status_at = 1_000_000,
+        .last_activity_at = 1_000_000,
+        .exit_code = null,
+        .stale = false,
+    };
+    const now = row.status_at + 10 * month;
+
+    var buf: [status_limit]u8 = undefined;
+    const cell = statusCell(&buf, row, now);
+    try testing.expect(std.mem.endsWith(u8, cell, "10mo"));
+
+    const rows = [_]Row{row};
+    const widths = measure(&rows, now);
+    if (widths.status < ui.displayWidth(cell)) {
+        std.debug.print(
+            "the status column measured {d} for a {d}-wide cell, so `10mo` is cut to `10m` " ++
+                "and ten months of silence reads as ten minutes — which is the difference " ++
+                "between an abandoned worktree and a live one.\n",
+            .{ widths.status, ui.displayWidth(cell) },
+        );
+        return error.TestExpectedEqual;
+    }
+}
+
+test "a waiting row is dated from when it started waiting, not from the last hook of any kind" {
+    const row: Row = .{
+        .key = "/w",
+        .session_id = "s-1",
+        .status = .waiting,
+        .issue = "PE-2",
+        .branch = "feature/pe-2",
+        .task = "Two",
+        .worktree = "/w",
+        .status_at = 1000,
+        .last_activity_at = 4000,
+        .exit_code = null,
+        .stale = false,
+    };
+
+    var buf: [status_limit]u8 = undefined;
+    const cell = statusCell(&buf, row, 4600);
+    if (std.mem.indexOf(u8, cell, "1h") == null) {
+        std.debug.print(
+            "the cell reads \"{s}\": it is dated from the last hook of any kind rather than " ++
+                "from the moment the session started waiting, so a prompt that has been up for " ++
+                "an hour reads as ten minutes old every time a subagent reports in behind it.\n",
+            .{cell},
+        );
+        return error.TestExpectedEqual;
+    }
+}
+
+test "a session that fell over says so, rather than looking like one that finished" {
+    var row: Row = .{
+        .key = "/w",
+        .session_id = "s-1",
+        .status = .exited,
+        .issue = "PE-3",
+        .branch = "feature/pe-3",
+        .task = "Three",
+        .worktree = "/w",
+        .status_at = 1000,
+        .last_activity_at = 1000,
+        .exit_code = 1,
+        .stale = false,
+    };
+
+    var buf: [status_limit]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, statusCell(&buf, row, 1000), "exited 1") != null);
+
+    row.exit_code = 0;
+    try testing.expect(std.mem.indexOf(u8, statusCell(&buf, row, 1000), "exited 0") != null);
+}
+
+test "a task name drops the prefix and the issue the ISSUE column already carries" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cases = [_]struct { branch: []const u8, want: []const u8 }{
+        .{ .branch = "feature/pe-256-app-hangs-on-launch", .want = "App hangs on launch" },
+        .{ .branch = "fix/pe-270-crash-in-mapview", .want = "Crash in mapview" },
+        .{ .branch = "chore/PE-9-tidy_up", .want = "Tidy up" },
+        .{ .branch = "feature/no-issue-here", .want = "No issue here" },
+        .{ .branch = "pe-301-widget-refresh", .want = "Widget refresh" },
+    };
+
+    for (cases) |case| {
+        try testing.expectEqualStrings(case.want, taskFrom(arena, case.branch));
+    }
+}
+
+test "a branch that is not a task name is left as it is" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for ([_][]const u8{ "master", "main", "abcdef01" }) |branch| {
+        try testing.expectEqualStrings(branch, taskFrom(arena, branch));
+    }
+}
+
+test "a branch that is nothing but its issue keeps the issue rather than going blank" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const got = taskFrom(arena, "feature/pe-256");
+    if (got.len == 0) {
+        std.debug.print(
+            "a branch named only for its issue produced an empty TASK: the row is then a " ++
+                "status and a blank, and on a terminal narrow enough to have dropped ISSUE " ++
+                "there is nothing left on it to say which worktree it is.\n",
+            .{},
+        );
+        return error.TestExpectedEqual;
+    }
+    try testing.expectEqualStrings("Pe 256", got);
+}
+
+
+test "a long task name is cut before a column of facts is dropped" {
+    const rows = [_]Row{.{
+        .key = "/w",
+        .session_id = "s-1",
+        .status = .waiting,
+        .issue = "PE-338",
+        .branch = "feature/pe-338-keep-error-observation-alive-after-the-main-sheet-is",
+        .task = "Keep error observation alive after the main sheet is",
+        .doing = "Edit ErrorObservation.swift",
+        .git = "3 dirty ↑2",
+        .worktree = "/Users/me/Projects/app.worktrees/pe-338-keep-error-observation",
+        .status_at = 900,
+        .last_activity_at = 900,
+        .exit_code = null,
+        .stale = false,
+    }};
+
+    const fitted = fit(measure(&rows, 1000), 80);
+    try testing.expect(fitted.total() <= 80);
+
+    if (fitted.git == 0 or fitted.doing == 0) {
+        std.debug.print(
+            "at 80 columns the frame kept {d} columns of task name and dropped GIT ({d}) / " ++
+                "DOING ({d}). A branch slug is prose and routinely runs past fifty characters, " ++
+                "so on the terminal width most people actually use it would swallow both of the " ++
+                "columns that say whether the row needs anything — to spell out a name whose " ++
+                "first twenty characters already identified it.\n",
+            .{ fitted.task, fitted.git, fitted.doing },
+        );
+        return error.TestExpectedEqual;
+    }
+    try testing.expect(fitted.task >= task_floor);
+}
+
+test "no column is measured wider than the share of the row it is worth" {
+    const rows = [_]Row{.{
+        .key = "/w",
+        .session_id = "s-1",
+        .status = .active,
+        .issue = "PE-1",
+        .branch = "feature/pe-1",
+        .task = "A task name far longer than any terminal should have to spell out in full",
+        .doing = "Bash a command long enough to fill a line of its own and then some more",
+        .git = "clean",
+        .worktree = "/w",
+        .last_activity_at = 900,
+        .exit_code = null,
+        .stale = false,
+    }};
+
+    const w = measure(&rows, 1000);
+    try testing.expectEqual(@as(usize, task_ceiling), w.task);
+    try testing.expectEqual(@as(usize, doing_ceiling), w.doing);
 }

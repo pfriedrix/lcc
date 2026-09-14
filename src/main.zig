@@ -700,6 +700,7 @@ test {
     _ = @import("watch_attach.zig");
     _ = @import("watch_client.zig");
     _ = @import("watch_hooks.zig");
+    _ = @import("watch_git.zig");
     _ = @import("watch_paths.zig");
     _ = @import("watch_session.zig");
     _ = @import("watch_state.zig");
