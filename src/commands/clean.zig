@@ -179,6 +179,7 @@ fn select(app: app_mod.App, candidates: []const Candidate) ![]const Candidate {
                 ui.pad(item.name(), name_width),
                 disk.abbreviate(app.gpa, app.environ, item.origin()),
             }),
+            .checked = true,
         };
     }
 
@@ -189,7 +190,6 @@ fn select(app: app_mod.App, candidates: []const Candidate) ![]const Candidate {
         "Select what to delete (space toggles, enter confirms):",
         "",
         items,
-        true,
     ) orelse std.process.exit(app_mod.cancelled_exit_code);
 
     const subset = try app.gpa.alloc(Candidate, chosen.len);
