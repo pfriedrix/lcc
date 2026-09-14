@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const app_mod = @import("../app.zig");
 const config = @import("../config.zig");
+const mcp = @import("../mcp.zig");
 const prompt = @import("../prompt.zig");
 const term = @import("../term.zig");
 const ui = @import("../ui.zig");
@@ -270,23 +271,73 @@ fn change(
             screen.out.flush() catch {};
             terminal.restore();
 
-            const current = try render(app, cfg, key);
-            const shown = if (placeholder(current)) "" else current;
-            const typed = try prompt.input(app.gpa, app.io, key.name, shown);
+            const answered = try ask(app, key, cfg, &patch);
 
             terminal.* = try term.Terminal.enterRaw();
             screen.out.writeAll(term.csi ++ "?25l") catch {};
             screen.reset();
 
-            const raw = typed orelse return;
-            if (key.kind == .text) {
-                applyText(&patch, key.name, raw);
-            } else {
-                applyList(&patch, key.name, try splitList(app.gpa, raw));
-            }
+            if (!answered) return;
         },
     }
     config.save(app.gpa, app.io, app.environ, patch) catch {};
+}
+
+const carry_hint = "every box checked carries everything, servers added later included";
+
+fn ask(app: app_mod.App, key: Key, cfg: config.Config, patch: *config.Patch) !bool {
+    if (std.mem.eql(u8, key.name, "mcpCarry")) {
+        const names = try carryCandidates(app.gpa, try mcp.known(app.gpa, app.io, app.environ), cfg.mcpCarry);
+        if (names.len > 0) {
+            const items = try app.gpa.alloc(prompt.Item, names.len);
+            for (names, items) |name, *item| item.* = .{
+                .label = name,
+                .checked = carriedNow(cfg.mcpCarry, name),
+            };
+            const picked = try prompt.checkbox(app.gpa, app.io, key.name, carry_hint, items) orelse return false;
+            patch.mcpCarry = try carryChoice(app.gpa, names, picked);
+            return true;
+        }
+    }
+
+    const current = try render(app, cfg, key);
+    const shown = if (placeholder(current)) "" else current;
+    const typed = try prompt.input(app.gpa, app.io, key.name, shown) orelse return false;
+    if (key.kind == .text) {
+        applyText(patch, key.name, typed);
+    } else {
+        applyList(patch, key.name, try splitList(app.gpa, typed));
+    }
+    return true;
+}
+
+pub fn carryCandidates(
+    gpa: std.mem.Allocator,
+    known: []const []const u8,
+    current: ?[]const []const u8,
+) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.appendSlice(gpa, known);
+    for (current orelse &.{}) |name| {
+        if (!mcp.containsFold(out.items, name)) try out.append(gpa, name);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+pub fn carriedNow(current: ?[]const []const u8, name: []const u8) bool {
+    const allow = current orelse return true;
+    return mcp.containsFold(allow, name);
+}
+
+pub fn carryChoice(
+    gpa: std.mem.Allocator,
+    names: []const []const u8,
+    picked: []const usize,
+) !config.McpCarry {
+    if (picked.len == names.len) return .all;
+    const chosen = try gpa.alloc([]const u8, picked.len);
+    for (picked, chosen) |index, *slot| slot.* = names[index];
+    return .{ .only = chosen };
 }
 
 fn placeholder(text: []const u8) bool {
@@ -433,6 +484,55 @@ test "mcpCarry keeps the three states its words describe" {
     try testing.expectEqualStrings("linear-server", named.only[0]);
     try testing.expectEqual(@as(usize, 2), mcpCarryFrom(&.{ "all", "xcode" }).only.len);
     _ = gpa;
+}
+
+test "the picker offers every name the key could match, and forgets none it already lists" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const known: []const []const u8 = &.{ "linear-server", "sentry", "xcode" };
+
+    const everything = try carryCandidates(arena, known, null);
+    try testing.expectEqual(@as(usize, 3), everything.len);
+
+    const with_stray = try carryCandidates(arena, known, &.{ "XCODE", "figma" });
+    try testing.expectEqual(@as(usize, 4), with_stray.len);
+    try testing.expectEqualStrings("xcode", with_stray[2]);
+    try testing.expectEqualStrings("figma", with_stray[3]);
+
+    const nothing_known = try carryCandidates(arena, &.{}, &.{"figma"});
+    try testing.expectEqual(@as(usize, 1), nothing_known.len);
+    try testing.expectEqual(@as(usize, 0), (try carryCandidates(arena, &.{}, null)).len);
+}
+
+test "a box starts checked exactly when the server is carried today" {
+    try testing.expect(carriedNow(null, "anything"));
+    try testing.expect(carriedNow(&.{ "linear-server", "xcode" }, "XCODE"));
+    try testing.expect(!carriedNow(&.{ "linear-server", "xcode" }, "sentry"));
+    try testing.expect(!carriedNow(&.{}, "xcode"));
+}
+
+test "checking every box means all, so a server added tomorrow is carried too" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const names: []const []const u8 = &.{ "linear-server", "sentry", "xcode" };
+
+    try testing.expect((try carryChoice(arena, names, &.{ 0, 1, 2 })) == .all);
+
+    const none = try carryChoice(arena, names, &.{});
+    try testing.expectEqual(@as(usize, 0), none.only.len);
+
+    const some = try carryChoice(arena, names, &.{ 0, 2 });
+    try testing.expectEqual(@as(usize, 2), some.only.len);
+    try testing.expectEqualStrings("linear-server", some.only[0]);
+    try testing.expectEqualStrings("xcode", some.only[1]);
+
+    try testing.expect((try carryChoice(arena, &.{}, &.{})) == .all);
 }
 
 test "listNetwork parses its three states and nothing else" {

@@ -10,6 +10,7 @@ pub const Item = struct {
     label: []const u8,
     haystack: []const u8 = "",
     description: []const u8 = "",
+    checked: bool = false,
 };
 
 const csi = term_mod.csi;
@@ -338,7 +339,6 @@ pub fn checkbox(
     message: []const u8,
     header: []const u8,
     items: []const Item,
-    checked_default: bool,
 ) Error!?[]usize {
     if (items.len == 0) return &.{};
 
@@ -359,7 +359,7 @@ pub fn checkbox(
     }
 
     const checked = try gpa.alloc(bool, items.len);
-    @memset(checked, checked_default);
+    for (items, checked) |item, *slot| slot.* = item.checked;
 
     var cursor: usize = 0;
     var offset: usize = 0;

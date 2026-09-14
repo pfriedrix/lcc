@@ -305,7 +305,10 @@ fn select(
     const w = measure(cells);
 
     const items = try app.gpa.alloc(prompt.Item, rows.len);
-    for (cells, 0..) |cell, i| items[i] = .{ .label = try rowLine(app.gpa, cell, w) };
+    for (cells, 0..) |cell, i| items[i] = .{
+        .label = try rowLine(app.gpa, cell, w),
+        .checked = checked_default,
+    };
 
     app.ui.flush();
     const chosen = try prompt.checkbox(
@@ -314,7 +317,6 @@ fn select(
         message,
         try headerLine(app.gpa, w),
         items,
-        checked_default,
     ) orelse std.process.exit(app_mod.cancelled_exit_code);
     return rowsAt(app.gpa, rows, chosen);
 }

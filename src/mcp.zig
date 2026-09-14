@@ -79,11 +79,39 @@ fn filePath(
     return std.fs.path.join(gpa, &.{ dir, "mcp", name });
 }
 
-fn readServers(
+pub fn known(
     gpa: std.mem.Allocator,
     io: Io,
     environ: *const std.process.Environ.Map,
-    repo_root: []const u8,
+) ![]const []const u8 {
+    const projects = readProjects(gpa, io, environ) orelse return &.{};
+
+    var names: std.ArrayList([]const u8) = .empty;
+    for (projects.values()) |entry| {
+        const servers = serversOf(entry) orelse continue;
+        for (servers.keys()) |name| {
+            if (!containsFold(names.items, name)) try names.append(gpa, name);
+        }
+    }
+    std.mem.sort([]const u8, names.items, {}, lessFold);
+    return names.toOwnedSlice(gpa);
+}
+
+pub fn containsFold(names: []const []const u8, wanted: []const u8) bool {
+    for (names) |name| {
+        if (std.ascii.eqlIgnoreCase(name, wanted)) return true;
+    }
+    return false;
+}
+
+fn lessFold(_: void, a: []const u8, b: []const u8) bool {
+    return std.ascii.lessThanIgnoreCase(a, b);
+}
+
+fn readProjects(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
 ) ?std.json.ObjectMap {
     const path = claudeJsonPath(gpa, environ) catch return null;
     const raw = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(claude_json_limit)) catch return null;
@@ -95,17 +123,30 @@ fn readServers(
     if (root != .object) return null;
     const projects = root.object.get("projects") orelse return null;
     if (projects != .object) return null;
+    return projects.object;
+}
 
-    const entry = projects.object.get(repo_root) orelse blk: {
-        const resolved = disk.realPath(gpa, io, repo_root);
-        if (std.mem.eql(u8, resolved, repo_root)) return null;
-        break :blk projects.object.get(resolved) orelse return null;
-    };
+fn serversOf(entry: std.json.Value) ?std.json.ObjectMap {
     if (entry != .object) return null;
-
     const servers = entry.object.get("mcpServers") orelse return null;
     if (servers != .object) return null;
     return servers.object;
+}
+
+fn readServers(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    repo_root: []const u8,
+) ?std.json.ObjectMap {
+    const projects = readProjects(gpa, io, environ) orelse return null;
+
+    const entry = projects.get(repo_root) orelse blk: {
+        const resolved = disk.realPath(gpa, io, repo_root);
+        if (std.mem.eql(u8, resolved, repo_root)) return null;
+        break :blk projects.get(resolved) orelse return null;
+    };
+    return serversOf(entry);
 }
 
 const testing = struct {
@@ -124,7 +165,15 @@ const testing = struct {
         \\    "/repo/other": {
         \\      "mcpServers": { "sentry": { "type": "http", "url": "https://mcp.sentry.dev/mcp" } }
         \\    },
-        \\    "/repo/bare": { "lastCost": 1.5, "mcpServers": {} }
+        \\    "/repo/bare": { "lastCost": 1.5, "mcpServers": {} },
+        \\    "/repo/twin": {
+        \\      "mcpServers": {
+        \\        "XCODE": { "type": "stdio", "command": "xcrun", "args": ["mcpbridge"] },
+        \\        "sentry": { "type": "http", "url": "https://mcp.sentry.dev/mcp" }
+        \\      }
+        \\    },
+        \\    "/repo/plain": { "lastSessionId": "def" },
+        \\    "/repo/odd": { "mcpServers": "not an object" }
         \\  }
         \\}
     ;
@@ -248,4 +297,60 @@ test "mcpCarry narrows what a worktree is handed" {
     const config_path = try config.path(arena, &environ);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "{\"mcpCarry\": \"linear-server\"}" });
     try std.testing.expectError(error.InvalidConfig, carry(arena, io, &environ, "/repo/app"));
+}
+
+test "known names every local-scope server once, whichever repo and spelling it came from" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const json_path = try std.fs.path.join(arena, &.{ base, "claude.json" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = json_path, .data = testing.claude_json });
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("HOME", base);
+    try environ.put("LCC_CLAUDE_JSON", json_path);
+
+    const names = try known(arena, io, &environ);
+    try std.testing.expectEqual(@as(usize, 3), names.len);
+    try std.testing.expectEqualStrings("linear-server", names[0]);
+    try std.testing.expectEqualStrings("sentry", names[1]);
+    try std.testing.expectEqualStrings("xcode", names[2]);
+    try std.testing.expect(!containsFold(names, "context7"));
+}
+
+test "known is empty, not an error, when there is no file to read it from" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("HOME", base);
+
+    try environ.put("LCC_CLAUDE_JSON", try std.fs.path.join(arena, &.{ base, "gone.json" }));
+    try std.testing.expectEqual(@as(usize, 0), (try known(arena, io, &environ)).len);
+
+    const broken = try std.fs.path.join(arena, &.{ base, "broken.json" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = broken, .data = "{\"projects\": " });
+    try environ.put("LCC_CLAUDE_JSON", broken);
+    try std.testing.expectEqual(@as(usize, 0), (try known(arena, io, &environ)).len);
+
+    const user_only = try std.fs.path.join(arena, &.{ base, "user.json" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = user_only, .data = "{\"mcpServers\": {\"context7\": {}}}" });
+    try environ.put("LCC_CLAUDE_JSON", user_only);
+    try std.testing.expectEqual(@as(usize, 0), (try known(arena, io, &environ)).len);
 }
