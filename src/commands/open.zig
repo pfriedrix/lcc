@@ -93,6 +93,9 @@ fn openInClaude(
 
     var extra: std.ArrayList([]const u8) = .empty;
     if (carried) |c| try extra.appendSlice(app.gpa, &.{ "--mcp-config", c.path });
+    if (try mcp.deny(app.gpa, app.io, app.environ)) |path| {
+        try extra.appendSlice(app.gpa, &.{ "--settings", path });
+    }
     if (resumable) try extra.append(app.gpa, "--resume");
 
     const code = try claude.launch(app.gpa, app.io, picked.entry.path, extra.items);

@@ -683,6 +683,7 @@ test {
     _ = @import("linear.zig");
     _ = @import("link.zig");
     _ = @import("mcp.zig");
+    _ = @import("mcp_roster.zig");
     _ = @import("oauth.zig");
     _ = @import("plist.zig");
     _ = @import("prompt.zig");

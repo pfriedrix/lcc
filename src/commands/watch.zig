@@ -622,6 +622,9 @@ fn startForWorktree(app: app_mod.App, row: watch_table.Row) !watch_client.Starte
             try argv.appendSlice(app.gpa, &.{ "--mcp-config", carried.path });
         }
     } else |_| {}
+    if (try mcp.deny(app.gpa, app.io, app.environ)) |path| {
+        try argv.appendSlice(app.gpa, &.{ "--settings", path });
+    }
     if (claude_projects.hasSessionsFor(app.gpa, app.io, app.environ, row.worktree)) {
         try argv.append(app.gpa, "--resume");
     }

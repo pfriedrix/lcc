@@ -3,6 +3,7 @@ const Io = std.Io;
 const app_mod = @import("../app.zig");
 const config = @import("../config.zig");
 const mcp = @import("../mcp.zig");
+const mcp_roster = @import("../mcp_roster.zig");
 const prompt = @import("../prompt.zig");
 const term = @import("../term.zig");
 const ui = @import("../ui.zig");
@@ -44,6 +45,7 @@ pub const keys = [_]Key{
     .{ .name = "linkPatterns", .kind = .list, .label = "Files linked into a worktree" },
     .{ .name = "linkExclude", .kind = .list, .label = "Files never linked" },
     .{ .name = "mcpCarry", .kind = .list, .label = "MCP servers carried" },
+    .{ .name = "mcpDisable", .kind = .list, .label = "MCP servers switched off" },
 };
 
 fn find(name: []const u8) ?Key {
@@ -92,6 +94,7 @@ fn list(app: app_mod.App, opts: Opts) !void {
             .linkPatterns = cfg.linkPatterns,
             .linkExclude = cfg.linkExclude,
             .mcpCarry = cfg.mcpCarry,
+            .mcpDisable = cfg.mcpDisable,
         }, .{ .whitespace = .indent_2 });
         app.ui.payload("{s}\n", .{body});
         app.ui.flush();
@@ -283,19 +286,24 @@ fn change(
     config.save(app.gpa, app.io, app.environ, patch) catch {};
 }
 
-const carry_hint = "every box checked carries everything, servers added later included";
+const servers_hint = "repo rows travel with the worktree; unchecking a global one switches it off";
 
 fn ask(app: app_mod.App, key: Key, cfg: config.Config, patch: *config.Patch) !bool {
-    if (std.mem.eql(u8, key.name, "mcpCarry")) {
-        const names = try carryCandidates(app.gpa, try mcp.known(app.gpa, app.io, app.environ), cfg.mcpCarry);
-        if (names.len > 0) {
-            const items = try app.gpa.alloc(prompt.Item, names.len);
-            for (names, items) |name, *item| item.* = .{
-                .label = name,
-                .checked = carriedNow(cfg.mcpCarry, name),
+    if (std.mem.eql(u8, key.name, "mcpCarry") or std.mem.eql(u8, key.name, "mcpDisable")) {
+        if (try serverRows(app, cfg)) |rows| {
+            const items = try app.gpa.alloc(prompt.Item, rows.len);
+            const width = nameWidth(rows);
+            for (rows, items) |row, *item| item.* = .{
+                .label = try std.fmt.allocPrint(app.gpa, "{f}  {s}", .{
+                    ui.pad(row.name, width),
+                    @tagName(row.origin),
+                }),
+                .checked = row.checked,
             };
-            const picked = try prompt.checkbox(app.gpa, app.io, key.name, carry_hint, items) orelse return false;
-            patch.mcpCarry = try carryChoice(app.gpa, names, picked);
+            const picked = try prompt.checkbox(app.gpa, app.io, "MCP servers", servers_hint, items) orelse return false;
+            const outcome = try serverOutcome(app.gpa, rows, picked);
+            patch.mcpCarry = outcome.carry;
+            patch.mcpDisable = outcome.disable;
             return true;
         }
     }
@@ -311,17 +319,84 @@ fn ask(app: app_mod.App, key: Key, cfg: config.Config, patch: *config.Patch) !bo
     return true;
 }
 
-pub fn carryCandidates(
+fn serverRows(app: app_mod.App, cfg: config.Config) !?[]const ServerRow {
+    const local = try mcp.known(app.gpa, app.io, app.environ);
+    const root = if (app.repo()) |repo| repo.root else |_| null;
+    const now = app_mod.nowSeconds(app.io);
+
+    const roster = mcp_roster.cached(app.gpa, app.io, app.environ, now) orelse probe: {
+        app.ui.step("Asking Claude Code which MCP servers it loads…", .{});
+        app.ui.flush();
+        break :probe mcp_roster.refresh(app.gpa, app.io, app.environ, root, now) catch &.{};
+    };
+
+    const rows = try serverRowsFrom(app.gpa, local, roster, cfg.mcpCarry, cfg.mcpDisable);
+    return if (rows.len == 0) null else rows;
+}
+
+fn nameWidth(rows: []const ServerRow) usize {
+    var width: usize = 0;
+    for (rows) |row| width = @max(width, ui.displayWidth(row.name));
+    return width;
+}
+
+pub const Origin = enum { repo, global };
+
+pub const ServerRow = struct {
+    name: []const u8,
+    origin: Origin,
+    checked: bool,
+};
+
+pub const ServerChoice = struct {
+    carry: ?config.McpCarry,
+    disable: []const []const u8,
+};
+
+pub fn serverRowsFrom(
     gpa: std.mem.Allocator,
-    known: []const []const u8,
-    current: ?[]const []const u8,
-) ![]const []const u8 {
-    var out: std.ArrayList([]const u8) = .empty;
-    try out.appendSlice(gpa, known);
-    for (current orelse &.{}) |name| {
-        if (!mcp.containsFold(out.items, name)) try out.append(gpa, name);
+    local: []const []const u8,
+    roster: []const []const u8,
+    carry: ?[]const []const u8,
+    disable: []const []const u8,
+) ![]const ServerRow {
+    var repo_names: std.ArrayList([]const u8) = .empty;
+    try repo_names.appendSlice(gpa, local);
+    for (carry orelse &.{}) |name| {
+        if (!mcp.containsFold(repo_names.items, name)) try repo_names.append(gpa, name);
     }
-    return out.toOwnedSlice(gpa);
+
+    var rows: std.ArrayList(ServerRow) = .empty;
+    for (repo_names.items) |name| {
+        try rows.append(gpa, .{
+            .name = name,
+            .origin = .repo,
+            .checked = carriedNow(carry, name),
+        });
+    }
+
+    for (roster) |name| {
+        if (mcp.containsFold(repo_names.items, name)) continue;
+        try rows.append(gpa, .{
+            .name = name,
+            .origin = .global,
+            .checked = !mcp.containsFold(disable, name),
+        });
+    }
+    for (disable) |name| {
+        if (mcp.containsFold(repo_names.items, name)) continue;
+        if (containsRow(rows.items, name)) continue;
+        try rows.append(gpa, .{ .name = name, .origin = .global, .checked = false });
+    }
+
+    return rows.toOwnedSlice(gpa);
+}
+
+fn containsRow(rows: []const ServerRow, wanted: []const u8) bool {
+    for (rows) |row| {
+        if (std.ascii.eqlIgnoreCase(row.name, wanted)) return true;
+    }
+    return false;
 }
 
 pub fn carriedNow(current: ?[]const []const u8, name: []const u8) bool {
@@ -329,15 +404,37 @@ pub fn carriedNow(current: ?[]const []const u8, name: []const u8) bool {
     return mcp.containsFold(allow, name);
 }
 
-pub fn carryChoice(
+pub fn serverOutcome(
     gpa: std.mem.Allocator,
-    names: []const []const u8,
+    rows: []const ServerRow,
     picked: []const usize,
-) !config.McpCarry {
-    if (picked.len == names.len) return .all;
-    const chosen = try gpa.alloc([]const u8, picked.len);
-    for (picked, chosen) |index, *slot| slot.* = names[index];
-    return .{ .only = chosen };
+) !ServerChoice {
+    var kept: std.ArrayList([]const u8) = .empty;
+    var denied: std.ArrayList([]const u8) = .empty;
+    var repo_total: usize = 0;
+
+    var chosen = try gpa.alloc(bool, rows.len);
+    @memset(chosen, false);
+    for (picked) |index| chosen[index] = true;
+
+    for (rows, chosen) |row, on| {
+        switch (row.origin) {
+            .repo => {
+                repo_total += 1;
+                if (on) try kept.append(gpa, row.name);
+            },
+            .global => if (!on) try denied.append(gpa, row.name),
+        }
+    }
+
+    const carry: ?config.McpCarry = if (repo_total == 0)
+        null
+    else if (kept.items.len == repo_total)
+        .all
+    else
+        .{ .only = try kept.toOwnedSlice(gpa) };
+
+    return .{ .carry = carry, .disable = try denied.toOwnedSlice(gpa) };
 }
 
 fn placeholder(text: []const u8) bool {
@@ -372,6 +469,7 @@ fn applyList(patch: *config.Patch, name: []const u8, items: []const []const u8) 
     if (std.mem.eql(u8, name, "linkPatterns")) patch.linkPatterns = items;
     if (std.mem.eql(u8, name, "linkExclude")) patch.linkExclude = items;
     if (std.mem.eql(u8, name, "mcpCarry")) patch.mcpCarry = mcpCarryFrom(items);
+    if (std.mem.eql(u8, name, "mcpDisable")) patch.mcpDisable = items;
 }
 
 pub fn mcpCarryFrom(items: []const []const u8) config.McpCarry {
@@ -422,6 +520,10 @@ fn render(app: app_mod.App, cfg: config.Config, key: Key) ![]const u8 {
         const carry = cfg.mcpCarry orelse return "(all)";
         if (carry.len == 0) return "(none)";
         return std.mem.join(app.gpa, ", ", carry);
+    }
+    if (std.mem.eql(u8, key.name, "mcpDisable")) {
+        if (cfg.mcpDisable.len == 0) return "(none)";
+        return std.mem.join(app.gpa, ", ", cfg.mcpDisable);
     }
     return "";
 }
@@ -486,25 +588,120 @@ test "mcpCarry keeps the three states its words describe" {
     _ = gpa;
 }
 
-test "the picker offers every name the key could match, and forgets none it already lists" {
+fn pickAll(gpa: std.mem.Allocator, rows: []const ServerRow) ![]usize {
+    const out = try gpa.alloc(usize, rows.len);
+    for (out, 0..) |*slot, i| slot.* = i;
+    return out;
+}
+
+test "the list is what Claude Code loads, split by who governs each row" {
     const gpa = testing.allocator;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const known: []const []const u8 = &.{ "linear-server", "sentry", "xcode" };
+    const local: []const []const u8 = &.{ "linear-server", "xcode" };
+    const roster: []const []const u8 = &.{ "linear-server", "xcode", "context7", "claude.ai Notion", "plugin:figma:figma" };
 
-    const everything = try carryCandidates(arena, known, null);
-    try testing.expectEqual(@as(usize, 3), everything.len);
+    const rows = try serverRowsFrom(arena, local, roster, null, &.{});
+    try testing.expectEqual(@as(usize, 5), rows.len);
+    try testing.expectEqual(Origin.repo, rows[0].origin);
+    try testing.expectEqual(Origin.repo, rows[1].origin);
+    try testing.expectEqual(Origin.global, rows[2].origin);
+    try testing.expectEqualStrings("context7", rows[2].name);
+    try testing.expectEqualStrings("claude.ai Notion", rows[3].name);
+    for (rows) |row| try testing.expect(row.checked);
+}
 
-    const with_stray = try carryCandidates(arena, known, &.{ "XCODE", "figma" });
-    try testing.expectEqual(@as(usize, 4), with_stray.len);
-    try testing.expectEqualStrings("xcode", with_stray[2]);
-    try testing.expectEqualStrings("figma", with_stray[3]);
+test "a row starts checked exactly when that server reaches the session today" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    const nothing_known = try carryCandidates(arena, &.{}, &.{"figma"});
-    try testing.expectEqual(@as(usize, 1), nothing_known.len);
-    try testing.expectEqual(@as(usize, 0), (try carryCandidates(arena, &.{}, null)).len);
+    const rows = try serverRowsFrom(
+        arena,
+        &.{ "linear-server", "xcode" },
+        &.{ "context7", "claude.ai Notion" },
+        &.{"linear-server"},
+        &.{"claude.ai Notion"},
+    );
+    try testing.expectEqual(@as(usize, 4), rows.len);
+    try testing.expect(rows[0].checked);
+    try testing.expect(!rows[1].checked);
+    try testing.expect(rows[2].checked);
+    try testing.expect(!rows[3].checked);
+}
+
+test "a name the roster no longer knows still gets a row, so a setting is never lost" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rows = try serverRowsFrom(arena, &.{}, &.{"context7"}, &.{"figma"}, &.{"pencil"});
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    try testing.expectEqualStrings("figma", rows[0].name);
+    try testing.expectEqual(Origin.repo, rows[0].origin);
+    try testing.expectEqualStrings("pencil", rows[2].name);
+    try testing.expect(!rows[2].checked);
+
+    try testing.expectEqual(@as(usize, 0), (try serverRowsFrom(arena, &.{}, &.{}, null, &.{})).len);
+}
+
+test "a roster that names a repo server does not list it twice under two rules" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rows = try serverRowsFrom(arena, &.{"xcode"}, &.{ "XCODE", "context7" }, null, &.{});
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("xcode", rows[0].name);
+    try testing.expectEqual(Origin.repo, rows[0].origin);
+    try testing.expectEqualStrings("context7", rows[1].name);
+}
+
+test "every box checked carries everything and denies nothing" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rows = try serverRowsFrom(arena, &.{ "linear-server", "xcode" }, &.{ "context7", "pencil" }, null, &.{});
+    const outcome = try serverOutcome(arena, rows, try pickAll(arena, rows));
+    try testing.expect(outcome.carry.? == .all);
+    try testing.expectEqual(@as(usize, 0), outcome.disable.len);
+}
+
+test "unchecking sends a repo row to mcpCarry and a global row to mcpDisable" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rows = try serverRowsFrom(arena, &.{ "linear-server", "xcode" }, &.{ "context7", "pencil" }, null, &.{});
+    const outcome = try serverOutcome(arena, rows, &.{ 0, 2 });
+
+    try testing.expectEqual(@as(usize, 1), outcome.carry.?.only.len);
+    try testing.expectEqualStrings("linear-server", outcome.carry.?.only[0]);
+    try testing.expectEqual(@as(usize, 1), outcome.disable.len);
+    try testing.expectEqualStrings("pencil", outcome.disable[0]);
+}
+
+test "a machine with no repo servers leaves mcpCarry alone rather than rewriting it to all" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rows = try serverRowsFrom(arena, &.{}, &.{ "context7", "pencil" }, null, &.{});
+    try testing.expectEqual(@as(usize, 2), rows.len);
+
+    const outcome = try serverOutcome(arena, rows, &.{0});
+    try testing.expect(outcome.carry == null);
+    try testing.expectEqual(@as(usize, 1), outcome.disable.len);
+    try testing.expectEqualStrings("pencil", outcome.disable[0]);
 }
 
 test "a box starts checked exactly when the server is carried today" {
@@ -512,27 +709,6 @@ test "a box starts checked exactly when the server is carried today" {
     try testing.expect(carriedNow(&.{ "linear-server", "xcode" }, "XCODE"));
     try testing.expect(!carriedNow(&.{ "linear-server", "xcode" }, "sentry"));
     try testing.expect(!carriedNow(&.{}, "xcode"));
-}
-
-test "checking every box means all, so a server added tomorrow is carried too" {
-    const gpa = testing.allocator;
-    var arena_state: std.heap.ArenaAllocator = .init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const names: []const []const u8 = &.{ "linear-server", "sentry", "xcode" };
-
-    try testing.expect((try carryChoice(arena, names, &.{ 0, 1, 2 })) == .all);
-
-    const none = try carryChoice(arena, names, &.{});
-    try testing.expectEqual(@as(usize, 0), none.only.len);
-
-    const some = try carryChoice(arena, names, &.{ 0, 2 });
-    try testing.expectEqual(@as(usize, 2), some.only.len);
-    try testing.expectEqualStrings("linear-server", some.only[0]);
-    try testing.expectEqualStrings("xcode", some.only[1]);
-
-    try testing.expect((try carryChoice(arena, &.{}, &.{})) == .all);
 }
 
 test "listNetwork parses its three states and nothing else" {

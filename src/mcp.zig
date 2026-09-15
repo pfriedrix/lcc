@@ -50,6 +50,34 @@ pub fn carry(
     return .{ .path = path, .names = try gpa.dupe([]const u8, servers.keys()) };
 }
 
+const DenyEntry = struct { serverName: []const u8 };
+
+pub fn deny(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+) !?[]const u8 {
+    const stored = try config.loadStored(gpa, io, environ);
+    const names = stored.mcpDisable orelse return null;
+    if (names.len == 0) return null;
+
+    const entries = try gpa.alloc(DenyEntry, names.len);
+    for (names, entries) |name, *entry| entry.* = .{ .serverName = name };
+
+    const body = try std.json.Stringify.valueAlloc(
+        gpa,
+        .{ .deniedMcpServers = entries },
+        .{ .whitespace = .indent_2 },
+    );
+
+    const dir = try config.dir(gpa, environ);
+    const path = try std.fs.path.join(gpa, &.{ dir, "mcp", "settings.json" });
+    const cwd = Io.Dir.cwd();
+    if (std.fs.path.dirname(path)) |parent| try cwd.createDirPath(io, parent);
+    try cwd.writeFile(io, .{ .sub_path = path, .data = body });
+    return path;
+}
+
 fn only(
     gpa: std.mem.Allocator,
     servers: std.json.ObjectMap,
@@ -353,4 +381,35 @@ test "known is empty, not an error, when there is no file to read it from" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = user_only, .data = "{\"mcpServers\": {\"context7\": {}}}" });
     try environ.put("LCC_CLAUDE_JSON", user_only);
     try std.testing.expectEqual(@as(usize, 0), (try known(arena, io, &environ)).len);
+}
+
+test "mcpDisable becomes the denylist Claude Code reads, and nothing at all when it is empty" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("HOME", base);
+
+    try std.testing.expect((try deny(arena, io, &environ)) == null);
+
+    try config.save(arena, io, &environ, .{ .mcpDisable = &.{ "context7", "claude.ai Notion" } });
+    const path = (try deny(arena, io, &environ)).?;
+
+    const written = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
+    const Schema = struct { deniedMcpServers: []struct { serverName: []const u8 } };
+    const parsed = try std.json.parseFromSliceLeaky(Schema, arena, written, .{});
+    try std.testing.expectEqual(@as(usize, 2), parsed.deniedMcpServers.len);
+    try std.testing.expectEqualStrings("context7", parsed.deniedMcpServers[0].serverName);
+    try std.testing.expectEqualStrings("claude.ai Notion", parsed.deniedMcpServers[1].serverName);
+
+    try config.save(arena, io, &environ, .{ .mcpDisable = &.{} });
+    try std.testing.expect((try deny(arena, io, &environ)) == null);
 }

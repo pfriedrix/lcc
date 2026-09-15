@@ -396,7 +396,8 @@ $ lcc start PE-256 --json
   "links":     { "linked": [".env"], "skipped": [".claude/settings.local.json"] },
   "start_task_command": "/start-task PE-256",
   "mcp":       { "config": "/Users/me/.config/lcc/mcp/-Users-me-Projects-App.json",
-                 "servers": ["linear-server", "xcode"] }
+                 "servers": ["linear-server", "xcode"] },
+  "mcp_disabled": ["context7", "claude.ai Notion"]
 }
 ```
 
@@ -893,7 +894,8 @@ months after anyone typed it.
 | `allIssues` | `false` | Offer every assigned issue in the picker, not just `activeStates` |
 | `keepBranch`, `keepDerivedData`, `keepXcode` | `false` | What `lcc remove` leaves behind |
 | `xcodeApp` | absent — ask | Which Xcode `lcc open xcode` launches: its name, version, build, or the path to the `.app` |
-| `mcpCarry` | absent — all of them | Which local-scope MCP servers to carry into Claude. `lcc setup` offers a checkbox list of every server it could name; `lcc config mcpCarry` takes a comma-separated list, `all`, or `none` |
+| `mcpCarry` | absent — all of them | Which of the **repo's** local-scope MCP servers to carry into a worktree. `lcc config mcpCarry` takes a comma-separated list, `all`, or `none` |
+| `mcpDisable` | absent — none | Which **global** MCP servers (user scope, plugin, claude.ai connector) to switch off for sessions lcc starts. `lcc config mcpDisable` takes a comma-separated list; an empty value clears it |
 | `clientId` | absent — required by `lcc auth` | Your Linear OAuth application. Set it with `lcc auth setup --client-id <id>`, or `LCC_CLIENT_ID` for a single run |
 
 `{repoRoot}` and `{repoParent}` always resolve against the **main** worktree, so running `lcc` from inside a worktree puts the next one beside its siblings instead of nesting it one level deeper.
@@ -960,7 +962,24 @@ Symlinks cannot solve the same problem for MCP servers, because they are not in 
 
 Two things this cannot do. A server that was never authenticated stays unauthenticated — `/mcp` in a session is the only thing that fixes that, and the worktree is not why it is dark. And a session that is *already* running cannot be handed servers retroactively, which is why `lcc start --json` reports what a launch would have carried instead of carrying it.
 
-`mcpCarry` narrows the set to the names it lists, matched case-insensitively, keeping the file's order. In `lcc setup` the setting is a checkbox list rather than something to type: one row per local-scope server name found anywhere in `~/.claude.json`, not just under the current repo, because the key is global and matched by name, so that is the whole set it can ever match. Names already in the key that no repo has any more are kept as rows too, so nothing is dropped by opening the picker. Each box starts checked if the server is carried today. Checking every box removes the key, so a server added tomorrow is carried as well; unchecking every box writes an empty list and carries none. `lcc config mcpCarry` takes the typed form for a script or a one-liner: a comma-separated list, `all`, or `none`. Carrying everything is the default because it is the answer that never surprises anyone, but it is not free: a server the work never calls still spends every agent in the session its name and its instructions, on every turn — and a pipeline that fans out to twenty subagents pays that twenty times over. Measured across eight pipeline runs in this repo's worktrees, `linear-server` and `xcode` accounted for every local-scope call that was made; `clickup`, `notion` and `sentry` were carried into all eight and never touched once. A name the repo does not have is ignored, and a list that matches nothing launches without MCP rather than with an empty config.
+#### Choosing them
+
+A session gets its servers from two places, and only one of them is about worktrees:
+
+| | Where it comes from | What a worktree does to it |
+|---|---|---|
+| **repo** | `projects["<repo path>"].mcpServers` in `~/.claude.json` | loses it — the key is the directory, so this is the half `lcc` carries |
+| **global** | user scope, a plugin, or a claude.ai connector | keeps it — these load in every directory already |
+
+`lcc setup` shows both in one checkbox list, each row tagged `repo` or `global`, because the question a person actually has is "what is in this session", not "which config file said so". Unchecking writes to whichever key owns that row: a repo row to `mcpCarry`, a global row to `mcpDisable`. Each box starts checked when that server reaches a session today.
+
+`mcpCarry` narrows the carried set to the names it lists, matched case-insensitively, keeping the file's order. Checking every repo row removes the key, so a server added tomorrow is carried as well; unchecking every one writes an empty list and carries none.
+
+`mcpDisable` is the other half, and it is empty by default — so nothing is switched off until you say so. It becomes a `deniedMcpServers` denylist in `~/.config/lcc/mcp/settings.json`, passed to every session lcc starts as `--settings`. That is Claude Code's own mechanism and it reaches all three kinds: a user-scope server, a plugin server (`plugin:figma:figma`), and a connector under its display name (`claude.ai Notion`). It applies to sessions `lcc` starts, and to nothing else — a plain `claude` in the same directory is unaffected, which is also why `/mcp`'s own per-project toggle and this key are separate answers.
+
+The global half of the list can only come from Claude Code itself: connectors are fetched from the network and never fully written to disk, and a plugin's servers are not always in a file either. So `lcc setup` runs `claude mcp list` once, caches the names in `~/.config/lcc/mcp-roster.json` (override with `LCC_MCP_ROSTER`) and re-asks when that is a day old. The probe takes a few seconds and health-checks every server, which is why it is not on the path of `lcc start` or `lcc open`. Delete the file to force a fresh one. A name in either key that the roster no longer knows still gets a row, so opening the picker never silently drops a setting, and a name nothing matches is simply inert.
+
+Carrying everything is the default because it is the answer that never surprises anyone, but it is not free: a server the work never calls still spends every agent in the session its name and its instructions, on every turn — and a pipeline that fans out to twenty subagents pays that twenty times over. Measured across eight pipeline runs in this repo's worktrees, `linear-server` and `xcode` accounted for every local-scope call that was made; `clickup`, `notion` and `sentry` were carried into all eight and never touched once. A name the repo does not have is ignored, and a list that matches nothing launches without MCP rather than with an empty config.
 
 ## Layout
 
@@ -975,6 +994,7 @@ src/github.zig           pull-request state via the `gh` CLI
 src/prompt.zig           raw-mode search, confirm, checkbox, input
 src/git.zig              worktrees, branches, branch disposition, drift
 src/mcp.zig              local-scope MCP servers, carried into a worktree
+src/mcp_roster.zig       what Claude Code loads, asked once and cached
 src/repos.zig            which repository an issue belongs to, remembered
 src/fold.zig             case folding for ASCII, Latin-1, Cyrillic
 src/link.zig             pattern matching and symlinking into a worktree

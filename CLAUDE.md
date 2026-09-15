@@ -80,8 +80,8 @@ Conventions inside a test:
   `readMutation`, `unwrap` in `src/linear.zig`) — no requests, no Keychain reads.
 - Never let a test touch real state under `$HOME`. Build a `std.process.Environ.Map` and set
   the override the module reads: `LCC_REPOS`, `LCC_USAGE_CACHE`, `LCC_REMOTE_CACHE`,
-  `LCC_CLAUDE_PROJECTS`, `LCC_CLAUDE_JSON`, `LCC_DERIVED_DATA`, `LCC_SESSIONS`,
-  `LCC_WATCH_DIR`. The last one moves the socket, the lock, the hook settings and the
+  `LCC_CLAUDE_PROJECTS`, `LCC_CLAUDE_JSON`, `LCC_MCP_ROSTER`, `LCC_DERIVED_DATA`,
+  `LCC_SESSIONS`, `LCC_WATCH_DIR`. The last one moves the socket, the lock, the hook settings and the
   recovered-status files together, so it is the one the daemon and `watch_state` tests need.
 - Failure messages carry what a wrong answer costs, not just the mismatch. `start_plan_test.zig`
   is the reference for that shape.
@@ -353,6 +353,28 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   which then eats the live sessions' updates while they sit frozen on whatever their first
   byte of output set. The worktree path is *not* a unique key: `lcc open` will happily start
   a second session in a worktree that already has one.
+
+- **The global half of the MCP list is not on disk, however much it looks like it should be.**
+  `~/.claude.json` holds user-scope servers in its root `mcpServers`, so those *are* readable —
+  but a claude.ai connector is fetched from the network and leaves only partial traces
+  (`claudeAiMcpEverConnected` held 5 names for a session that loaded 8, and
+  `mcp-needs-auth-cache.json` only ever names the ones that needed auth), and a plugin's
+  servers are not reliably in a `.mcp.json` either (`plugin:sentry:sentry` loads with no such
+  file anywhere under its install path). `mcp_roster` therefore asks `claude mcp list` and
+  caches the answer, and "optimising" that into a disk read compiles, runs fast, and silently
+  drops every connector from the picker — which reads as lcc not knowing about servers the
+  user is looking at. The probe health-checks every server and spawns each stdio one, so it
+  costs seconds and belongs nowhere near `lcc start` or `lcc open`.
+- **`mcpCarry` and `mcpDisable` are one list to a person and two keys on purpose.** They act
+  by different mechanisms — `mcpCarry` decides what goes *into* `--mcp-config`, `mcpDisable`
+  becomes a `deniedMcpServers` denylist passed as `--settings` — and they have opposite
+  defaults: absent `mcpCarry` carries everything, absent `mcpDisable` denies nothing. Folding
+  them into a single allowlist compiles and reads tidier, and it turns every existing
+  `mcpCarry` value into a denial of every global server the moment lcc is upgraded, so a
+  config written months ago starts stripping connectors nobody asked it to touch.
+  `serverOutcome` keeps `carry` optional for the same reason: a machine whose repos have no
+  local-scope servers at all has no repo rows, and writing `.all` there would rewrite a key
+  the picker never showed.
 
 ## Style
 

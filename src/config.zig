@@ -39,6 +39,7 @@ pub const Stored = struct {
     activeStates: ?[]const []const u8 = null,
     startTaskCommand: ?[]const u8 = null,
     mcpCarry: ?[]const []const u8 = null,
+    mcpDisable: ?[]const []const u8 = null,
     watchByDefault: ?bool = null,
     planMode: ?bool = null,
     planModel: ?[]const u8 = null,
@@ -67,6 +68,7 @@ pub const Patch = struct {
     activeStates: ?[]const []const u8 = null,
     startTaskCommand: ?[]const u8 = null,
     mcpCarry: ?McpCarry = null,
+    mcpDisable: ?[]const []const u8 = null,
     watchByDefault: ?bool = null,
     planMode: ?bool = null,
     planModel: ?[]const u8 = null,
@@ -90,6 +92,7 @@ pub const Config = struct {
     activeStates: []const []const u8,
     startTaskCommand: []const u8,
     mcpCarry: ?[]const []const u8,
+    mcpDisable: []const []const u8,
     watchByDefault: bool,
     planMode: bool,
     planModel: []const u8,
@@ -149,6 +152,7 @@ pub fn load(
         .activeStates = stored.activeStates orelse &default_active_states,
         .startTaskCommand = stored.startTaskCommand orelse "",
         .mcpCarry = stored.mcpCarry,
+        .mcpDisable = stored.mcpDisable orelse &.{},
         .watchByDefault = stored.watchByDefault orelse default_watch_by_default,
         .planMode = stored.planMode orelse true,
         .planModel = stored.planModel orelse "",
@@ -197,6 +201,7 @@ pub fn save(
     if (patch.keepDerivedData) |v| merged.keepDerivedData = v;
     if (patch.keepXcode) |v| merged.keepXcode = v;
     if (patch.xcodeApp) |v| merged.xcodeApp = v;
+    if (patch.mcpDisable) |v| merged.mcpDisable = if (v.len == 0) null else v;
     if (patch.mcpCarry) |carry| switch (carry) {
         .all => merged.mcpCarry = null,
         .only => |v| merged.mcpCarry = v,

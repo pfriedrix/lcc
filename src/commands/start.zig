@@ -150,7 +150,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     } else null;
 
     if (opts.json) {
-        try report(app, repo, selected, suggested, wt, carried, initial_prompt);
+        try report(app, repo, selected, suggested, wt, carried, cfg.mcpDisable, initial_prompt);
         return;
     }
 
@@ -179,6 +179,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     const args = try launchArgs(
         app.gpa,
         if (claude_carried) |c| c.path else null,
+        try mcp.deny(app.gpa, app.io, app.environ),
         initial_prompt,
         plan_mode,
         cfg.planModel,
@@ -561,6 +562,7 @@ const Report = struct {
     links: ReportLinks,
     start_task_command: ?[]const u8,
     mcp: ?ReportMcp,
+    mcp_disabled: []const []const u8,
 };
 
 const McpFact = struct {
@@ -623,6 +625,7 @@ const Facts = struct {
     is_cwd: bool,
     start_task_command: ?[]const u8,
     carried: ?McpFact,
+    disabled: []const []const u8 = &.{},
 };
 
 fn buildReport(
@@ -674,6 +677,7 @@ fn buildReport(
             .{ .config = c.path, .servers = c.names }
         else
             null,
+        .mcp_disabled = facts.disabled,
     };
 }
 
@@ -684,6 +688,7 @@ fn report(
     suggested: []const u8,
     wt: Bootstrapped,
     carried: ?McpFact,
+    disabled: []const []const u8,
     start_task_command: ?[]const u8,
 ) !void {
     var branch_status: ?git.BranchStatus = null;
@@ -701,6 +706,7 @@ fn report(
         .is_cwd = isCwd(app, wt.path),
         .start_task_command = start_task_command,
         .carried = carried,
+        .disabled = disabled,
     });
 
     const body = try std.json.Stringify.valueAlloc(app.gpa, value, .{ .whitespace = .indent_2 });
@@ -974,6 +980,7 @@ test "the --json payload keeps the shape a caller parses" {
         .is_cwd = true,
         .start_task_command = "/start-task PE-250",
         .carried = .{ .path = "/cfg/mcp/-r.json", .names = &.{ "linear-server", "xcode" } },
+        .disabled = &.{"context7"},
     });
 
     const body = try std.json.Stringify.valueAlloc(gpa, value, .{ .whitespace = .indent_2 });
@@ -1013,6 +1020,7 @@ test "the --json payload keeps the shape a caller parses" {
         links: struct { linked: [][]const u8, skipped: [][]const u8 },
         start_task_command: ?[]const u8,
         mcp: ?struct { config: []const u8, servers: [][]const u8 },
+        mcp_disabled: [][]const u8,
     };
 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -1034,6 +1042,7 @@ test "the --json payload keeps the shape a caller parses" {
     try std.testing.expectEqualStrings("/start-task PE-250", parsed.start_task_command.?);
     try std.testing.expectEqualStrings("/cfg/mcp/-r.json", parsed.mcp.?.config);
     try std.testing.expectEqualStrings("linear-server", parsed.mcp.?.servers[0]);
+    try std.testing.expectEqualStrings("context7", parsed.mcp_disabled[0]);
 }
 
 test "a created worktree reports no match and its base" {
@@ -1115,6 +1124,7 @@ pub fn openingTemplate(
 pub fn launchArgs(
     gpa: std.mem.Allocator,
     mcp_config: ?[]const u8,
+    settings: ?[]const u8,
     initial_prompt: ?[]const u8,
     plan_mode: bool,
     plan_model: []const u8,
@@ -1125,6 +1135,7 @@ pub fn launchArgs(
         if (plan_model.len > 0) try out.appendSlice(gpa, &.{ "--model", plan_model });
     }
     if (mcp_config) |path| try out.appendSlice(gpa, &.{ "--mcp-config", path });
+    if (settings) |path| try out.appendSlice(gpa, &.{ "--settings", path });
     if (initial_prompt) |value| {
         try out.append(gpa, "--");
         try out.append(gpa, value);
@@ -1249,7 +1260,7 @@ test "launchArgs always separates the prompt from the options with --" {
 
     const opens_with_dash = "--- \n- step one";
 
-    const carried = try launchArgs(gpa, "/cfg/mcp.json", opens_with_dash, false, "");
+    const carried = try launchArgs(gpa, "/cfg/mcp.json", null, opens_with_dash, false, "");
     defer gpa.free(carried);
     try std.testing.expectEqual(@as(usize, 4), carried.len);
     try std.testing.expectEqualStrings("--mcp-config", carried[0]);
@@ -1257,25 +1268,43 @@ test "launchArgs always separates the prompt from the options with --" {
     try std.testing.expectEqualStrings("--", carried[2]);
     try std.testing.expectEqualStrings(opens_with_dash, carried[3]);
 
-    const bare = try launchArgs(gpa, null, opens_with_dash, false, "");
+    const bare = try launchArgs(gpa, null, null, opens_with_dash, false, "");
     defer gpa.free(bare);
     try std.testing.expectEqual(@as(usize, 2), bare.len);
     try std.testing.expectEqualStrings("--", bare[0]);
     try std.testing.expectEqualStrings(opens_with_dash, bare[1]);
 
-    const empty = try launchArgs(gpa, null, null, false, "");
+    const empty = try launchArgs(gpa, null, null, null, false, "");
     defer gpa.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 
-    const only_mcp = try launchArgs(gpa, "/cfg/mcp.json", null, false, "");
+    const only_mcp = try launchArgs(gpa, "/cfg/mcp.json", null, null, false, "");
     defer gpa.free(only_mcp);
     try std.testing.expectEqual(@as(usize, 2), only_mcp.len);
+}
+
+test "a denylist reaches the session as its own settings file, with or without carried servers" {
+    const gpa = std.testing.allocator;
+
+    const both = try launchArgs(gpa, "/cfg/mcp.json", "/cfg/deny.json", "/start-task PE-250", false, "");
+    defer gpa.free(both);
+    try std.testing.expectEqual(@as(usize, 6), both.len);
+    try std.testing.expectEqualStrings("--mcp-config", both[0]);
+    try std.testing.expectEqualStrings("--settings", both[2]);
+    try std.testing.expectEqualStrings("/cfg/deny.json", both[3]);
+    try std.testing.expectEqualStrings("--", both[4]);
+
+    const deny_only = try launchArgs(gpa, null, "/cfg/deny.json", null, false, "");
+    defer gpa.free(deny_only);
+    try std.testing.expectEqual(@as(usize, 2), deny_only.len);
+    try std.testing.expectEqualStrings("--settings", deny_only[0]);
+    try std.testing.expectEqualStrings("/cfg/deny.json", deny_only[1]);
 }
 
 test "launchArgs opens in plan mode, and the mode stays ahead of the separator" {
     const gpa = std.testing.allocator;
 
-    const planning = try launchArgs(gpa, null, "/start-task PE-250", true, "");
+    const planning = try launchArgs(gpa, null, null, "/start-task PE-250", true, "");
     defer gpa.free(planning);
     try std.testing.expectEqual(@as(usize, 4), planning.len);
     try std.testing.expectEqualStrings("--permission-mode", planning[0]);
@@ -1283,7 +1312,7 @@ test "launchArgs opens in plan mode, and the mode stays ahead of the separator" 
     try std.testing.expectEqualStrings("--", planning[2]);
     try std.testing.expectEqualStrings("/start-task PE-250", planning[3]);
 
-    const with_mcp = try launchArgs(gpa, "/cfg/mcp.json", "/start-task PE-250", true, "");
+    const with_mcp = try launchArgs(gpa, "/cfg/mcp.json", null, "/start-task PE-250", true, "");
     defer gpa.free(with_mcp);
     try std.testing.expectEqual(@as(usize, 6), with_mcp.len);
     try std.testing.expectEqualStrings("--permission-mode", with_mcp[0]);
@@ -1291,7 +1320,7 @@ test "launchArgs opens in plan mode, and the mode stays ahead of the separator" 
     try std.testing.expectEqualStrings("--mcp-config", with_mcp[2]);
     try std.testing.expectEqualStrings("--", with_mcp[4]);
 
-    const no_prompt = try launchArgs(gpa, null, null, true, "");
+    const no_prompt = try launchArgs(gpa, null, null, null, true, "");
     defer gpa.free(no_prompt);
     try std.testing.expectEqual(@as(usize, 2), no_prompt.len);
     try std.testing.expectEqualStrings("--permission-mode", no_prompt[0]);

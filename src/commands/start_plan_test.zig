@@ -139,7 +139,7 @@ fn argAfter(args: []const []const u8, flag: []const u8) ?[]const u8 {
 test "the planning model rides the sessions that are there to plan, and no others" {
     const gpa = std.testing.allocator;
 
-    const planning = try start.launchArgs(gpa, null, "/start-task PE-250", true, "fable");
+    const planning = try start.launchArgs(gpa, null, null, "/start-task PE-250", true, "fable");
     defer gpa.free(planning);
 
     const chosen = argAfter(planning, "--model");
@@ -168,7 +168,7 @@ test "the planning model rides the sessions that are there to plan, and no other
         return error.PlanModelAfterSeparator;
     }
 
-    const carried = try start.launchArgs(gpa, null, "/start-task PE-250", false, "fable");
+    const carried = try start.launchArgs(gpa, null, null, "/start-task PE-250", false, "fable");
     defer gpa.free(carried);
     if (argAfter(carried, "--model")) |leaked| {
         std.debug.print(
@@ -182,7 +182,7 @@ test "the planning model rides the sessions that are there to plan, and no other
         return error.PlanModelLeaked;
     }
 
-    const unset = try start.launchArgs(gpa, null, null, true, "");
+    const unset = try start.launchArgs(gpa, null, null, null, true, "");
     defer gpa.free(unset);
     if (argAfter(unset, "--model")) |empty| {
         std.debug.print(
