@@ -971,7 +971,7 @@ A session gets its servers from two places, and only one of them is about worktr
 | **repo** | `projects["<repo path>"].mcpServers` in `~/.claude.json` | loses it — the key is the directory, so this is the half `lcc` carries |
 | **global** | user scope, a plugin, or a claude.ai connector | keeps it — these load in every directory already |
 
-`lcc setup` shows both in one checkbox list, each row tagged `repo` or `global`, because the question a person actually has is "what is in this session", not "which config file said so". Unchecking writes to whichever key owns that row: a repo row to `mcpCarry`, a global row to `mcpDisable`. Each box starts checked when that server reaches a session today.
+`lcc setup` asks this as **one** question — a single `MCP servers` row, reading `all · 3 off` or the carried names and the count switched off — which opens one checkbox list with every server in it, each row tagged `repo` or `global`. The question a person has is "what is in this session", not "which config file said so"; the two keys below are an implementation detail of how the answer is enforced, and `lcc config` lists them separately for a script that wants one of them. Unchecking writes to whichever key owns that row: a repo row to `mcpCarry`, a global row to `mcpDisable`. Each box starts checked when that server reaches a session today.
 
 `mcpCarry` narrows the carried set to the names it lists, matched case-insensitively, keeping the file's order. Checking every repo row removes the key, so a server added tomorrow is carried as well; unchecking every one writes an empty list and carries none.
 

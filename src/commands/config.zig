@@ -23,6 +23,7 @@ const Key = struct {
     kind: Kind,
     label: []const u8,
     choices: []const []const u8 = &.{},
+    browse: bool = true,
 };
 
 pub const keys = [_]Key{
@@ -44,8 +45,8 @@ pub const keys = [_]Key{
     .{ .name = "activeStates", .kind = .list, .label = "Linear states offered" },
     .{ .name = "linkPatterns", .kind = .list, .label = "Files linked into a worktree" },
     .{ .name = "linkExclude", .kind = .list, .label = "Files never linked" },
-    .{ .name = "mcpCarry", .kind = .list, .label = "MCP servers carried" },
-    .{ .name = "mcpDisable", .kind = .list, .label = "MCP servers switched off" },
+    .{ .name = "mcpCarry", .kind = .list, .label = "MCP servers" },
+    .{ .name = "mcpDisable", .kind = .list, .label = "MCP servers switched off", .browse = false },
 };
 
 fn find(name: []const u8) ?Key {
@@ -183,8 +184,17 @@ fn browse(app: app_mod.App) !void {
     var key_buf: [8]u8 = undefined;
     var last_cols: u16 = 0;
 
+    var shown: [keys.len]Key = undefined;
+    var shown_len: usize = 0;
+    for (keys) |key| {
+        if (!key.browse) continue;
+        shown[shown_len] = key;
+        shown_len += 1;
+    }
+    const rows = shown[0..shown_len];
+
     var width: usize = 0;
-    for (keys) |key| width = @max(width, ui.displayWidth(key.label));
+    for (rows) |key| width = @max(width, ui.displayWidth(key.label));
 
     while (true) {
         const dims = terminal.size();
@@ -200,7 +210,7 @@ fn browse(app: app_mod.App) !void {
         out.print("{s}lcc{s}\n\n", .{ p.bold, p.reset }) catch {};
         lines += 2;
 
-        for (keys, 0..) |key, i| {
+        for (rows, 0..) |key, i| {
             const selected = i == cursor;
             out.print("{s}{s}{f}{s}  {s}{s}{s}\n", .{
                 if (selected) p.cyan else "",
@@ -222,14 +232,14 @@ fn browse(app: app_mod.App) !void {
 
         switch (term.readKey(terminal, &key_buf)) {
             .cancel => return,
-            .up => cursor = if (cursor == 0) keys.len - 1 else cursor - 1,
-            .down => cursor = if (cursor + 1 >= keys.len) 0 else cursor + 1,
-            .space, .enter => try change(app, &screen, &terminal, keys[cursor], cfg),
+            .up => cursor = if (cursor == 0) rows.len - 1 else cursor - 1,
+            .down => cursor = if (cursor + 1 >= rows.len) 0 else cursor + 1,
+            .space, .enter => try change(app, &screen, &terminal, rows[cursor], cfg),
             .text => |t| {
                 if (term.layoutKey(t)) |key| switch (key) {
                     'q' => return,
-                    'j' => cursor = if (cursor + 1 >= keys.len) 0 else cursor + 1,
-                    'k' => cursor = if (cursor == 0) keys.len - 1 else cursor - 1,
+                    'j' => cursor = if (cursor + 1 >= rows.len) 0 else cursor + 1,
+                    'k' => cursor = if (cursor == 0) rows.len - 1 else cursor - 1,
                     else => {},
                 };
             },
@@ -240,8 +250,14 @@ fn browse(app: app_mod.App) !void {
 
 fn display(app: app_mod.App, cfg: config.Config, key: Key) ![]const u8 {
     const raw = try render(app, cfg, key);
+    if (std.mem.eql(u8, key.name, "mcpCarry")) return serversSummary(app.gpa, raw, cfg.mcpDisable.len);
     if (key.kind != .boolean) return raw;
     return if (std.mem.eql(u8, raw, "true")) "on" else "off";
+}
+
+pub fn serversSummary(gpa: std.mem.Allocator, carried: []const u8, off: usize) ![]const u8 {
+    if (off == 0) return carried;
+    return std.fmt.allocPrint(gpa, "{s} · {d} off", .{ carried, off });
 }
 
 fn change(
@@ -566,6 +582,37 @@ test "every key is unique and carries a label short enough to sit in a list" {
     for (keys) |key| {
         if (key.kind == .choice) try testing.expect(key.choices.len > 1);
     }
+}
+
+test "one question about MCP servers means one row, whatever the file keeps underneath" {
+    var mcp_rows: usize = 0;
+    var mcp_keys: usize = 0;
+    for (keys) |key| {
+        if (!std.mem.startsWith(u8, key.name, "mcp")) continue;
+        mcp_keys += 1;
+        if (key.browse) mcp_rows += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), mcp_keys);
+    try testing.expectEqual(@as(usize, 1), mcp_rows);
+
+    try testing.expect(find("mcpCarry").?.browse);
+    try testing.expect(!find("mcpDisable").?.browse);
+
+    for (keys) |key| {
+        if (key.browse) continue;
+        try testing.expect(find(key.name) != null);
+    }
+}
+
+test "the row says what is carried and how much was switched off" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try testing.expectEqualStrings("(all)", try serversSummary(arena, "(all)", 0));
+    try testing.expectEqualStrings("(all) · 3 off", try serversSummary(arena, "(all)", 3));
+    try testing.expectEqualStrings("linear-server · 1 off", try serversSummary(arena, "linear-server", 1));
 }
 
 test "the destructive flags are deliberately not settings" {

@@ -374,7 +374,11 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   config written months ago starts stripping connectors nobody asked it to touch.
   `serverOutcome` keeps `carry` optional for the same reason: a machine whose repos have no
   local-scope servers at all has no repo rows, and writing `.all` there would rewrite a key
-  the picker never showed.
+  the picker never showed. None of that is the user's problem, so `Key.browse` keeps the pair
+  to one row in the interactive list — two rows that open the same picker read as one setting
+  entered twice. `browse` iterates that filtered slice rather than `keys`, so a `cursor`
+  bounded by `keys.len` is the bug to watch for; the flat `lcc config` listing still prints
+  both, because there the names are the file's own.
 
 ## Style
 
