@@ -10,6 +10,7 @@ const prompt = @import("../prompt.zig");
 const rc = @import("../remote_cache.zig");
 const ui = @import("../ui.zig");
 const usage = @import("../usage.zig");
+const watch_client = @import("../watch_client.zig");
 const xcode = @import("../xcode.zig");
 
 pub const Opts = struct {
@@ -418,6 +419,7 @@ fn removeSelected(
 
         removed += 1;
         app.ui.success("Removed worktree {f}", .{ui.cyan(label)});
+        stopAgents(app, entry.path, label);
         reclaimed += try purgeDerived(app, row.attached.derived, dd_root);
         if (opts.sessions) {
             reclaimed += try purgeSessions(app, row.attached.sessions, cp_root);
@@ -466,6 +468,16 @@ fn closeXcode(app: app_mod.App, held: xcode.Open) bool {
 fn noteReopen(app: app_mod.App, closed: bool) void {
     if (!closed) return;
     app.ui.hint("  Its Xcode window is closed — reopen with: lcc open xcode", .{});
+}
+
+fn stopAgents(app: app_mod.App, worktree: []const u8, label: []const u8) void {
+    const stopped = watch_client.stopIn(app, worktree) catch |err| {
+        app.ui.warn("Could not stop the background session in {f} — {s}", .{ ui.cyan(label), @errorName(err) });
+        app.ui.hint("  Stop it from: lcc open", .{});
+        return;
+    };
+    if (stopped == 0) return;
+    app.ui.success("Stopped {d} background session{s} that ran in it", .{ stopped, plural(stopped) });
 }
 
 fn refresh(app: app_mod.App, repo: git.Repo) void {
