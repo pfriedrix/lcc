@@ -174,6 +174,17 @@ pub fn owning(gpa: std.mem.Allocator, state: State, target: []const u8) ?Session
     return null;
 }
 
+pub fn runningIn(gpa: std.mem.Allocator, list: []const Session, worktree: []const u8) ![]const Session {
+    var out: std.ArrayList(Session) = .empty;
+    for (list) |session| {
+        if (session.parsedStatus() == .exited) continue;
+        const inside = std.mem.eql(u8, session.worktree, worktree) or
+            disk.isInside(gpa, worktree, session.worktree);
+        if (inside) try out.append(gpa, session);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 const testing = std.testing;
 
 fn testEnviron(arena: std.mem.Allocator, base: []const u8) !std.process.Environ.Map {
@@ -453,4 +464,35 @@ test "owning matches the worktree and what is inside it, never a sibling prefix"
 test "an unrecognised status from a newer daemon reads as unknown, not a parse failure" {
     const session: Session = .{ .id = "s-a", .status = "thinking_very_hard" };
     try testing.expectEqual(Status.unknown, session.parsedStatus());
+}
+
+test "the sessions a removed worktree takes down are the live ones in it, never a sibling's" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const list: []const Session = &.{
+        .{ .id = "s-root", .worktree = "/r/.lcc/worktrees/pe-256", .status = "idle" },
+        .{ .id = "s-nested", .worktree = "/r/.lcc/worktrees/pe-256/app", .status = "active" },
+        .{ .id = "s-done", .worktree = "/r/.lcc/worktrees/pe-256", .status = "exited" },
+        .{ .id = "s-sibling", .worktree = "/r/.lcc/worktrees/pe-2567", .status = "idle" },
+        .{ .id = "s-parent", .worktree = "/r/.lcc/worktrees", .status = "idle" },
+    };
+
+    const found = try runningIn(arena, list, "/r/.lcc/worktrees/pe-256");
+    var ids: std.ArrayList(u8) = .empty;
+    for (found) |s| {
+        try ids.appendSlice(arena, s.id);
+        try ids.append(arena, ' ');
+    }
+    if (!std.mem.eql(u8, ids.items, "s-root s-nested ")) {
+        std.debug.print(
+            "removing pe-256 would stop `{s}` instead of `s-root s-nested `: a missed id is an " ++
+                "agent left running in a directory that no longer exists, holding its memory " ++
+                "until the daemon dies; an extra one kills work in a worktree nobody removed.\n",
+            .{ids.items},
+        );
+        return error.TestExpectedEqual;
+    }
 }

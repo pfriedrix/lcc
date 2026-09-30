@@ -190,6 +190,22 @@ pub fn snapshot(app: app_mod.App) Error!?[]const sessions_mod.Session {
     return body.sessions;
 }
 
+pub fn stopIn(app: app_mod.App, worktree: []const u8) Error!usize {
+    var conn = (try connectExisting(app, .control)) orelse return 0;
+    defer conn.close(app.io);
+
+    try conn.sendControl(app.gpa, .list, .{});
+    const frame = try conn.recv();
+    if (frame.type != .snapshot) return Error.BadResponse;
+    const body = wire.parse(wire.Snapshot, app.gpa, frame) catch return Error.BadResponse;
+
+    const running = try sessions_mod.runningIn(app.gpa, body.sessions, worktree);
+    for (running) |session| {
+        try conn.sendControl(app.gpa, .kill, .{ .session_id = session.id, .signal = "TERM" });
+    }
+    return running.len;
+}
+
 pub fn report(
     app: app_mod.App,
     socket: ?[]const u8,

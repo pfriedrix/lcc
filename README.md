@@ -252,8 +252,9 @@ finished work.
 
 **Two things worth knowing.** Sessions run in one shared background process, and
 they do not survive it: if it dies the ptys are revoked and every agent gets a
-hangup, the same property tmux has. And `lcc remove` does not yet check whether a
-worktree has a live session in it, so check `lcc open` before removing one.
+hangup, the same property tmux has. And `lcc remove` stops every background
+session running in a worktree it removed — a live agent in it included, so check
+`lcc open` before removing one you are not done with.
 
 What *does* survive is the status. Every hook writes what it reported to a small
 file of its own, so when the background process is replaced the dashboard still

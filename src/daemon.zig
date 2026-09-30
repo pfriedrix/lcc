@@ -1430,6 +1430,130 @@ test "two sessions in one worktree each get their own status" {
     }
 }
 
+test "stopping a removed worktree's sessions ends the agents in it and leaves a sibling's running" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try tmp.dir.createDirPath(io, "pe-1");
+    try tmp.dir.createDirPath(io, "pe-12");
+    const removed = try std.fs.path.join(arena, &.{ base, "pe-1" });
+    const sibling = try std.fs.path.join(arena, &.{ base, "pe-12" });
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("LCC_WATCH_DIR", base);
+    const socket_path = watch_paths.socket(arena, &environ) catch |err| switch (err) {
+        error.SocketPathTooLong => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var daemon_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer daemon_arena.deinit();
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_w: Io.Writer = .fixed(&out_buf);
+    var err_w: Io.Writer = .fixed(&err_buf);
+    const daemon_app: app_mod.App = .{
+        .gpa = daemon_arena.allocator(),
+        .io = io,
+        .environ = &environ,
+        .ui = .{ .io = io, .out = &out_w, .err = &err_w },
+    };
+
+    const thread = try std.Thread.spawn(.{}, runForTest, .{ daemon_app, Options{
+        .foreground = true,
+        .idle_exit_seconds = 3600,
+    } });
+    defer thread.join();
+
+    var budget: i32 = 15_000;
+    while (budget > 0) : (budget -= 50) {
+        if (Io.Dir.cwd().statFile(io, socket_path, .{})) |_| break else |_| {}
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+
+    var conn = try TestConn.open(arena, io, socket_path);
+    defer conn.close();
+    var b: i32 = 15_000;
+    try conn.hello(arena, &b);
+    defer conn.send(arena, .stop, wire.Stop{ .force = true }) catch {};
+
+    const register = struct {
+        fn go(c: *TestConn, a: std.mem.Allocator, program: []const u8, root: []const u8, worktree: []const u8, budget_ms: *i32) ![]const u8 {
+            try c.send(a, .register, wire.Register{
+                .worktree = worktree,
+                .branch = "feature/pe-1-removed-with-its-agent",
+                .issue = "PE-1",
+                .repo_root = root,
+                .program = program,
+                .argv = &.{},
+                .env = &.{"TERM=dumb"},
+                .cols = 80,
+                .rows = 24,
+            });
+            const registered = try wire.parse(wire.Registered, a, try c.recv(.registered, budget_ms));
+            return registered.session_id;
+        }
+    }.go;
+
+    const program = try standIn(arena, io, base, stand_in_cat);
+    const doomed = try register(&conn, arena, program, base, removed, &b);
+    const neighbour = try register(&conn, arena, program, base, sibling, &b);
+
+    const statusOf = struct {
+        fn get(c: *TestConn, a: std.mem.Allocator, id: []const u8, budget_ms: *i32) ![]const u8 {
+            try c.send(a, .list, .{});
+            const view = try wire.parse(wire.Snapshot, a, try c.recv(.snapshot, budget_ms));
+            for (view.sessions) |s| {
+                if (std.mem.eql(u8, s.id, id)) return s.status;
+            }
+            return "<none>";
+        }
+    }.get;
+
+    var client_out: Io.Writer = .fixed(&out_buf);
+    var client_err: Io.Writer = .fixed(&err_buf);
+    const client_app: app_mod.App = .{
+        .gpa = arena,
+        .io = io,
+        .environ = &environ,
+        .ui = .{ .io = io, .out = &client_out, .err = &client_err },
+    };
+
+    const stopped = try watch_client.stopIn(client_app, removed);
+    try testing.expectEqual(@as(usize, 1), stopped);
+
+    var waited: i32 = 5_000;
+    while (waited > 0) : (waited -= 100) {
+        if (std.mem.eql(u8, try statusOf(&conn, arena, doomed, &b), "exited")) break;
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+    if (waited <= 0) {
+        std.debug.print(
+            "{s} still reads `{s}` after its worktree was stopped: `lcc remove` deletes the " ++
+                "directory and the agent keeps running in it, holding a claude process and its " ++
+                "language servers until the daemon itself dies.\n",
+            .{ doomed, try statusOf(&conn, arena, doomed, &b) },
+        );
+        return error.TestExpectedEqual;
+    }
+
+    const survived = try statusOf(&conn, arena, neighbour, &b);
+    if (std.mem.eql(u8, survived, "exited")) {
+        std.debug.print(
+            "{s} in pe-12 was stopped along with pe-1: the match treated a sibling that shares " ++
+                "the prefix as the same worktree, so removing one task kills another's agent.\n",
+            .{neighbour},
+        );
+        return error.TestExpectedEqual;
+    }
+}
+
 test "a session is launched with the hook settings, read back off the real process" {
     const gpa = testing.allocator;
     const io = testing.io;
