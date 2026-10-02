@@ -354,6 +354,20 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   byte of output set. The worktree path is *not* a unique key: `lcc open` will happily start
   a second session in a worktree that already has one.
 
+- **`claude` reads one `--settings`, and it is the last one.** Measured against the real binary:
+  a `SessionStart` hook in the first file fires on its own, and does not fire when a second
+  `--settings` follows, whatever unrelated keys that second file holds — nothing warns, the
+  flag is simply ignored. `registerSession` prepends `--settings hooks-<id>.json` to whatever
+  argv the caller registered, so the day `mcp.deny`'s denylist was appended to that argv every
+  background session stopped reporting: no `PreToolUse`, no `Notification`, no `SessionEnd`, so
+  `STATUS` held whatever registration set and `DOING` stayed empty for the whole life of the
+  session — the dashboard reading `idle` for an agent burning a minute of CPU a minute. The
+  session's own settings file is therefore the only one: `settingsJson` writes
+  `deniedMcpServers` into it from the daemon's own config read, and `withoutSettings` strips a
+  caller's `--settings` pair before it can reach the child. Anything else that has to reach a
+  background session belongs in that file too, never on the command line — and a flag that is
+  fine on `lcc start`'s direct launch (one `--settings`, no hooks) is exactly the one that is
+  not fine on the registered path.
 - **The global half of the MCP list is not on disk, however much it looks like it should be.**
   `~/.claude.json` holds user-scope servers in its root `mcpServers`, so those *are* readable —
   but a claude.ai connector is fetched from the network and leaves only partial traces
@@ -367,7 +381,8 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   costs seconds and belongs nowhere near `lcc start` or `lcc open`.
 - **`mcpCarry` and `mcpDisable` are one list to a person and two keys on purpose.** They act
   by different mechanisms — `mcpCarry` decides what goes *into* `--mcp-config`, `mcpDisable`
-  becomes a `deniedMcpServers` denylist passed as `--settings` — and they have opposite
+  becomes a `deniedMcpServers` denylist, on `--settings` for a direct launch and inside the
+  session's own settings file for a registered one — and they have opposite
   defaults: absent `mcpCarry` carries everything, absent `mcpDisable` denies nothing. Folding
   them into a single allowlist compiles and reads tidier, and it turns every existing
   `mcpCarry` value into a denial of every global server the moment lcc is upgraded, so a

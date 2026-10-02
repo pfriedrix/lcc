@@ -33,7 +33,12 @@ const Events = struct {
     SessionEnd: []const Entry,
 };
 
-const Settings = struct { hooks: Events };
+const DenyEntry = struct { serverName: []const u8 };
+
+const Settings = struct {
+    hooks: Events,
+    deniedMcpServers: ?[]const DenyEntry = null,
+};
 
 pub const blocking_matchers = [_][]const u8{
     "permission_prompt",
@@ -58,6 +63,7 @@ pub fn settingsJson(
     exe: []const u8,
     socket: []const u8,
     session: []const u8,
+    denied: []const []const u8,
 ) ![]u8 {
     const waiting = try command(gpa, exe, socket, session, .waiting);
     const active = try command(gpa, exe, socket, session, .active);
@@ -72,14 +78,38 @@ pub fn settingsJson(
         });
     }
 
-    return std.json.Stringify.valueAlloc(gpa, Settings{ .hooks = .{
-        .Notification = blocking.items,
-        .SubagentStart = &.{.{ .hooks = &.{.{ .command = active }} }},
-        .UserPromptSubmit = &.{.{ .hooks = &.{.{ .command = active }} }},
-        .PreToolUse = &.{.{ .hooks = &.{.{ .command = active }} }},
-        .Stop = &.{.{ .hooks = &.{.{ .command = idle }} }},
-        .SessionEnd = &.{.{ .hooks = &.{.{ .command = ended }} }},
-    } }, .{ .whitespace = .indent_2 });
+    var deny: ?[]const DenyEntry = null;
+    if (denied.len > 0) {
+        const entries = try gpa.alloc(DenyEntry, denied.len);
+        for (denied, entries) |name, *entry| entry.* = .{ .serverName = name };
+        deny = entries;
+    }
+
+    return std.json.Stringify.valueAlloc(gpa, Settings{
+        .hooks = .{
+            .Notification = blocking.items,
+            .SubagentStart = &.{.{ .hooks = &.{.{ .command = active }} }},
+            .UserPromptSubmit = &.{.{ .hooks = &.{.{ .command = active }} }},
+            .PreToolUse = &.{.{ .hooks = &.{.{ .command = active }} }},
+            .Stop = &.{.{ .hooks = &.{.{ .command = idle }} }},
+            .SessionEnd = &.{.{ .hooks = &.{.{ .command = ended }} }},
+        },
+        .deniedMcpServers = deny,
+    }, .{ .whitespace = .indent_2, .emit_null_optional_fields = false });
+}
+
+pub fn withoutSettings(gpa: std.mem.Allocator, argv: []const []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        if (std.mem.eql(u8, argv[i], "--settings")) {
+            i += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, argv[i], "--settings=")) continue;
+        try out.append(gpa, argv[i]);
+    }
+    return out.toOwnedSlice(gpa);
 }
 
 pub const Payload = struct {
@@ -202,7 +232,7 @@ test "the settings name every event and bake the state into each command" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const body = try settingsJson(arena, "/opt/homebrew/bin/lcc", "/home/me/.config/lcc/daemon.sock", "s-00000007");
+    const body = try settingsJson(arena, "/opt/homebrew/bin/lcc", "/home/me/.config/lcc/daemon.sock", "s-00000007", &.{});
 
     const Schema = struct {
         hooks: struct {
@@ -329,7 +359,7 @@ test "plan mode needs no hook of its own" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const body = try settingsJson(arena, "/opt/homebrew/bin/lcc", "/s.sock", "s-00000001");
+    const body = try settingsJson(arena, "/opt/homebrew/bin/lcc", "/s.sock", "s-00000001", &.{});
     try testing.expect(std.mem.indexOf(u8, body, "permission_mode") == null);
     try testing.expect(std.mem.indexOf(u8, body, "--event plan") == null);
     inline for (@typeInfo(Events).@"struct".fields) |field| {
@@ -478,4 +508,71 @@ test "the activity parse is separate, so a tool_input lcc cannot read still repo
     try testing.expect(isPlan(payload.?.permission_mode));
 
     try testing.expectEqualStrings("", describe(arena, raw));
+}
+
+test "a session is handed one settings file, because a second --settings discards the first" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const argv = [_][]const u8{
+        "--mcp-config",  "/cfg/mcp.json",
+        "--settings",    "/cfg/mcp/settings.json",
+        "--resume",      "--settings=/cfg/other.json",
+        "--model",       "fable",
+    };
+
+    const kept = try withoutSettings(arena, &argv);
+    for (kept) |arg| {
+        if (std.mem.startsWith(u8, arg, "--settings")) {
+            std.debug.print(
+                "the caller's \"{s}\" survived into the session's argv, where it sits after the " ++
+                    "daemon's own --settings and silently wins. The hook settings are then never " ++
+                    "read, so the session reports nothing for as long as it runs and the dashboard " ++
+                    "shows it idle while it works.\n",
+                .{arg},
+            );
+            return error.TestExpectedEqual;
+        }
+    }
+
+    try testing.expectEqual(@as(usize, 5), kept.len);
+    try testing.expectEqualStrings("--mcp-config", kept[0]);
+    try testing.expectEqualStrings("/cfg/mcp.json", kept[1]);
+    try testing.expectEqualStrings("--resume", kept[2]);
+    try testing.expectEqualStrings("--model", kept[3]);
+    try testing.expectEqualStrings("fable", kept[4]);
+}
+
+test "the servers switched off travel in the settings file that already carries the hooks" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const denied = [_][]const u8{ "context7", "tavily" };
+    const body = try settingsJson(arena, "/bin/lcc", "/s.sock", "s-00000001", &denied);
+
+    const Schema = struct {
+        hooks: struct { Stop: []struct { hooks: []struct { command: []const u8 } } },
+        deniedMcpServers: []struct { serverName: []const u8 },
+    };
+    const parsed = try std.json.parseFromSlice(Schema, arena, body, .{ .ignore_unknown_fields = true });
+
+    try testing.expectEqual(@as(usize, 2), parsed.value.deniedMcpServers.len);
+    try testing.expectEqualStrings("context7", parsed.value.deniedMcpServers[0].serverName);
+    try testing.expectEqualStrings("tavily", parsed.value.deniedMcpServers[1].serverName);
+    try testing.expect(std.mem.indexOf(u8, parsed.value.hooks.Stop[0].hooks[0].command, "--event idle") != null);
+}
+
+test "denying nothing leaves the key out rather than writing an empty denial" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = try settingsJson(arena, "/bin/lcc", "/s.sock", "s-00000001", &.{});
+    try testing.expect(std.mem.indexOf(u8, body, "deniedMcpServers") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "null") == null);
 }
