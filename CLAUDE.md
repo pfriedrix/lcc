@@ -392,6 +392,18 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   make the whole answer `unknown`, never be skipped, or its session reads as stopped and its
   scratchpad is deleted under a running agent.
 
+- **A seeded `workspace-state.json` is rewritten through a JSON parse, never by string
+  replacement.** The default worktree template nests worktrees *inside* the main checkout
+  (`{repoRoot}/.lcc/worktrees/…`), so the donor root is a prefix of the target root, and a
+  replace of `"/x/App/` by `"/x/App/.lcc/worktrees/pe-1/` leaves output that still contains the
+  donor prefix — any "verify nothing of the donor is left" check then fails on a correct result,
+  or a second pass rewrites it twice. `package_seed.rewriteValue` touches each string once, by
+  prefix with a `/` boundary, so `/x/AppOther` is not `/x/App`. Measured against a real Xcode:
+  the re-serialised file (different whitespace, same values) resolves with zero package files changed.
+  The DerivedData folder name is `stem-` plus Xcode's MD5-based hash of the workspace path;
+  `folderName` was checked against five folders Xcode made itself before its fixtures were
+  computed. A wrong hash fails silently — the seed lands in a folder Xcode never opens.
+
 ## Style
 
 **The Zig sources carry no comments.** No `//!` module headers, no `///` on declarations,

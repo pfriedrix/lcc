@@ -3,18 +3,21 @@ const Io = std.Io;
 const app_mod = @import("../app.zig");
 const claude = @import("../claude.zig");
 const config = @import("../config.zig");
+const dd = @import("../derived_data.zig");
 const disk = @import("../disk.zig");
 const git = @import("../git.zig");
 const link = @import("../link.zig");
 const linear = @import("../linear.zig");
 const mcp = @import("../mcp.zig");
 const oauth = @import("../oauth.zig");
+const package_seed = @import("../package_seed.zig");
 const prompt = @import("../prompt.zig");
 const repos = @import("../repos.zig");
 const ui = @import("../ui.zig");
 const usage = @import("../usage.zig");
 const watch_client = @import("../watch_client.zig");
 const watch_cmd = @import("watch.zig");
+const xcode = @import("../xcode.zig");
 
 const priority_label = [_][]const u8{ "   ", "U  ", "H  ", "M  ", "L  " };
 
@@ -346,6 +349,31 @@ fn warnIfLowOnDisk(app: app_mod.App, at: []const u8) void {
     app.ui.hint("  Reclaim space first: lcc clean, then lcc remove --merged", .{});
 }
 
+fn seedPackages(app: app_mod.App, opts: Opts, worktrees: []const git.WorktreeEntry, path: []const u8) void {
+    const target = (xcode.findTarget(app.gpa, app.io, path, 4) catch return) orelse return;
+    if (target.kind == .package) return;
+    if (!std.mem.startsWith(u8, target.path, path) or target.path.len <= path.len + 1) return;
+    const relative = target.path[path.len + 1 ..];
+
+    const dd_root = dd.root(app.gpa, app.io, app.environ) catch return;
+    const entries = dd.list(app.gpa, app.io, dd_root) catch return;
+    var roots: std.ArrayList([]const u8) = .empty;
+    for (worktrees) |entry| roots.append(app.gpa, entry.path) catch return;
+
+    const donor = (package_seed.pickDonor(app.gpa, app.io, entries, roots.items, path, relative) catch return) orelse return;
+    const outcome = package_seed.seed(app.gpa, app.io, dd_root, donor, path, target.path) catch |err| {
+        app.ui.warn("Could not seed Swift packages: {s} — Xcode resolves them itself on first open.", .{@errorName(err)});
+        return;
+    };
+    switch (outcome) {
+        .seeded => |from| if (!opts.json) app.ui.success("Seeded Swift packages from {s} — an APFS clone, nothing to download", .{
+            std.fs.path.basename(from.root),
+        }),
+        .exists => {},
+        .failed => |why| app.ui.warn("Could not seed Swift packages: {s} — Xcode resolves them itself on first open.", .{why}),
+    }
+}
+
 fn bootstrap(
     app: app_mod.App,
     opts: Opts,
@@ -429,6 +457,7 @@ fn bootstrap(
             };
             app.ui.success("Worktree {s}: {s}", .{ summary, wt.path });
         }
+        seedPackages(app, opts, entries, path);
     }
 
     var linked: std.ArrayList([]const u8) = .empty;

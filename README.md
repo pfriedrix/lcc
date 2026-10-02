@@ -737,6 +737,16 @@ Set `LCC_DERIVED_DATA` to override the location; otherwise `lcc` honours Xcode's
 
 A new worktree is cheap for git and expensive for Xcode: its first open resolves every Swift package into a DerivedData folder of its own, and a build doubles that. `lcc start` checks the free space on the repository's volume before it creates a worktree, and warns below 20 GB — the point where two or three more worktrees fill the disk. It never refuses; the warning names `lcc clean` and `lcc remove --merged`, which are where the space usually is.
 
+### Seeding Swift packages
+
+Most of that first-open cost is the same bytes every time. Measured on an app with Firebase, Sentry and Amplitude: a fresh worktree's `SourcePackages` reached **5.6 GB before anything was built** — 4.3 GB of unpacked binary frameworks (Sentry alone is 2.9 GB) and 1.2 GB of package git clones — identical in every worktree on the same `Package.resolved`, and downloaded again for each one.
+
+So when `lcc start` creates a worktree of an Xcode project, it hands Xcode those packages up front. It picks a sibling worktree of the same repository — the main checkout counts — whose DerivedData already holds resolved packages, preferring one with a byte-identical `Package.resolved` and then the most recently resolved, and clones its `SourcePackages` into the folder Xcode will use for the new worktree. The clone is APFS `clonefile`: one call for the whole tree, under a second, and it shares every block with the donor until one side writes, so the new worktree's 5.6 GB cost about 50 MB of disk. Xcode's first open then resolves in place — nothing downloaded, nothing unpacked, not one package file rewritten; Xcode only re-saves `workspace-state.json` with the same paths.
+
+Two details make that work. The DerivedData folder name is Xcode's own hash of the workspace path, so `lcc` computes it and creates the folder before Xcode ever sees the worktree, with an `info.plist` naming the workspace — which is also what lets `lcc remove` and `lcc clean` find it later. And `workspace-state.json` records absolute paths, both of the DerivedData folder and of the worktree's local packages, so `lcc` rewrites every string that starts with the donor's folder or the donor's checkout to the new ones; paths elsewhere are left alone.
+
+Seeding is skipped when there is no Xcode project, no donor, or Xcode already made the folder; any failure says so and leaves Xcode to resolve as it always did. The folder is assembled under a dot-name and renamed into place at the end, so Xcode never opens a half-seeded one.
+
 ## The Xcode window standing on the worktree
 
 A worktree open in Xcode does not stop `git worktree remove`, so the directory goes and the window stays — sitting on a path that no longer exists. `lcc remove` asks Xcode to close it first, and says so before it does:

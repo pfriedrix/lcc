@@ -690,6 +690,7 @@ test {
     _ = @import("mcp.zig");
     _ = @import("mcp_roster.zig");
     _ = @import("oauth.zig");
+    _ = @import("package_seed.zig");
     _ = @import("plist.zig");
     _ = @import("prompt.zig");
     _ = @import("pty.zig");
