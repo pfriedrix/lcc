@@ -128,7 +128,7 @@ pub fn daemonOutdated(state: State, binary_modified: ?i64) bool {
 }
 
 pub fn present(io: Io, session: Session) bool {
-    return !disk.isGone(io, session.worktree);
+    return !disk.isUnlinked(io, session.worktree);
 }
 
 pub fn visible(io: Io, session: Session, daemon_alive: bool) ?Status {
@@ -279,9 +279,13 @@ test "a dead daemon makes every status unknown, whatever the file claims" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const here = try linkedWorktree(arena, io, tmp.dir);
+
     const live: State = .{
         .daemon = .{ .pid = 1, .wrote_at = 1000 },
-        .sessions = &.{.{ .id = "s-a", .worktree = "/", .status = "active", .last_activity_at = 990 }},
+        .sessions = &.{.{ .id = "s-a", .worktree = here, .status = "active", .last_activity_at = 990 }},
     };
     try testing.expect(alive(live));
     const live_rows = try resolved(arena, io, live, 1005);
@@ -290,7 +294,7 @@ test "a dead daemon makes every status unknown, whatever the file claims" {
 
     const dead: State = .{
         .daemon = .{ .pid = 0x7fff_fffe, .wrote_at = 1000 },
-        .sessions = &.{.{ .id = "s-a", .worktree = "/", .status = "active" }},
+        .sessions = &.{.{ .id = "s-a", .worktree = here, .status = "active" }},
     };
     try testing.expect(!alive(dead));
     const dead_rows = try resolved(arena, io, dead, 1005);
@@ -305,9 +309,13 @@ test "staleness is reported past the window, and a backwards clock is not freshn
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const here = try linkedWorktree(arena, io, tmp.dir);
+
     const state: State = .{
         .daemon = .{ .pid = 1, .wrote_at = 1000 },
-        .sessions = &.{.{ .id = "s-a", .worktree = "/", .status = "idle" }},
+        .sessions = &.{.{ .id = "s-a", .worktree = here, .status = "idle" }},
     };
 
     try testing.expect(!(try resolved(arena, io, state, 1000 + stale_after_seconds))[0].stale);
@@ -344,7 +352,7 @@ test "a session whose worktree was deleted stops being a row at all" {
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const base = try linkedWorktree(arena, io, tmp.dir);
     const removed = try std.fs.path.join(arena, &.{ base, "removed" });
 
     const state: State = .{
@@ -380,7 +388,7 @@ test "a deleted worktree is gone from the list whether or not a daemon is still 
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const base = try linkedWorktree(arena, io, tmp.dir);
     const removed = try std.fs.path.join(arena, &.{ base, "removed" });
 
     const dead: State = .{
@@ -412,7 +420,7 @@ test "the count the daemon reports is the count the dashboard shows, not everyth
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const base = try linkedWorktree(arena, io, tmp.dir);
     const removed = try std.fs.path.join(arena, &.{ base, "removed" });
 
     const state: State = .{
@@ -435,6 +443,47 @@ test "the count the daemon reports is the count the dashboard shows, not everyth
         return error.TestExpectedEqual;
     }
     try testing.expectEqual(@as(usize, 1), visibleCount(io, state));
+}
+
+test "a worktree folder git removed but something wrote back into is not a row" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try linkedWorktree(arena, io, tmp.dir);
+    try tmp.dir.createDirPath(io, "leftover");
+    try tmp.dir.writeFile(io, .{ .sub_path = "leftover/.DS_Store", .data = "" });
+    const leftover = try std.fs.path.join(arena, &.{ base, "leftover" });
+
+    const state: State = .{
+        .daemon = .{ .pid = 1, .wrote_at = 1000 },
+        .sessions = &.{
+            .{ .id = "s-here", .worktree = base, .status = "waiting" },
+            .{ .id = "s-left", .worktree = leftover, .status = "exited" },
+        },
+    };
+
+    const rows = try resolved(arena, io, state, 1001);
+    if (rows.len != 1) {
+        std.debug.print(
+            "{d} rows for one worktree: a folder Finder kept alive with a .DS_Store after " ++
+                "`lcc remove` stays on the dashboard, missing from `lcc remove` and `lcc list`, " ++
+                "and enter on it starts an agent in a directory with no checkout in it.\n",
+            .{rows.len},
+        );
+        return error.TestExpectedEqual;
+    }
+    try testing.expectEqualStrings("s-here", rows[0].session.id);
+    try testing.expectEqual(@as(usize, 1), visibleCount(io, state));
+}
+
+fn linkedWorktree(arena: std.mem.Allocator, io: Io, dir: Io.Dir) ![]const u8 {
+    try dir.writeFile(io, .{ .sub_path = ".git", .data = "gitdir: /nowhere\n" });
+    return dir.realPathFileAlloc(io, ".", arena);
 }
 
 test "plan round-trips as text, like every other status" {

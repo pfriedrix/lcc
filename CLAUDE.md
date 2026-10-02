@@ -288,6 +288,12 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   `lcc list` shows in red and `lcc remove` needs in order to clean the entry up. Anything
   counting sessions has to ask too — `lcc daemon --status` reports `sessions.visibleCount`,
   not `state.sessions.len`, or it contradicts the list `lcc open` prints from the same file.
+  "Still exists" means the worktree's `.git` is still there, not just the folder:
+  `git worktree remove` can succeed and leave the directory behind when Finder writes a
+  `.DS_Store` into it mid-delete, and a presence check on the folder alone then keeps that
+  session on the dashboard, missing from `lcc remove` and `lcc list`, where enter starts an agent
+  in a directory with no checkout. `disk.isUnlinked` is that check, and it keeps
+  `disk.presence`'s narrowness: only `FileNotFound` / `NotDir` on the `.git` entry counts.
 - **"Gone" is a narrower answer than "the stat failed".** `disk.presence` separates the two and
   `isGone` is the one a row is hidden on, because the predicate now runs against *live*
   sessions: collapse `AccessDenied`, `SymLinkLoop`, a stalled mount or a deleted cwd into

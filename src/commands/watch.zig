@@ -805,6 +805,7 @@ test "a session the daemon is still running in a deleted worktree is dropped too
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git", .data = "gitdir: /nowhere\n" });
     const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
     const removed = try std.fs.path.join(arena, &.{ base, "removed" });
 
