@@ -8,6 +8,7 @@ extern "c" fn clonefile(src: [*:0]const u8, dst: [*:0]const u8, flags: u32) c_in
 pub const Donor = struct {
     entry: dd.Entry,
     root: []const u8,
+    main: bool = false,
 };
 
 pub const Outcome = union(enum) {
@@ -48,6 +49,7 @@ pub fn pickDonor(
     gpa: std.mem.Allocator,
     io: Io,
     entries: []const dd.Entry,
+    main_root: ?[]const u8,
     roots: []const []const u8,
     target_root: []const u8,
     relative_workspace: []const u8,
@@ -69,15 +71,18 @@ pub fn pickDonor(
             const theirs = readOrNull(gpa, io, try resolvedFile(gpa, workspace));
             const matches = wanted != null and theirs != null and std.mem.eql(u8, wanted.?, theirs.?);
 
+            const main = if (main_root) |m| std.mem.eql(u8, root, m) else false;
             const better = if (best == null)
                 true
+            else if (main != best.?.main)
+                main
             else if (matches != best_matches)
                 matches
             else
                 mtime > best_mtime;
             if (!better) continue;
 
-            best = .{ .entry = entry, .root = root };
+            best = .{ .entry = entry, .root = root, .main = main };
             best_matches = matches;
             best_mtime = mtime;
         }
@@ -331,7 +336,7 @@ test "a seeded worktree finds the donor's packages under its own DerivedData nam
     try fakeDonor(io, tmp.dir, try std.fmt.allocPrint(arena, "DerivedData/{s}", .{std.fs.path.basename(donor_folder)}), main_ws, state);
 
     const entries = try dd.list(arena, io, dd_root);
-    const donor = (try pickDonor(arena, io, entries, &.{ main_root, wt_root }, wt_root, "App.xcodeproj")) orelse {
+    const donor = (try pickDonor(arena, io, entries, main_root, &.{ main_root, wt_root }, wt_root, "App.xcodeproj")) orelse {
         std.debug.print("the main checkout's DerivedData was not picked as a donor for its own worktree.\n", .{});
         return error.TestUnexpectedResult;
     };
@@ -416,6 +421,51 @@ test "a donor resolved to the same package versions wins over a fresher one that
         try std.fs.path.join(arena, &.{ base, "same" }),
         try std.fs.path.join(arena, &.{ base, "target" }),
     };
-    const donor = (try pickDonor(arena, io, entries, &roots, roots[2], "App.xcodeproj")).?;
+    const donor = (try pickDonor(arena, io, entries, null, &roots, roots[2], "App.xcodeproj")).?;
     try std.testing.expectEqualStrings("App-same", donor.entry.name);
+}
+
+test "the main checkout is the donor whenever it has packages, even against a closer sibling" {
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const resolved_at = "project.xcworkspace/xcshareddata/swiftpm";
+    for ([_][]const u8{ "main", "sibling", "target" }) |root| {
+        try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/App.xcodeproj/{s}", .{ root, resolved_at }));
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "target/App.xcodeproj/" ++ resolved_at ++ "/Package.resolved", .data = "v2" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "sibling/App.xcodeproj/" ++ resolved_at ++ "/Package.resolved", .data = "v2" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main/App.xcodeproj/" ++ resolved_at ++ "/Package.resolved", .data = "v1" });
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    try fakeDonor(io, tmp.dir, "DerivedData/App-main", try std.fs.path.join(arena, &.{ base, "main", "App.xcodeproj" }), "{}");
+    try fakeDonor(io, tmp.dir, "DerivedData/App-sibling", try std.fs.path.join(arena, &.{ base, "sibling", "App.xcodeproj" }), "{}");
+
+    const dd_root = try std.fs.path.join(arena, &.{ base, "DerivedData" });
+    const main_root = try std.fs.path.join(arena, &.{ base, "main" });
+    const roots = [_][]const u8{
+        try std.fs.path.join(arena, &.{ base, "sibling" }),
+        main_root,
+        try std.fs.path.join(arena, &.{ base, "target" }),
+    };
+
+    const donor = (try pickDonor(arena, io, try dd.list(arena, io, dd_root), main_root, &roots, roots[2], "App.xcodeproj")).?;
+    if (!donor.main) {
+        std.debug.print(
+            "{s} was picked over the main checkout: which worktree feeds the next one depends on " ++
+                "whichever was resolved last, so the packages drift with every branch instead of " ++
+                "following the checkout the work is cut from.\n",
+            .{donor.entry.name},
+        );
+        return error.TestUnexpectedResult;
+    }
+
+    try Io.Dir.cwd().deleteTree(io, try std.fs.path.join(arena, &.{ dd_root, "App-main" }));
+    const fallback = (try pickDonor(arena, io, try dd.list(arena, io, dd_root), main_root, &roots, roots[2], "App.xcodeproj")).?;
+    try std.testing.expectEqualStrings("App-sibling", fallback.entry.name);
+    try std.testing.expect(!fallback.main);
 }

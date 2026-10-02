@@ -358,17 +358,27 @@ fn seedPackages(app: app_mod.App, opts: Opts, worktrees: []const git.WorktreeEnt
     const dd_root = dd.root(app.gpa, app.io, app.environ) catch return;
     const entries = dd.list(app.gpa, app.io, dd_root) catch return;
     var roots: std.ArrayList([]const u8) = .empty;
-    for (worktrees) |entry| roots.append(app.gpa, entry.path) catch return;
+    var main_root: ?[]const u8 = null;
+    for (worktrees) |entry| {
+        roots.append(app.gpa, entry.path) catch return;
+        if (entry.is_main) main_root = entry.path;
+    }
 
-    const donor = (package_seed.pickDonor(app.gpa, app.io, entries, roots.items, path, relative) catch return) orelse return;
+    const donor = (package_seed.pickDonor(app.gpa, app.io, entries, main_root, roots.items, path, relative) catch return) orelse {
+        if (!opts.json) app.ui.hint("No resolved Swift packages to seed from — open the main checkout in Xcode once, and later worktrees start with them.", .{});
+        return;
+    };
     const outcome = package_seed.seed(app.gpa, app.io, dd_root, donor, path, target.path) catch |err| {
         app.ui.warn("Could not seed Swift packages: {s} — Xcode resolves them itself on first open.", .{@errorName(err)});
         return;
     };
     switch (outcome) {
-        .seeded => |from| if (!opts.json) app.ui.success("Seeded Swift packages from {s} — an APFS clone, nothing to download", .{
-            std.fs.path.basename(from.root),
-        }),
+        .seeded => |from| if (!opts.json) {
+            app.ui.success("Seeded Swift packages from {s} — an APFS clone, nothing to download", .{
+                if (from.main) "the main checkout" else std.fs.path.basename(from.root),
+            });
+            if (!from.main) app.ui.hint("  The main checkout has no resolved packages yet — open it in Xcode once to make it the source.", .{});
+        },
         .exists => {},
         .failed => |why| app.ui.warn("Could not seed Swift packages: {s} — Xcode resolves them itself on first open.", .{why}),
     }
