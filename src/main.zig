@@ -109,9 +109,11 @@ const usage =
     \\    --keep-branch          leave the git branch in place
     \\    --keep-xcode           don't ask Xcode to close the worktree it has open
     \\    --sessions             also delete Claude Code session transcripts
-    \\  clean                    Delete what worktrees that no longer exist left behind
+    \\  clean                    Delete what worktrees that no longer exist left behind,
+    \\                           and the scratch folders of stopped Claude Code sessions
     \\    --build-data           only Xcode DerivedData
     \\    --sessions             only Claude Code session transcripts
+    \\    --scratch              only scratch folders of sessions no longer running
     \\    -y, --yes              delete every orphaned folder without prompting
     \\
     \\  -h, --help               show this help
@@ -590,6 +592,8 @@ fn cleanCommand(app: app_mod.App, args: []const []const u8) !void {
             opts.build_data = true;
         } else if (eq(arg, "--sessions")) {
             opts.sessions = true;
+        } else if (eq(arg, "--scratch")) {
+            opts.scratch = true;
         } else return error.UnknownOption;
     }
     return clean_cmd.run(app, opts);
@@ -671,6 +675,7 @@ test {
     _ = @import("app.zig");
     _ = @import("claude.zig");
     _ = @import("claude_projects.zig");
+    _ = @import("claude_tmp.zig");
     _ = @import("config.zig");
     _ = @import("daemon.zig");
     _ = @import("derived_data.zig");
@@ -685,6 +690,7 @@ test {
     _ = @import("mcp.zig");
     _ = @import("mcp_roster.zig");
     _ = @import("oauth.zig");
+    _ = @import("package_seed.zig");
     _ = @import("plist.zig");
     _ = @import("prompt.zig");
     _ = @import("pty.zig");

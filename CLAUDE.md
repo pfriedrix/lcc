@@ -80,7 +80,7 @@ Conventions inside a test:
   `readMutation`, `unwrap` in `src/linear.zig`) — no requests, no Keychain reads.
 - Never let a test touch real state under `$HOME`. Build a `std.process.Environ.Map` and set
   the override the module reads: `LCC_REPOS`, `LCC_USAGE_CACHE`, `LCC_REMOTE_CACHE`,
-  `LCC_CLAUDE_PROJECTS`, `LCC_CLAUDE_JSON`, `LCC_MCP_ROSTER`, `LCC_DERIVED_DATA`,
+  `LCC_CLAUDE_PROJECTS`, `LCC_CLAUDE_TMP`, `LCC_CLAUDE_SESSIONS`, `LCC_CLAUDE_JSON`, `LCC_MCP_ROSTER`, `LCC_DERIVED_DATA`,
   `LCC_SESSIONS`, `LCC_WATCH_DIR`. The last one moves the socket, the lock, the hook settings and the
   recovered-status files together, so it is the one the daemon and `watch_state` tests need.
 - Failure messages carry what a wrong answer costs, not just the mismatch. `start_plan_test.zig`
@@ -379,6 +379,30 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   entered twice. `browse` iterates that filtered slice rather than `keys`, so a `cursor`
   bounded by `keys.len` is the bug to watch for; the flat `lcc config` listing still prints
   both, because there the names are the file's own.
+
+- **A session record is read by search, never parsed.** Claude Code rewrites
+  `~/.claude/sessions/<pid>.json` in place without truncating, so a shorter status update leaves
+  the tail of the previous one after the closing brace — measured on a live machine, two of six
+  records were not valid JSON. `claude_tmp.live` therefore takes the pid from the file name and
+  the session id from the first `"sessionId":"…"`, the same move `claude_projects.extractCwd`
+  makes for transcripts. Swapping that for `std.json` compiles, passes every test written with a
+  clean record, and turns the running set `unknown` on most real machines — which is the safe
+  answer, so nothing breaks loudly: `lcc clean` just never offers a scratch folder again. The
+  other direction is the one that costs data: a live process whose record yields no id has to
+  make the whole answer `unknown`, never be skipped, or its session reads as stopped and its
+  scratchpad is deleted under a running agent.
+
+- **A seeded `workspace-state.json` is rewritten through a JSON parse, never by string
+  replacement.** The default worktree template nests worktrees *inside* the main checkout
+  (`{repoRoot}/.lcc/worktrees/…`), so the donor root is a prefix of the target root, and a
+  replace of `"/x/App/` by `"/x/App/.lcc/worktrees/pe-1/` leaves output that still contains the
+  donor prefix — any "verify nothing of the donor is left" check then fails on a correct result,
+  or a second pass rewrites it twice. `package_seed.rewriteValue` touches each string once, by
+  prefix with a `/` boundary, so `/x/AppOther` is not `/x/App`. Measured against a real Xcode:
+  the re-serialised file (different whitespace, same values) resolves with zero package files changed.
+  The DerivedData folder name is `stem-` plus Xcode's MD5-based hash of the workspace path;
+  `folderName` was checked against five folders Xcode made itself before its fixtures were
+  computed. A wrong hash fails silently — the seed lands in a folder Xcode never opens.
 
 ## Style
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const app_mod = @import("../app.zig");
 const cp = @import("../claude_projects.zig");
+const ct = @import("../claude_tmp.zig");
 const dd = @import("../derived_data.zig");
 const disk = @import("../disk.zig");
 const git = @import("../git.zig");
@@ -421,6 +422,7 @@ fn removeSelected(
         app.ui.success("Removed worktree {f}", .{ui.cyan(label)});
         stopAgents(app, entry.path, label);
         reclaimed += try purgeDerived(app, row.attached.derived, dd_root);
+        reclaimed += try purgeScratch(app, entry.path);
         if (opts.sessions) {
             reclaimed += try purgeSessions(app, row.attached.sessions, cp_root);
         } else {
@@ -652,6 +654,30 @@ fn purgeSessions(app: app_mod.App, sized: []const cp.Sized, root: []const u8) !u
     return reclaimed;
 }
 
+fn purgeScratch(app: app_mod.App, worktree_path: []const u8) !u64 {
+    const root = try ct.root(app.gpa, app.environ);
+    const running = try ct.live(app.gpa, app.io, try ct.sessionsRoot(app.gpa, app.environ));
+    const entries = try ct.forWorktree(app.gpa, app.io, try ct.list(app.gpa, app.io, root, running), worktree_path);
+
+    var reclaimed: u64 = 0;
+    for (try ct.withSizes(app.gpa, app.io, entries)) |item| {
+        ct.remove(app.io, item.entry, root) catch |err| {
+            app.ui.warn("Could not remove scratch {s}: {s}", .{ item.entry.name, @errorName(err) });
+            continue;
+        };
+        reclaimed += item.size;
+        app.ui.success("Removed scratch of {d} stopped session{s} {f}", .{
+            item.entry.stopped.len,
+            plural(item.entry.stopped.len),
+            ui.yellow(try std.fmt.allocPrint(app.gpa, "({f})", .{ui.bytes(item.size)})),
+        });
+        if (item.entry.running > 0) {
+            app.ui.hint("  {d} still running there — `lcc clean --scratch` takes it once it stops.", .{item.entry.running});
+        }
+    }
+    return reclaimed;
+}
+
 fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
     if (!opts.local) refresh(app, repo);
 
@@ -738,6 +764,7 @@ fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
             app.ui.success("Removed worktree {f}", .{ui.cyan(branch)});
 
             reclaimed += try purgeDerived(app, row.attached.derived, dd_root);
+            reclaimed += try purgeScratch(app, entry.path);
             if (opts.sessions) {
                 reclaimed += try purgeSessions(app, row.attached.sessions, cp_root);
             }

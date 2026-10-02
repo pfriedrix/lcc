@@ -92,7 +92,8 @@ lcc open --stop-all  # end every session running in the background
 lcc open xcode       # pick a worktree and open it in Xcode instead
 lcc remove           # select worktrees, remove them + their branches + Xcode build data
 lcc remove --merged  # bulk: every worktree and branch whose work already landed
-lcc clean            # reclaim build data and transcripts left by worktrees that are gone
+lcc clean            # reclaim build data and transcripts left by worktrees that are gone,
+                     # and the scratch folders of Claude Code sessions that have stopped
 lcc auth             # log in
 lcc auth --status    # who am I, when does the token expire
 lcc auth --logout    # clear the token from the Keychain
@@ -732,6 +733,20 @@ Folders without an `info.plist` — Xcode's own shared caches — are never touc
 
 Set `LCC_DERIVED_DATA` to override the location; otherwise `lcc` honours Xcode's own `IDECustomDerivedDataLocation` when it is absolute.
 
+## Disk space
+
+A new worktree is cheap for git and expensive for Xcode: its first open resolves every Swift package into a DerivedData folder of its own, and a build doubles that. `lcc start` checks the free space on the repository's volume before it creates a worktree, and warns below 20 GB — the point where two or three more worktrees fill the disk. It never refuses; the warning names `lcc clean` and `lcc remove --merged`, which are where the space usually is.
+
+### Seeding Swift packages
+
+Most of that first-open cost is the same bytes every time. Measured on an app with Firebase, Sentry and Amplitude: a fresh worktree's `SourcePackages` reached **5.6 GB before anything was built** — 4.3 GB of unpacked binary frameworks (Sentry alone is 2.9 GB) and 1.2 GB of package git clones — identical in every worktree on the same `Package.resolved`, and downloaded again for each one.
+
+So when `lcc start` creates a worktree of an Xcode project, it hands Xcode those packages up front. The source is the main checkout: worktrees are cut from it, so it is the one place packages are resolved for real, and every worktree only consumes them — which keeps what a new worktree starts with from depending on whichever branch happened to be opened last. Only when the main checkout's DerivedData holds no resolved packages yet does `lcc` fall back to a sibling worktree — a byte-identical `Package.resolved` first, then the most recently resolved — and says that opening the main checkout in Xcode once fixes it. The packages are cloned into the folder Xcode will use for the new worktree. The clone is APFS `clonefile`: one call for the whole tree, under a second, and it shares every block with the donor until one side writes, so the new worktree's 5.6 GB cost about 50 MB of disk. Xcode's first open then resolves in place — nothing downloaded, nothing unpacked, not one package file rewritten; Xcode only re-saves `workspace-state.json` with the same paths.
+
+Two details make that work. The DerivedData folder name is Xcode's own hash of the workspace path, so `lcc` computes it and creates the folder before Xcode ever sees the worktree, with an `info.plist` naming the workspace — which is also what lets `lcc remove` and `lcc clean` find it later. And `workspace-state.json` records absolute paths, both of the DerivedData folder and of the worktree's local packages, so `lcc` rewrites every string that starts with the donor's folder or the donor's checkout to the new ones; paths elsewhere are left alone.
+
+Seeding is skipped when there is no Xcode project, no donor, or Xcode already made the folder; any failure says so and leaves Xcode to resolve as it always did. The folder is assembled under a dot-name and renamed into place at the end, so Xcode never opens a half-seeded one.
+
 ## The Xcode window standing on the worktree
 
 A worktree open in Xcode does not stop `git worktree remove`, so the directory goes and the window stays — sitting on a path that no longer exists. `lcc remove` asks Xcode to close it first, and says so before it does:
@@ -761,6 +776,16 @@ Claude Code names each directory after a flattened cwd, and that flattening is l
 Transcripts are treated as more valuable than build data, because they are: a DerivedData folder comes back on the next build and a transcript is what `claude --resume` replays. So `lcc remove` **lists** the matching folders in its confirmation and keeps them; `--sessions` is what actually deletes them.
 
 Set `LCC_CLAUDE_PROJECTS` to override the location.
+
+## Claude Code scratch folders
+
+Claude Code gives every session a temp folder, `/private/tmp/claude-<uid>/<flattened cwd>/<session id>/`, and the agent parks whatever it likes in its `scratchpad` — a private DerivedData for an `xcodebuild -derivedDataPath`, a copy of a build to diff against, an Instruments trace. Nothing ever deletes them: macOS does not empty `/private/tmp` while the machine stays up, and one profiling session can leave 27 GB behind. On a machine that had filled its disk to the last byte, these folders held 48 GB.
+
+They are tied to a *session*, not a worktree, so the main checkout collects them as fast as any worktree does, and a worktree that still exists can be carrying gigabytes from sessions that ended weeks ago. `lcc` therefore decides by whether the session is still running. Claude Code keeps a record per running process in `~/.claude/sessions/<pid>.json`; a scratch folder is offered only when no live process names its session id. Anything that makes that answer uncertain — no `sessions` directory, an unreadable record for a process that is alive — offers nothing at all rather than guessing. Only folders named like a session id are considered; anything else an agent created at the top level is left alone.
+
+`lcc remove` deletes the scratch folders of the worktree it removes, after stopping its background sessions; a session still shutting down keeps its folder, and the next `lcc clean` takes it. A session resumed after its scratch folder went starts with an empty one — nothing in there is meant to outlive the session.
+
+Set `LCC_CLAUDE_TMP` and `LCC_CLAUDE_SESSIONS` to override the two locations.
 
 ## Token usage
 
@@ -826,19 +851,21 @@ The cache lives under `~/.cache`, not `~/.config/lcc` like the rest of lcc's sta
 
 ## `lcc clean`
 
-The backlog of both: every DerivedData folder and Claude project directory whose worktree no longer exists on disk, biggest first, in one checkbox list.
+The backlog of all three: every DerivedData folder and Claude project directory whose worktree no longer exists on disk, and every scratch folder whose session has stopped, biggest first, in one checkbox list.
 
 ```
 $ lcc clean
-› Measuring 31 orphaned folders…
-14 GB in 31 folders whose worktree no longer exists.
+› Measuring 33 orphaned folders…
+41 GB in 33 folders nothing is using any more.
 Session transcripts are what `claude --resume` replays — check before deleting.
+Scratch folders are temp files of sessions that have stopped — a resumed session starts with an empty one.
 ? Select what to delete (space toggles, enter confirms):
-❯ ◉  2.4 GB  build data  App-fmqzbi…  ~/…/pe-224-history-empty-states
-  ◉   12 MB  sessions    -Users-…-pe-224-history  ~/…/pe-224-history-empty-states
+❯ ◉   27 GB  scratch     -Users-…-App                  /private/tmp/claude-501/-Users-…-App
+  ◉  2.4 GB  build data  App-fmqzbi…                   ~/…/pe-224-history-empty-states
+  ◉   12 MB  sessions    -Users-…-pe-224-history       ~/…/pe-224-history-empty-states
 ```
 
-`--build-data` and `--sessions` narrow it to one category; `-y` takes everything without asking.
+`--build-data`, `--sessions` and `--scratch` narrow it to one category; `-y` takes everything without asking.
 
 ## Configuration
 

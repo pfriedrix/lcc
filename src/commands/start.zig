@@ -3,18 +3,21 @@ const Io = std.Io;
 const app_mod = @import("../app.zig");
 const claude = @import("../claude.zig");
 const config = @import("../config.zig");
+const dd = @import("../derived_data.zig");
 const disk = @import("../disk.zig");
 const git = @import("../git.zig");
 const link = @import("../link.zig");
 const linear = @import("../linear.zig");
 const mcp = @import("../mcp.zig");
 const oauth = @import("../oauth.zig");
+const package_seed = @import("../package_seed.zig");
 const prompt = @import("../prompt.zig");
 const repos = @import("../repos.zig");
 const ui = @import("../ui.zig");
 const usage = @import("../usage.zig");
 const watch_client = @import("../watch_client.zig");
 const watch_cmd = @import("watch.zig");
+const xcode = @import("../xcode.zig");
 
 const priority_label = [_][]const u8{ "   ", "U  ", "H  ", "M  ", "L  " };
 
@@ -339,6 +342,48 @@ fn newestBranchForIssue(statuses: []const git.BranchStatus, suggested: []const u
     return if (best) |status| status.branch else null;
 }
 
+fn warnIfLowOnDisk(app: app_mod.App, at: []const u8) void {
+    const free = disk.available(app.gpa, app.io, at) orelse return;
+    if (free >= disk.low_free_bytes) return;
+    app.ui.warn("Only {f} free on this disk — a worktree's Xcode build data alone runs to several GB.", .{ui.bytes(free)});
+    app.ui.hint("  Reclaim space first: lcc clean, then lcc remove --merged", .{});
+}
+
+fn seedPackages(app: app_mod.App, opts: Opts, worktrees: []const git.WorktreeEntry, path: []const u8) void {
+    const target = (xcode.findTarget(app.gpa, app.io, path, 4) catch return) orelse return;
+    if (target.kind == .package) return;
+    if (!std.mem.startsWith(u8, target.path, path) or target.path.len <= path.len + 1) return;
+    const relative = target.path[path.len + 1 ..];
+
+    const dd_root = dd.root(app.gpa, app.io, app.environ) catch return;
+    const entries = dd.list(app.gpa, app.io, dd_root) catch return;
+    var roots: std.ArrayList([]const u8) = .empty;
+    var main_root: ?[]const u8 = null;
+    for (worktrees) |entry| {
+        roots.append(app.gpa, entry.path) catch return;
+        if (entry.is_main) main_root = entry.path;
+    }
+
+    const donor = (package_seed.pickDonor(app.gpa, app.io, entries, main_root, roots.items, path, relative) catch return) orelse {
+        if (!opts.json) app.ui.hint("No resolved Swift packages to seed from — open the main checkout in Xcode once, and later worktrees start with them.", .{});
+        return;
+    };
+    const outcome = package_seed.seed(app.gpa, app.io, dd_root, donor, path, target.path) catch |err| {
+        app.ui.warn("Could not seed Swift packages: {s} — Xcode resolves them itself on first open.", .{@errorName(err)});
+        return;
+    };
+    switch (outcome) {
+        .seeded => |from| if (!opts.json) {
+            app.ui.success("Seeded Swift packages from {s} — an APFS clone, nothing to download", .{
+                if (from.main) "the main checkout" else std.fs.path.basename(from.root),
+            });
+            if (!from.main) app.ui.hint("  The main checkout has no resolved packages yet — open it in Xcode once to make it the source.", .{});
+        },
+        .exists => {},
+        .failed => |why| app.ui.warn("Could not seed Swift packages: {s} — Xcode resolves them itself on first open.", .{why}),
+    }
+}
+
 fn bootstrap(
     app: app_mod.App,
     opts: Opts,
@@ -387,6 +432,7 @@ fn bootstrap(
 
         path = try git.renderWorktreePath(app.gpa, cfg.worktreeTemplate, repo.root, branch);
         base = try resolveBase(app, opts, repo, branch);
+        warnIfLowOnDisk(app, repo.root);
 
         if (!opts.json) {
             if (repo.resolveStrategy(branch) == .new) {
@@ -421,6 +467,7 @@ fn bootstrap(
             };
             app.ui.success("Worktree {s}: {s}", .{ summary, wt.path });
         }
+        seedPackages(app, opts, entries, path);
     }
 
     var linked: std.ArrayList([]const u8) = .empty;
