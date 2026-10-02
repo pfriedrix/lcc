@@ -92,7 +92,8 @@ lcc open --stop-all  # end every session running in the background
 lcc open xcode       # pick a worktree and open it in Xcode instead
 lcc remove           # select worktrees, remove them + their branches + Xcode build data
 lcc remove --merged  # bulk: every worktree and branch whose work already landed
-lcc clean            # reclaim build data and transcripts left by worktrees that are gone
+lcc clean            # reclaim build data and transcripts left by worktrees that are gone,
+                     # and the scratch folders of Claude Code sessions that have stopped
 lcc auth             # log in
 lcc auth --status    # who am I, when does the token expire
 lcc auth --logout    # clear the token from the Keychain
@@ -762,6 +763,16 @@ Transcripts are treated as more valuable than build data, because they are: a De
 
 Set `LCC_CLAUDE_PROJECTS` to override the location.
 
+## Claude Code scratch folders
+
+Claude Code gives every session a temp folder, `/private/tmp/claude-<uid>/<flattened cwd>/<session id>/`, and the agent parks whatever it likes in its `scratchpad` — a private DerivedData for an `xcodebuild -derivedDataPath`, a copy of a build to diff against, an Instruments trace. Nothing ever deletes them: macOS does not empty `/private/tmp` while the machine stays up, and one profiling session can leave 27 GB behind. On a machine that had filled its disk to the last byte, these folders held 48 GB.
+
+They are tied to a *session*, not a worktree, so the main checkout collects them as fast as any worktree does, and a worktree that still exists can be carrying gigabytes from sessions that ended weeks ago. `lcc` therefore decides by whether the session is still running. Claude Code keeps a record per running process in `~/.claude/sessions/<pid>.json`; a scratch folder is offered only when no live process names its session id. Anything that makes that answer uncertain — no `sessions` directory, an unreadable record for a process that is alive — offers nothing at all rather than guessing. Only folders named like a session id are considered; anything else an agent created at the top level is left alone.
+
+`lcc remove` deletes the scratch folders of the worktree it removes, after stopping its background sessions; a session still shutting down keeps its folder, and the next `lcc clean` takes it. A session resumed after its scratch folder went starts with an empty one — nothing in there is meant to outlive the session.
+
+Set `LCC_CLAUDE_TMP` and `LCC_CLAUDE_SESSIONS` to override the two locations.
+
 ## Token usage
 
 Claude transcripts record the API usage block on assistant messages.
@@ -826,19 +837,21 @@ The cache lives under `~/.cache`, not `~/.config/lcc` like the rest of lcc's sta
 
 ## `lcc clean`
 
-The backlog of both: every DerivedData folder and Claude project directory whose worktree no longer exists on disk, biggest first, in one checkbox list.
+The backlog of all three: every DerivedData folder and Claude project directory whose worktree no longer exists on disk, and every scratch folder whose session has stopped, biggest first, in one checkbox list.
 
 ```
 $ lcc clean
-› Measuring 31 orphaned folders…
-14 GB in 31 folders whose worktree no longer exists.
+› Measuring 33 orphaned folders…
+41 GB in 33 folders nothing is using any more.
 Session transcripts are what `claude --resume` replays — check before deleting.
+Scratch folders are temp files of sessions that have stopped — a resumed session starts with an empty one.
 ? Select what to delete (space toggles, enter confirms):
-❯ ◉  2.4 GB  build data  App-fmqzbi…  ~/…/pe-224-history-empty-states
-  ◉   12 MB  sessions    -Users-…-pe-224-history  ~/…/pe-224-history-empty-states
+❯ ◉   27 GB  scratch     -Users-…-App                  /private/tmp/claude-501/-Users-…-App
+  ◉  2.4 GB  build data  App-fmqzbi…                   ~/…/pe-224-history-empty-states
+  ◉   12 MB  sessions    -Users-…-pe-224-history       ~/…/pe-224-history-empty-states
 ```
 
-`--build-data` and `--sessions` narrow it to one category; `-y` takes everything without asking.
+`--build-data`, `--sessions` and `--scratch` narrow it to one category; `-y` takes everything without asking.
 
 ## Configuration
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const app_mod = @import("../app.zig");
 const cp = @import("../claude_projects.zig");
+const ct = @import("../claude_tmp.zig");
 const dd = @import("../derived_data.zig");
 const disk = @import("../disk.zig");
 const prompt = @import("../prompt.zig");
@@ -10,21 +11,24 @@ pub const Opts = struct {
     yes: bool = false,
     build_data: bool = false,
     sessions: bool = false,
+    scratch: bool = false,
 
     fn wants(self: Opts, kind: Kind) bool {
-        if (!self.build_data and !self.sessions) return true;
+        if (!self.build_data and !self.sessions and !self.scratch) return true;
         return switch (kind) {
             .build_data => self.build_data,
             .sessions => self.sessions,
+            .scratch => self.scratch,
         };
     }
 };
 
-const Kind = enum { build_data, sessions };
+const Kind = enum { build_data, sessions, scratch };
 
 const Target = union(Kind) {
     build_data: dd.Entry,
     sessions: cp.Entry,
+    scratch: ct.Entry,
 };
 
 const Candidate = struct {
@@ -35,6 +39,7 @@ const Candidate = struct {
         return switch (self.target) {
             .build_data => |e| e.name,
             .sessions => |e| e.name,
+            .scratch => |e| e.name,
         };
     }
 
@@ -42,6 +47,7 @@ const Candidate = struct {
         return switch (self.target) {
             .build_data => |e| e.path,
             .sessions => |e| e.path,
+            .scratch => |e| e.path,
         };
     }
 
@@ -49,6 +55,7 @@ const Candidate = struct {
         return switch (self.target) {
             .build_data => |e| e.workspace_path,
             .sessions => |e| e.cwd,
+            .scratch => |e| e.path,
         };
     }
 
@@ -56,6 +63,7 @@ const Candidate = struct {
         return switch (self.target) {
             .build_data => "build data",
             .sessions => "sessions  ",
+            .scratch => "scratch   ",
         };
     }
 
@@ -67,6 +75,7 @@ const Candidate = struct {
 pub fn run(app: app_mod.App, opts: Opts) !void {
     const dd_root = try dd.root(app.gpa, app.io, app.environ);
     const cp_root = try cp.root(app.gpa, app.environ);
+    const ct_root = try ct.root(app.gpa, app.environ);
 
     var scanned: usize = 0;
     var dead: std.ArrayList(Target) = .empty;
@@ -85,11 +94,21 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
             try dead.append(app.gpa, .{ .sessions = entry });
         }
     }
+    if (opts.wants(.scratch)) {
+        const running = try ct.live(app.gpa, app.io, try ct.sessionsRoot(app.gpa, app.environ));
+        if (running == .unknown) {
+            app.ui.warn("Could not tell which Claude Code sessions are running — leaving every scratch folder alone.", .{});
+        }
+        const entries = try ct.list(app.gpa, app.io, ct_root, running);
+        scanned += entries.len;
+        for (entries) |entry| try dead.append(app.gpa, .{ .scratch = entry });
+    }
 
     if (scanned == 0) {
-        app.ui.warn("Nothing to scan — no build data in {f} and no sessions in {f}.", .{
+        app.ui.warn("Nothing to scan — no build data in {f}, no sessions in {f}, no stopped scratch in {f}.", .{
             ui.dim(disk.abbreviate(app.gpa, app.environ, dd_root)),
             ui.dim(disk.abbreviate(app.gpa, app.environ, cp_root)),
+            ui.dim(disk.abbreviate(app.gpa, app.environ, ct_root)),
         });
         return;
     }
@@ -106,13 +125,16 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
     const candidates = try measure(app, dead.items);
     std.mem.sort(Candidate, candidates, {}, Candidate.sizeDesc);
 
-    app.ui.info("{f} in {d} folder{s} whose worktree no longer exists.", .{
+    app.ui.info("{f} in {d} folder{s} nothing is using any more.", .{
         ui.bold(try std.fmt.allocPrint(app.gpa, "{f}", .{ui.bytes(totalSize(candidates))})),
         candidates.len,
         plural(candidates.len),
     });
     if (opts.wants(.sessions)) {
         app.ui.hint("Session transcripts are what `claude --resume` replays — check before deleting.", .{});
+    }
+    if (opts.wants(.scratch)) {
+        app.ui.hint("Scratch folders are temp files of sessions that have stopped — a resumed session starts with an empty one.", .{});
     }
 
     const picked: []const Candidate = if (opts.yes) candidates else try select(app, candidates);
@@ -127,6 +149,7 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
         const result = switch (item.target) {
             .build_data => |e| dd.remove(app.gpa, app.io, e, dd_root),
             .sessions => |e| cp.remove(app.gpa, app.io, e, cp_root),
+            .scratch => |e| ct.remove(app.io, e, ct_root),
         };
         result catch |err| {
             app.ui.warn("Could not remove {s}: {s}", .{ item.name(), @errorName(err) });
@@ -145,17 +168,26 @@ pub fn run(app: app_mod.App, opts: Opts) !void {
 }
 
 fn measure(app: app_mod.App, targets: []const Target) ![]Candidate {
-    const paths = try app.gpa.alloc([]const u8, targets.len);
-    for (targets, 0..) |target, i| {
-        paths[i] = switch (target) {
-            .build_data => |e| e.path,
-            .sessions => |e| e.path,
-        };
-    }
-    const sizes = try disk.usage(app.gpa, app.io, paths);
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (targets) |target| switch (target) {
+        .build_data => |e| try paths.append(app.gpa, e.path),
+        .sessions => |e| try paths.append(app.gpa, e.path),
+        .scratch => |e| try paths.appendSlice(app.gpa, e.stopped),
+    };
+    const sizes = try disk.usage(app.gpa, app.io, paths.items);
 
     const candidates = try app.gpa.alloc(Candidate, targets.len);
-    for (targets, 0..) |target, i| candidates[i] = .{ .target = target, .size = sizes[i] };
+    var at: usize = 0;
+    for (targets, 0..) |target, i| {
+        const count = switch (target) {
+            .scratch => |e| e.stopped.len,
+            else => 1,
+        };
+        var size: u64 = 0;
+        for (sizes[at .. at + count]) |s| size += s;
+        at += count;
+        candidates[i] = .{ .target = target, .size = size };
+    }
     return candidates;
 }
 
