@@ -107,7 +107,9 @@ const usage =
     \\    -y, --yes              skip confirmation after selecting worktrees
     \\    --keep-derived-data    leave the Xcode DerivedData folder in place
     \\    --keep-branch          leave the git branch in place
-    \\    --keep-xcode           don't ask Xcode to close the worktree it has open
+    \\    --keep-xcode           don't ask Xcode to close the worktree it has open;
+    \\                           without it, a worktree Xcode cannot be seen to let
+    \\                           go of is kept
     \\    --sessions             also delete Claude Code session transcripts
     \\  clean                    Delete what worktrees that no longer exist left behind,
     \\                           and the scratch folders of stopped Claude Code sessions

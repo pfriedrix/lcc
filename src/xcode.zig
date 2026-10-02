@@ -197,7 +197,7 @@ fn component(part: ?[]const u8) u64 {
     return std.fmt.parseUnsigned(u64, text, 10) catch 0;
 }
 
-pub const Error = error{ XcodeLaunchFailed, XcodeCloseFailed } || std.mem.Allocator.Error;
+pub const Error = error{ XcodeLaunchFailed, XcodeCloseFailed, XcodeStillOpen } || std.mem.Allocator.Error;
 
 pub fn findTarget(gpa: std.mem.Allocator, io: Io, root: []const u8, max_depth: u8) !?Target {
     var found: std.ArrayList(Candidate) = .empty;
@@ -289,17 +289,27 @@ pub const Document = struct {
 
 pub const Open = struct {
     workspaces: []const Document = &.{},
+    documents: []const Document = &.{},
     unsaved: []const Document = &.{},
     unanswered: bool = false,
 
     pub fn empty(self: Open) bool {
-        return self.workspaces.len == 0 and self.unsaved.len == 0;
+        return !self.holds() and self.unsaved.len == 0;
+    }
+
+    pub fn holds(self: Open) bool {
+        return self.workspaces.len > 0 or self.documents.len > 0;
+    }
+
+    pub fn closable(self: Open, gpa: std.mem.Allocator) ![]const Document {
+        return std.mem.concat(gpa, Document, &.{ self.workspaces, self.documents });
     }
 
     pub fn inside(self: Open, gpa: std.mem.Allocator, io: Io, worktree: []const u8) !Open {
         const root_path = disk.realPath(gpa, io, worktree);
         return .{
             .workspaces = try under(gpa, self.workspaces, root_path),
+            .documents = try under(gpa, self.documents, root_path),
             .unsaved = try under(gpa, self.unsaved, root_path),
             .unanswered = self.unanswered,
         };
@@ -317,8 +327,7 @@ fn under(gpa: std.mem.Allocator, docs: []const Document, root_path: []const u8) 
 }
 
 pub fn openDocuments(gpa: std.mem.Allocator, io: Io) !Open {
-    var workspaces: std.ArrayList(Document) = .empty;
-    var unsaved: std.ArrayList(Document) = .empty;
+    var found: Found = .{};
     var unanswered = false;
 
     for (try runningApps(gpa, io)) |bundle| {
@@ -326,14 +335,36 @@ pub fn openDocuments(gpa: std.mem.Allocator, io: Io) !Open {
             unanswered = true;
             continue;
         };
-        try collect(gpa, io, bundle, listing, &workspaces, &unsaved);
+        try collect(gpa, io, bundle, listing, &found);
     }
 
-    return .{
-        .workspaces = workspaces.items,
-        .unsaved = unsaved.items,
-        .unanswered = unanswered,
-    };
+    return found.open(unanswered);
+}
+
+pub fn heldBy(gpa: std.mem.Allocator, io: Io, worktree: []const u8) !Open {
+    const all = try openDocuments(gpa, io);
+    return all.inside(gpa, io, worktree);
+}
+
+pub const confirm_polls = 50;
+const confirm_poll_ms = 200;
+
+pub fn closeAndConfirm(gpa: std.mem.Allocator, io: Io, held: Open, worktree: []const u8) Error!void {
+    try closeDocuments(gpa, io, try held.closable(gpa));
+
+    var polls: usize = 0;
+    while (true) : (polls += 1) {
+        const left = try heldBy(gpa, io, worktree);
+        if (!left.unanswered and !left.holds()) return;
+        if (polls >= confirm_polls) {
+            last_error = if (left.holds())
+                try std.fmt.allocPrint(gpa, "{s} is still open after the close", .{(try left.closable(gpa))[0].name()})
+            else
+                "Xcode stopped answering after the close";
+            return Error.XcodeStillOpen;
+        }
+        io.sleep(.fromMilliseconds(confirm_poll_ms), .awake) catch {};
+    }
 }
 
 pub fn closeDocuments(gpa: std.mem.Allocator, io: Io, docs: []const Document) Error!void {
@@ -399,13 +430,27 @@ fn query(gpa: std.mem.Allocator, io: Io, bundle: []const u8) ?[]const u8 {
     return out.stdout;
 }
 
+const Found = struct {
+    workspaces: std.ArrayList(Document) = .empty,
+    documents: std.ArrayList(Document) = .empty,
+    unsaved: std.ArrayList(Document) = .empty,
+
+    fn open(self: Found, unanswered: bool) Open {
+        return .{
+            .workspaces = self.workspaces.items,
+            .documents = self.documents.items,
+            .unsaved = self.unsaved.items,
+            .unanswered = unanswered,
+        };
+    }
+};
+
 fn collect(
     gpa: std.mem.Allocator,
     io: Io,
     bundle: []const u8,
     listing: []const u8,
-    workspaces: *std.ArrayList(Document),
-    unsaved: *std.ArrayList(Document),
+    found: *Found,
 ) !void {
     var lines = std.mem.splitScalar(u8, listing, '\n');
     while (lines.next()) |raw| {
@@ -421,8 +466,9 @@ fn collect(
             .resolved = disk.realPath(gpa, io, owned),
         };
         switch (line[0]) {
-            'w' => try workspaces.append(gpa, doc),
-            'm' => try unsaved.append(gpa, doc),
+            'w' => try found.workspaces.append(gpa, doc),
+            'd' => try found.documents.append(gpa, doc),
+            'm' => try found.unsaved.append(gpa, doc),
             else => {},
         }
     }
@@ -444,6 +490,9 @@ const list_script =
     \\repeat with d in workspace documents
     \\set out to out & "w" & tab & (path of d) & linefeed
     \\end repeat
+    \\repeat with d in documents
+    \\if class of d is not workspace document then set out to out & "d" & tab & (path of d) & linefeed
+    \\end repeat
     \\repeat with d in (every document whose modified is true)
     \\set out to out & "m" & tab & (path of d) & linefeed
     \\end repeat
@@ -457,7 +506,7 @@ const close_script =
     \\with timeout of 10 seconds
     \\tell application "{s}"
     \\repeat with p in argv
-    \\repeat with d in (every workspace document whose path is (p as text))
+    \\repeat with d in (every document whose path is (p as text))
     \\close d saving no
     \\end repeat
     \\end repeat
@@ -529,7 +578,7 @@ test "a beta running beside the release build is two instances, not one" {
     try std.testing.expectEqualStrings("/Users/me/Downloads/Xcode-beta.app", apps[1]);
 }
 
-test "a listing splits into windows and unsaved work" {
+test "a listing splits into windows, loose documents and unsaved work" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -537,24 +586,66 @@ test "a listing splits into windows and unsaved work" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var workspaces: std.ArrayList(Document) = .empty;
-    var unsaved: std.ArrayList(Document) = .empty;
+    var found: Found = .{};
     const listing =
         "w\t/Users/me/Projects/App/.lcc/worktrees/pe-101/App.xcodeproj\n" ++
         "w\t/Users/me/Projects/Other/Other.xcworkspace\n" ++
+        "d\t/Users/me/Projects/App/.lcc/worktrees/pe-101/Tracking/Package.swift\n" ++
+        "d\t/56AD3E3F-A5C6-41E6-A42B-B1254A16FA12\n" ++
         "m\t/Users/me/Projects/App/.lcc/worktrees/pe-101/App/View.swift\n" ++
         "\n";
-    try collect(arena, io, "/Applications/Xcode.app", listing, &workspaces, &unsaved);
+    try collect(arena, io, "/Applications/Xcode.app", listing, &found);
+    const held = found.open(false);
 
-    try std.testing.expectEqual(@as(usize, 2), workspaces.items.len);
-    try std.testing.expectEqual(@as(usize, 1), unsaved.items.len);
-    try std.testing.expectEqualStrings("App.xcodeproj", workspaces.items[0].name());
+    try std.testing.expectEqual(@as(usize, 2), held.workspaces.len);
+    try std.testing.expectEqual(@as(usize, 2), held.documents.len);
+    try std.testing.expectEqual(@as(usize, 1), held.unsaved.len);
+    try std.testing.expectEqualStrings("App.xcodeproj", held.workspaces[0].name());
 
-    const held: Open = .{ .workspaces = workspaces.items, .unsaved = unsaved.items };
     const here = try held.inside(arena, io, "/Users/me/Projects/App/.lcc/worktrees/pe-101");
     try std.testing.expectEqual(@as(usize, 1), here.workspaces.len);
     try std.testing.expectEqual(@as(usize, 1), here.unsaved.len);
     try std.testing.expectEqualStrings("App.xcodeproj", here.workspaces[0].name());
+    if (here.documents.len != 1) {
+        std.debug.print(
+            "a Package.swift standing in its own window was not counted: it is never closed, and " ++
+                "Xcode raises a files-deleted alert in that window the moment the worktree goes\n",
+            .{},
+        );
+        return error.TestExpectedEqual;
+    }
+    try std.testing.expectEqual(@as(usize, 2), (try here.closable(arena)).len);
+}
+
+test "closing a worktree's windows leaves the main checkout's windows open" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var found: Found = .{};
+    const listing =
+        "w\t/Users/me/Projects/App/App.xcodeproj\n" ++
+        "d\t/Users/me/Projects/App/Tracking/Package.swift\n" ++
+        "w\t/Users/me/Projects/App.worktrees/pe-1/App.xcodeproj\n" ++
+        "w\t/Users/me/Projects/App.worktrees/pe-10/App.xcodeproj\n";
+    try collect(arena, io, "/Applications/Xcode.app", listing, &found);
+
+    const here = try found.open(false).inside(arena, io, "/Users/me/Projects/App.worktrees/pe-1");
+    const closing = try here.closable(arena);
+    if (closing.len != 1 or !std.mem.eql(u8, closing[0].path, "/Users/me/Projects/App.worktrees/pe-1/App.xcodeproj")) {
+        std.debug.print(
+            "removing pe-1 would close {d} window(s), not just its own: the main checkout or a " ++
+                "sibling worktree loses its Xcode window over a removal it was not part of\n",
+            .{closing.len},
+        );
+        return error.TestUnexpectedResult;
+    }
+
+    const main_only = try found.open(false).inside(arena, io, "/Users/me/Projects/App.worktrees/pe-2");
+    try std.testing.expect(!main_only.holds());
 }
 
 test "a package opened by its folder is the worktree root itself" {

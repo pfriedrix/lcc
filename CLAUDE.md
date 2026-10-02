@@ -164,6 +164,19 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   same failure: `open.Preference` keeps `.flag` apart from `.config` so a typo'd flag can fail
   the command while a setting written months ago only warns and asks, which is the split
   `start.AllIssues` draws for the same reason.
+- **`lcc remove` may not delete a worktree Xcode has not been seen to let go of.** A window
+  left on a deleted folder is not cosmetic: Xcode raises a files-deleted alert in it, which is
+  exactly the report this rule came from. So `remove.gate` answers before every
+  `git worktree remove`, on a *fresh* `xcode.heldBy` rather than the inspection the picker was
+  drawn from, and `unanswered` is a refusal, not a pass — turning it back into a warn-and-proceed
+  compiles, passes every test written against a responsive Xcode, and brings the alert back the
+  first time Xcode is indexing when you remove. `closeAndConfirm` polls the listing after the
+  `close` because a returned `close` is not a closed window. The listing has to carry `d` lines
+  (every non-workspace document) as well as `w`: a file opened on its own — a local package's
+  `Package.swift` — belongs to no workspace inside the worktree, and with `w` alone it is never
+  closed. Measured against Xcode 27: a file opened by itself sits in a `Files.xcfilescontainer`
+  under `/var/folders`, so only its `d` line is inside the worktree; a file open in a workspace
+  tab is a `d` line too. `--force` deliberately does not lift the gate; `--keep-xcode` does.
 - **Keychain and code signing are coupled.** The Linear token's ACL is keyed on the binary's
   code signature, so `build.zig` signs the installed binary to keep one "Always Allow"
   valid across rebuilds. Removing or bypassing that (`-Dsign=none`) brings back a login
