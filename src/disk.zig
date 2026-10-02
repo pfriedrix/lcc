@@ -73,6 +73,56 @@ pub fn abbreviate(gpa: std.mem.Allocator, environ: *const std.process.Environ.Ma
     return std.fmt.allocPrint(gpa, "~{s}", .{path[home.len..]}) catch path;
 }
 
+pub const low_free_bytes: u64 = 20 * 1024 * 1024 * 1024;
+
+pub fn available(gpa: std.mem.Allocator, io: Io, path: []const u8) ?u64 {
+    const out = exec.run(gpa, io, &.{ "df", "-k", "-P", path }, null) catch return null;
+    defer out.deinit(gpa);
+    if (!out.ok()) return null;
+    return parseAvailable(out.stdout);
+}
+
+pub fn parseAvailable(text: []const u8) ?u64 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    _ = lines.next() orelse return null;
+    const row = lines.next() orelse return null;
+    var fields = std.mem.tokenizeAny(u8, row, " \t");
+    var previous: ?[]const u8 = null;
+    while (fields.next()) |field| {
+        if (isPercent(field)) {
+            const kb = std.fmt.parseInt(u64, previous orelse return null, 10) catch return null;
+            return kb * 1024;
+        }
+        previous = field;
+    }
+    return null;
+}
+
+fn isPercent(field: []const u8) bool {
+    if (field.len < 2 or field[field.len - 1] != '%') return false;
+    for (field[0 .. field.len - 1]) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+test "free space is the Available column of df -P, in bytes" {
+    const out =
+        \\Filesystem     1024-blocks      Used Available Capacity  Mounted on
+        \\/dev/disk3s5     482797652 351145564  88218552    80%    /System/Volumes/Data
+        \\
+    ;
+    try std.testing.expectEqual(@as(?u64, 88218552 * 1024), parseAvailable(out));
+}
+
+test "df output that does not carry a number where Available goes reads as unknown, not as a full disk" {
+    try std.testing.expectEqual(@as(?u64, null), parseAvailable(""));
+    try std.testing.expectEqual(@as(?u64, null), parseAvailable("Filesystem 1024-blocks Used Available\n"));
+}
+
+test "a filesystem name with a space does not shift which column is read as free" {
+    const out = "Filesystem 1024-blocks Used Available Capacity Mounted on\nmap auto home 10 4 6 40% /System/Volumes/Data/home\n";
+    try std.testing.expectEqual(@as(?u64, 6 * 1024), parseAvailable(out));
+}
+
 test "a worktree is a directory that is there, not a name that used to be one" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;

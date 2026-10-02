@@ -733,6 +733,10 @@ Folders without an `info.plist` — Xcode's own shared caches — are never touc
 
 Set `LCC_DERIVED_DATA` to override the location; otherwise `lcc` honours Xcode's own `IDECustomDerivedDataLocation` when it is absolute.
 
+## Disk space
+
+A new worktree is cheap for git and expensive for Xcode: its first open resolves every Swift package into a DerivedData folder of its own, and a build doubles that. `lcc start` checks the free space on the repository's volume before it creates a worktree, and warns below 20 GB — the point where two or three more worktrees fill the disk. It never refuses; the warning names `lcc clean` and `lcc remove --merged`, which are where the space usually is.
+
 ## The Xcode window standing on the worktree
 
 A worktree open in Xcode does not stop `git worktree remove`, so the directory goes and the window stays — sitting on a path that no longer exists. `lcc remove` asks Xcode to close it first, and says so before it does:

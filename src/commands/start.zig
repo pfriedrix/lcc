@@ -339,6 +339,13 @@ fn newestBranchForIssue(statuses: []const git.BranchStatus, suggested: []const u
     return if (best) |status| status.branch else null;
 }
 
+fn warnIfLowOnDisk(app: app_mod.App, at: []const u8) void {
+    const free = disk.available(app.gpa, app.io, at) orelse return;
+    if (free >= disk.low_free_bytes) return;
+    app.ui.warn("Only {f} free on this disk — a worktree's Xcode build data alone runs to several GB.", .{ui.bytes(free)});
+    app.ui.hint("  Reclaim space first: lcc clean, then lcc remove --merged", .{});
+}
+
 fn bootstrap(
     app: app_mod.App,
     opts: Opts,
@@ -387,6 +394,7 @@ fn bootstrap(
 
         path = try git.renderWorktreePath(app.gpa, cfg.worktreeTemplate, repo.root, branch);
         base = try resolveBase(app, opts, repo, branch);
+        warnIfLowOnDisk(app, repo.root);
 
         if (!opts.json) {
             if (repo.resolveStrategy(branch) == .new) {
