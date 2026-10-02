@@ -288,7 +288,7 @@ fn noteCell(gpa: std.mem.Allocator, row: Row) ![]const u8 {
     }
     if (row.attached.xcode.unsaved.len > 0) {
         try out.appendSlice(gpa, "  — unsaved in Xcode");
-    } else if (row.attached.xcode.workspaces.len > 0) {
+    } else if (row.attached.xcode.holds()) {
         try out.appendSlice(gpa, "  — open in Xcode");
     }
     return out.toOwnedSlice(gpa);
@@ -378,14 +378,9 @@ fn removeSelected(
         const entry = row.entry() orelse continue;
         const label = try row.label(app.gpa);
 
-        if (row.attached.xcode.unsaved.len > 0 and !opts.force) {
-            app.ui.warn("Kept {f} — Xcode has unsaved changes in it", .{ui.cyan(label)});
-            for (row.attached.xcode.unsaved) |doc| app.ui.hint("  {s}", .{doc.path});
-            app.ui.hint("  Save them there, or rerun with: lcc remove --force", .{});
-            continue;
-        }
-
-        const closed = closeXcode(app, row.attached.xcode);
+        const released = try releaseXcode(app, entry.path, label, opts, "lcc remove");
+        if (released == .blocked) continue;
+        const closed = released == .closed;
         const gone = remove: {
             repo.removeWorktree(entry.path, opts.force) catch {
                 if (opts.force) {
@@ -450,21 +445,56 @@ fn removeSelected(
 const automation_hint =
     "Allow it under System Settings → Privacy & Security → Automation, or use --keep-xcode.";
 
-fn closeXcode(app: app_mod.App, held: xcode.Open) bool {
-    if (held.workspaces.len == 0) return false;
+pub const Gate = enum { clear, close, unanswered, unsaved };
 
-    xcode.closeDocuments(app.gpa, app.io, held.workspaces) catch {
-        app.ui.warn("Could not close {s} in Xcode — {s}", .{
-            held.workspaces[0].name(),
-            xcode.last_error,
-        });
-        app.ui.hint("  {s}", .{automation_hint});
-        return false;
-    };
-    for (held.workspaces) |doc| {
-        app.ui.success("Closed {f} in Xcode", .{ui.cyan(doc.name())});
+pub fn gate(held: xcode.Open, opts: Opts) Gate {
+    if (opts.keep_xcode) return .clear;
+    if (held.unanswered) return .unanswered;
+    if (held.unsaved.len > 0 and !opts.force) return .unsaved;
+    if (held.holds()) return .close;
+    return .clear;
+}
+
+const Release = enum { clear, closed, blocked };
+
+fn releaseXcode(
+    app: app_mod.App,
+    worktree: []const u8,
+    label: []const u8,
+    opts: Opts,
+    retry: []const u8,
+) !Release {
+    if (opts.keep_xcode) return .clear;
+
+    const held = try xcode.heldBy(app.gpa, app.io, worktree);
+    switch (gate(held, opts)) {
+        .clear => return .clear,
+        .unanswered => {
+            app.ui.warn("Kept {f} — Xcode did not answer, so it may still have it open", .{ui.cyan(label)});
+            app.ui.hint("  {s}", .{automation_hint});
+            return .blocked;
+        },
+        .unsaved => {
+            app.ui.warn("Kept {f} — Xcode has unsaved changes in it", .{ui.cyan(label)});
+            for (held.unsaved) |doc| app.ui.hint("  {s}", .{doc.path});
+            app.ui.hint("  Save them there, or rerun with: {s} --force", .{retry});
+            return .blocked;
+        },
+        .close => {
+            xcode.closeAndConfirm(app.gpa, app.io, held, worktree) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    app.ui.warn("Kept {f} — Xcode would not close it: {s}", .{ ui.cyan(label), xcode.last_error });
+                    app.ui.hint("  Close its window in Xcode and rerun. {s}", .{automation_hint});
+                    return .blocked;
+                },
+            };
+            for (try held.closable(app.gpa)) |doc| {
+                app.ui.success("Closed {f} in Xcode", .{ui.cyan(doc.name())});
+            }
+            return .closed;
+        },
     }
-    return true;
 }
 
 fn noteReopen(app: app_mod.App, closed: bool) void {
@@ -539,7 +569,7 @@ fn appendConfirmationDetails(
             ));
         }
     }
-    for (row.attached.xcode.workspaces) |doc| {
+    for (try row.attached.xcode.closable(w)) |doc| {
         try out.appendSlice(w, try std.fmt.allocPrint(w, "    xcode      {s}  (open — will be closed)\n", .{
             doc.name(),
         }));
@@ -747,12 +777,9 @@ fn runMerged(app: app_mod.App, repo: git.Repo, opts: Opts) !void {
     for (picked) |row| {
         const branch = row.branch orelse continue;
         if (row.entry()) |entry| {
-            if (row.attached.xcode.unsaved.len > 0 and !opts.force) {
-                app.ui.warn("Kept {f} — Xcode has unsaved changes in it", .{ui.cyan(branch)});
-                app.ui.hint("  Save them there, or rerun with: lcc remove --merged --force", .{});
-                continue;
-            }
-            const closed = closeXcode(app, row.attached.xcode);
+            const released = try releaseXcode(app, entry.path, branch, opts, "lcc remove --merged");
+            if (released == .blocked) continue;
+            const closed = released == .closed;
 
             repo.removeWorktree(entry.path, opts.force) catch {
                 app.ui.warn("Kept {f} — {s}", .{ ui.cyan(branch), git.last_error });
@@ -829,7 +856,7 @@ fn attach(
 
     const held: xcode.Open = if (opts.keep_xcode) .{} else try xcode.openDocuments(app.gpa, app.io);
     if (held.unanswered) {
-        app.ui.warn("Could not ask Xcode what it has open — it may be holding some of these.", .{});
+        app.ui.warn("Could not ask Xcode what it has open — it is asked again before each removal.", .{});
         app.ui.hint("  {s}", .{automation_hint});
     }
 
@@ -1090,6 +1117,32 @@ test "an open Xcode window is named on the row that would close it" {
     row.attached.xcode = .{ .workspaces = &.{doc}, .unsaved = &.{doc} };
     const dirty = try cellsFor(app, row, .{}, 0);
     try std.testing.expectEqualStrings("  lcc  — unsaved in Xcode", dirty.note);
+}
+
+test "a worktree is removed only once Xcode has said it holds nothing there" {
+    const doc: xcode.Document = .{
+        .app = "/Applications/Xcode.app",
+        .path = "/Users/me/Projects/App.worktrees/pe-1/App.xcodeproj",
+        .resolved = "/Users/me/Projects/App.worktrees/pe-1/App.xcodeproj",
+    };
+
+    const silent: xcode.Open = .{ .unanswered = true };
+    if (gate(silent, .{}) != .unanswered or gate(silent, .{ .force = true }) != .unanswered) {
+        std.debug.print(
+            "an Xcode that did not answer let the removal through: if it had the worktree open, " ++
+                "its window is left on a deleted folder and raises a files-deleted alert\n",
+            .{},
+        );
+        return error.TestUnexpectedResult;
+    }
+
+    try std.testing.expectEqual(Gate.close, gate(.{ .workspaces = &.{doc} }, .{}));
+    try std.testing.expectEqual(Gate.close, gate(.{ .documents = &.{doc} }, .{}));
+    try std.testing.expectEqual(Gate.unsaved, gate(.{ .workspaces = &.{doc}, .unsaved = &.{doc} }, .{}));
+    try std.testing.expectEqual(Gate.close, gate(.{ .workspaces = &.{doc}, .unsaved = &.{doc} }, .{ .force = true }));
+    try std.testing.expectEqual(Gate.clear, gate(.{}, .{}));
+    try std.testing.expectEqual(Gate.clear, gate(silent, .{ .keep_xcode = true }));
+    try std.testing.expectEqual(Gate.clear, gate(.{ .workspaces = &.{doc} }, .{ .keep_xcode = true }));
 }
 
 test "every column is as wide as its widest cell, header included" {

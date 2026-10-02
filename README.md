@@ -767,7 +767,7 @@ Seeding is skipped when there is no Xcode project, no donor, or Xcode already ma
 
 ## The Xcode window standing on the worktree
 
-A worktree open in Xcode does not stop `git worktree remove`, so the directory goes and the window stays — sitting on a path that no longer exists. `lcc remove` asks Xcode to close it first, and says so before it does:
+A worktree open in Xcode does not stop `git worktree remove`, so the directory goes and the window stays — sitting on a path that no longer exists, with Xcode raising an alert that its files were deleted. `lcc remove` closes that window first — only the worktree's, never the main checkout's or a sibling's, and never Xcode itself — and says so before it does:
 
 ```
 Remove worktree feature/pe-101-shipped?
@@ -781,9 +781,13 @@ Remove worktree feature/pe-101-shipped?
 
 Matching goes by Xcode's own answer rather than a path `lcc` assembled: Xcode says `/tmp/…` where git says `/private/tmp/…`, so both sides are resolved before the containment test, while the string handed to `close` is the one Xcode gave. A Swift package opened by its folder is reported as that folder, which *is* the worktree root rather than something inside it — that counts too.
 
+A window is not only a workspace. A file opened on its own — a local package's `Package.swift`, a source file dragged onto the Dock icon — is a document of its own, not part of any workspace in the worktree, and its window gets the same alert. So `lcc` asks for every document Xcode has open and closes each one whose file is inside the worktree.
+
+**The worktree goes only once Xcode says it has let go.** Xcode is asked again right before each removal, not just when the list was drawn, so a window opened while the confirmation was up is closed too. After the close, `lcc` keeps asking until nothing inside the worktree is open any more (up to about ten seconds), and only then runs `git worktree remove` — a `close` that returned is not yet a window that is gone.
+
 **Unsaved changes stop the removal.** Xcode's scripting interface has no `save` — its documents answer `close` and nothing else — so `lcc` cannot put editor work on disk, and deleting the worktree would take it along. It lists what is unsaved and removes nothing; save it in Xcode, or pass `--force` and lose it knowingly. That is also why the close is `saving no`: a CLI must not be able to raise a save dialog nobody is looking at.
 
-Everything here is best-effort in one direction only. Nothing running, automation not permitted (System Settings → Privacy & Security → Automation), an Xcode too busy to answer inside the timeout — none of those stops a removal, and the last two say so rather than passing for "nothing was open". `--keep-xcode` skips the lot: Xcode is never even asked.
+**An Xcode that cannot vouch for the worktree keeps it.** No Xcode running is a clear answer, and the removal goes ahead. But automation not permitted (System Settings → Privacy & Security → Automation), an Xcode too busy to answer inside the timeout, or a window that is still open when the wait runs out are not answers — any of them keeps that worktree, says why, and moves on to the rest of the selection. `--force` does not lift this: it is about uncommitted changes and unsaved editor work, not about deleting a folder from under an open window. `--keep-xcode` is the way past it: Xcode is never even asked, and its windows are left where they are.
 
 ## Session transcripts
 
