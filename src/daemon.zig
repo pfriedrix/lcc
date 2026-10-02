@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const ansi = @import("ansi.zig");
 const app_mod = @import("app.zig");
+const config = @import("config.zig");
 const exec = @import("exec.zig");
 const pty = @import("pty.zig");
 const sessions_mod = @import("sessions.zig");
@@ -305,7 +306,11 @@ pub fn run(app: app_mod.App, opts: Options) !void {
 fn writeHookSettings(app: app_mod.App, session_id: []const u8) ![]const u8 {
     const exe = try exec.selfPath(app.gpa, app.io);
     const socket_path = try watch_paths.socket(app.gpa, app.environ);
-    const body = try watch_hooks.settingsJson(app.gpa, exe, socket_path, session_id);
+    var denied: []const []const u8 = &.{};
+    if (config.loadStored(app.gpa, app.io, app.environ)) |stored| {
+        if (stored.mcpDisable) |names| denied = names;
+    } else |_| {}
+    const body = try watch_hooks.settingsJson(app.gpa, exe, socket_path, session_id, denied);
     const path = try watch_paths.hooksFor(app.gpa, app.environ, session_id);
     try Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = body });
     return path;
@@ -538,7 +543,8 @@ fn registerSession(loop: *Loop, client: *Client, frame: wire.Frame, at: i64) voi
 
     var argv: std.ArrayList([]const u8) = .empty;
     argv.appendSlice(gpa, &.{ "--settings", hooks_path }) catch return;
-    argv.appendSlice(gpa, body.argv) catch return;
+    const carried = watch_hooks.withoutSettings(gpa, body.argv) catch return;
+    argv.appendSlice(gpa, carried) catch return;
 
     const session = watch_session.Session.start(gpa, .{
         .id = id,

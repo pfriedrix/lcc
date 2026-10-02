@@ -57,7 +57,7 @@ pub const Widths = struct {
     task: usize = 0,
     doing: usize = 0,
     git: usize = 0,
-    worktree: usize = 0,
+    age: usize = 0,
 
     pub fn total(self: Widths) usize {
         var out: usize = 2;
@@ -80,7 +80,7 @@ const headers = .{
     .task = "TASK",
     .doing = "DOING",
     .git = "GIT",
-    .worktree = "WORKTREE",
+    .age = "AGE",
 };
 
 pub const task_ceiling = 36;
@@ -91,16 +91,17 @@ pub fn measure(rows: []const Row, now: i64) Widths {
         .issue = headers.issue.len,
         .status = headers.status.len,
         .task = headers.task.len,
-        .worktree = headers.worktree.len,
+        .age = headers.age.len,
     };
     var buf: [status_limit]u8 = undefined;
+    var age_buf: [age_limit]u8 = undefined;
     for (rows) |row| {
         w.issue = @max(w.issue, ui.displayWidth(row.issue orelse "—"));
-        w.status = @max(w.status, ui.displayWidth(statusCell(&buf, row, now)));
+        w.status = @max(w.status, ui.displayWidth(statusCell(&buf, row)));
         w.task = @max(w.task, ui.displayWidth(row.task));
         w.doing = @max(w.doing, ui.displayWidth(row.doing));
         w.git = @max(w.git, ui.displayWidth(row.git));
-        w.worktree = @max(w.worktree, ui.displayWidth(row.worktree));
+        w.age = @max(w.age, ui.displayWidth(ageCell(&age_buf, row, now)));
     }
     w.task = @min(w.task, task_ceiling);
     w.doing = @min(w.doing, doing_ceiling);
@@ -109,7 +110,7 @@ pub fn measure(rows: []const Row, now: i64) Widths {
     return w;
 }
 
-pub const drop_order = [_][]const u8{ "worktree", "git", "doing", "issue" };
+pub const drop_order = [_][]const u8{ "age", "git", "doing", "issue" };
 
 const task_floor = 12;
 
@@ -117,10 +118,9 @@ pub fn fit(widths: Widths, cols: usize) Widths {
     var out = widths;
     if (out.total() <= cols) return out;
 
-    out.worktree = 0;
     shrinkTask(&out, cols);
 
-    inline for (drop_order[1..]) |name| {
+    inline for (drop_order) |name| {
         if (out.total() > cols) @field(out, name) = 0;
     }
 
@@ -135,8 +135,9 @@ fn shrinkTask(out: *Widths, cols: usize) void {
 }
 
 pub const status_limit = 64;
+pub const age_limit = 16;
 
-pub fn statusCell(buf: []u8, row: Row, now: i64) []const u8 {
+pub fn statusCell(buf: []u8, row: Row) []const u8 {
     var w: Io.Writer = .fixed(buf);
     w.print("{s} {s}", .{ glyph(row.status), statusText(row.status) }) catch
         return statusText(row.status);
@@ -146,10 +147,14 @@ pub fn statusCell(buf: []u8, row: Row, now: i64) []const u8 {
     if (status == .exited) {
         if (row.exit_code) |code| w.print(" {d}", .{code}) catch {};
     }
-
-    const at = if (row.status_at > 0) row.status_at else row.last_activity_at;
-    if (at > 0) w.print(" {f}", .{ui.age(now - at)}) catch {};
     return w.buffered();
+}
+
+pub fn ageCell(buf: []u8, row: Row, now: i64) []const u8 {
+    if (row.status == null) return "—";
+    const at = if (row.status_at > 0) row.status_at else row.last_activity_at;
+    if (at == 0) return "—";
+    return std.fmt.bufPrint(buf, "{f}", .{ui.age(now - at)}) catch "—";
 }
 
 pub fn taskFrom(gpa: std.mem.Allocator, branch: []const u8) []const u8 {
@@ -218,13 +223,14 @@ pub fn render(
         const gutter = if (selected) "❯ " else "  ";
 
         var status_buf: [status_limit]u8 = undefined;
+        var age_buf: [age_limit]u8 = undefined;
         const cells: [6]Cell = .{
             .{ .text = row.issue orelse "—", .width = widths.issue, .colour = "" },
-            .{ .text = statusCell(&status_buf, row, now), .width = widths.status, .colour = paint(row.status, p) },
+            .{ .text = statusCell(&status_buf, row), .width = widths.status, .colour = paint(row.status, p) },
             .{ .text = row.task, .width = widths.task, .colour = if (selected) p.bold else "" },
             .{ .text = row.doing, .width = widths.doing, .colour = p.dim },
             .{ .text = row.git, .width = widths.git, .colour = p.dim },
-            .{ .text = row.worktree, .width = widths.worktree, .colour = p.dim },
+            .{ .text = ageCell(&age_buf, row, now), .width = widths.age, .colour = p.dim },
         };
 
         writeRow(out, cols, gutter, "", &cells, p.reset);
@@ -249,7 +255,7 @@ fn headerCells(widths: Widths) []const Cell {
         .{ .text = headers.task, .width = widths.task, .colour = "" },
         .{ .text = headers.doing, .width = widths.doing, .colour = "" },
         .{ .text = headers.git, .width = widths.git, .colour = "" },
-        .{ .text = headers.worktree, .width = widths.worktree, .colour = "" },
+        .{ .text = headers.age, .width = widths.age, .colour = "" },
     };
     return &S.cells;
 }
@@ -399,11 +405,14 @@ test "fit drops columns in order and never drops the status" {
     try testing.expectEqual(full, fit(full, full.total()));
 
     const narrow = fit(full, full.total() - 1);
-    try testing.expectEqual(@as(usize, 0), narrow.worktree);
+    try testing.expectEqual(full.age, narrow.age);
+    try testing.expectEqual(full.git, narrow.git);
+    try testing.expectEqual(full.doing, narrow.doing);
+    try testing.expect(narrow.task < full.task);
     try testing.expect(narrow.status > 0);
 
     const narrower = fit(full, 40);
-    try testing.expectEqual(@as(usize, 0), narrower.worktree);
+    try testing.expectEqual(@as(usize, 0), narrower.age);
     try testing.expectEqual(@as(usize, 0), narrower.git);
     try testing.expectEqual(@as(usize, 0), narrower.doing);
 
@@ -545,13 +554,31 @@ test "a planning row says plan, not active" {
 }
 
 test "a worktree with nothing running shows no age, not one measured from the epoch" {
+    const now = 1_800_000_000;
+    const rows = testRows();
+
+    var age_buf: [age_limit]u8 = undefined;
+    for (rows) |row| {
+        if (row.status != null) continue;
+        const cell = ageCell(&age_buf, row, now);
+        if (!std.mem.eql(u8, cell, "—")) {
+            std.debug.print(
+                "a row with no session is dated \"{s}\" from the timestamp the last hook left " ++
+                    "behind in that worktree. Nothing is running there to have been silent for " ++
+                    "that long, so the number measures the epoch rather than a session, and the " ++
+                    "row reads as an abandoned agent instead of an empty worktree.\n",
+                .{cell},
+            );
+            return error.TestExpectedEqual;
+        }
+    }
+
     var buf: [4096]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     ui.setColor(false);
-    const rows = testRows();
-    _ = render(&w, rows, fit(measure(rows, 1_800_000_000), 120), 120, rows[0].key, 1_800_000_000);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "56y") == null);
+    _ = render(&w, rows, fit(measure(rows, now), 120), 120, rows[0].key, now);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "no session") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "—") != null);
 }
 
 test "a stale row is marked rather than silently believed" {
@@ -579,7 +606,7 @@ test "the selected row is the one whose id matches, not a row index" {
     try testing.expect(std.mem.startsWith(u8, second, "❯"));
 }
 
-test "a status ten months old says months, not minutes" {
+test "an age ten months old says months, not minutes" {
     const month = 30 * 24 * 60 * 60;
     const row: Row = .{
         .key = "/w",
@@ -596,18 +623,18 @@ test "a status ten months old says months, not minutes" {
     };
     const now = row.status_at + 10 * month;
 
-    var buf: [status_limit]u8 = undefined;
-    const cell = statusCell(&buf, row, now);
-    try testing.expect(std.mem.endsWith(u8, cell, "10mo"));
+    var buf: [age_limit]u8 = undefined;
+    const cell = ageCell(&buf, row, now);
+    try testing.expectEqualStrings("10mo", cell);
 
     const rows = [_]Row{row};
     const widths = measure(&rows, now);
-    if (widths.status < ui.displayWidth(cell)) {
+    if (widths.age < ui.displayWidth(cell)) {
         std.debug.print(
-            "the status column measured {d} for a {d}-wide cell, so `10mo` is cut to `10m` " ++
+            "the age column measured {d} for a {d}-wide cell, so `10mo` is cut to `10m` " ++
                 "and ten months of silence reads as ten minutes — which is the difference " ++
                 "between an abandoned worktree and a live one.\n",
-            .{ widths.status, ui.displayWidth(cell) },
+            .{ widths.age, ui.displayWidth(cell) },
         );
         return error.TestExpectedEqual;
     }
@@ -628,8 +655,8 @@ test "a waiting row is dated from when it started waiting, not from the last hoo
         .stale = false,
     };
 
-    var buf: [status_limit]u8 = undefined;
-    const cell = statusCell(&buf, row, 4600);
+    var buf: [age_limit]u8 = undefined;
+    const cell = ageCell(&buf, row, 4600);
     if (std.mem.indexOf(u8, cell, "1h") == null) {
         std.debug.print(
             "the cell reads \"{s}\": it is dated from the last hook of any kind rather than " ++
@@ -657,10 +684,10 @@ test "a session that fell over says so, rather than looking like one that finish
     };
 
     var buf: [status_limit]u8 = undefined;
-    try testing.expect(std.mem.indexOf(u8, statusCell(&buf, row, 1000), "exited 1") != null);
+    try testing.expect(std.mem.indexOf(u8, statusCell(&buf, row), "exited 1") != null);
 
     row.exit_code = 0;
-    try testing.expect(std.mem.indexOf(u8, statusCell(&buf, row, 1000), "exited 0") != null);
+    try testing.expect(std.mem.indexOf(u8, statusCell(&buf, row), "exited 0") != null);
 }
 
 test "a task name drops the prefix and the issue the ISSUE column already carries" {

@@ -115,11 +115,11 @@ whatever is running in each. Enter opens one — attaching if a session is
 already there, starting one if not.
 
 ```
-  ISSUE   STATUS         TASK                 DOING               GIT
-❯ PE-256  ● waiting 15m  App hangs on launch  needs permission    3 dirty ↑2
-  PE-270  ◐ active now   Crash in mapview     Edit MapView.swift  clean
-  PE-301  ◈ plan 30m     Widget refresh       Bash swift test     clean ↑1
-  PE-9    · no session   Unrelated                                2 dirty
+  ISSUE   STATUS        TASK                 DOING               GIT         AGE
+❯ PE-256  ● waiting     App hangs on launch  needs permission    3 dirty ↑2  15m
+  PE-270  ◐ active      Crash in mapview     Edit MapView.swift  clean       now
+  PE-301  ◈ plan        Widget refresh       Bash swift test     clean ↑1    30m
+  PE-9    · no session  Unrelated                                2 dirty     —
 
   ↑↓ move · enter opens · n new issue · x kill · q quit
 ```
@@ -127,10 +127,11 @@ already there, starting one if not.
 | Column | What it is |
 |---|---|
 | `ISSUE` | the issue the branch names, parsed out of the branch itself |
-| `STATUS` | what the session is doing, and how long it has been doing it |
+| `STATUS` | what the session is doing, and how it ended if it has |
 | `TASK` | the branch, read as a sentence: prefix dropped, issue dropped, dashes spaced |
 | `DOING` | the tool the agent last reached for, or what it is blocked on |
 | `GIT` | uncommitted files, and the drift from the upstream branch |
+| `AGE` | how long the session has been in that status |
 
 The branch itself is not a column. `feature/pe-256-app-hangs-on-launch` spends
 most of its width on a prefix that never varies and an issue that is already in
@@ -139,10 +140,16 @@ that is what `TASK` shows. Where the branch is the thing being named rather than
 a label for the work, it is still spelled in full: the confirmation `x` puts in
 front of killing a session names the branch, not the task.
 
-`AGE` is not a column either. It belongs against the status it measures, so it
-is part of it: `● waiting 15m` is a question that has been waiting a quarter of
-an hour, and `· no session` gets no number at all rather than a `—` in a column
-of its own.
+`AGE` measures the status beside it, not the last thing that happened in the
+worktree: `● waiting 15m` is a question that has been waiting a quarter of an
+hour, and it stays a quarter of an hour old however many subagents report in
+behind that prompt. A row with no session is dated `—` rather than from whatever
+timestamp the last hook left in that worktree — there is nothing running there to
+have been silent, so a number would be measuring the epoch. The column is
+measured, so ten months of silence reads `10mo` and not `10m`.
+
+What the session is, and how it ended, stay in `STATUS`: `✗ exited 1` fell over,
+`✗ exited 0` finished, and `~` marks a status lcc no longer trusts.
 
 **`DOING` comes from the same hooks as the status**, not from reading Claude
 Code's screen — `Edit MapView.swift`, `Bash swift test`, `Grep pageSize`. A
@@ -162,10 +169,17 @@ again rather than waiting the rotation out. A worktree whose `.git` went missing
 reads `missing`, never `clean` — `clean` there would be the main checkout
 answering for it.
 
-Columns come off the right as the terminal narrows — first `WORKTREE`, then
-`GIT`, then `DOING`, then `ISSUE` — and `TASK` is cut before any of them goes,
-because the tail of a name is worth less than a fact. `STATUS` is never dropped.
-A column with nothing in it anywhere is not drawn at all.
+The worktree path is not a column either. It is
+`{repoRoot}/.lcc/worktrees/{branchLeaf}` — a constant prefix and then the branch
+leaf a third time, after `ISSUE` and `TASK` have each already read it — so a
+hundred and twenty columns said nothing the row did not, and said it loudly
+enough to be what cut `TASK` and dropped `GIT` on every terminal narrower than
+the path.
+
+Columns come off the right as the terminal narrows — first `AGE`, then `GIT`,
+then `DOING`, then `ISSUE` — and `TASK` is cut before any of them goes, because the tail of a
+name is worth less than a fact. `STATUS` is never dropped. A column with nothing
+in it anywhere is not drawn at all.
 
 Shortcuts are key *positions*, not characters, so they work on any keyboard
 layout — on Ukrainian ЙЦУКЕН the key labelled `n` prints `т` and still means
@@ -1003,7 +1017,7 @@ A session gets its servers from two places, and only one of them is about worktr
 
 `mcpCarry` narrows the carried set to the names it lists, matched case-insensitively, keeping the file's order. Checking every repo row removes the key, so a server added tomorrow is carried as well; unchecking every one writes an empty list and carries none.
 
-`mcpDisable` is the other half, and it is empty by default — so nothing is switched off until you say so. It becomes a `deniedMcpServers` denylist in `~/.config/lcc/mcp/settings.json`, passed to every session lcc starts as `--settings`. That is Claude Code's own mechanism and it reaches all three kinds: a user-scope server, a plugin server (`plugin:figma:figma`), and a connector under its display name (`claude.ai Notion`). It applies to sessions `lcc` starts, and to nothing else — a plain `claude` in the same directory is unaffected, which is also why `/mcp`'s own per-project toggle and this key are separate answers.
+`mcpDisable` is the other half, and it is empty by default — so nothing is switched off until you say so. It becomes a `deniedMcpServers` denylist: a session started in this terminal gets it as `~/.config/lcc/mcp/settings.json` on `--settings`, and a background session gets the same list written into the settings file the daemon already writes for it, because `claude` reads one `--settings` and a second would discard the first along with lcc's hooks. That is Claude Code's own mechanism and it reaches all three kinds: a user-scope server, a plugin server (`plugin:figma:figma`), and a connector under its display name (`claude.ai Notion`). It applies to sessions `lcc` starts, and to nothing else — a plain `claude` in the same directory is unaffected, which is also why `/mcp`'s own per-project toggle and this key are separate answers.
 
 The global half of the list can only come from Claude Code itself: connectors are fetched from the network and never fully written to disk, and a plugin's servers are not always in a file either. So `lcc setup` runs `claude mcp list` once, caches the names in `~/.config/lcc/mcp-roster.json` (override with `LCC_MCP_ROSTER`) and re-asks when that is a day old. The probe takes a few seconds and health-checks every server, which is why it is not on the path of `lcc start` or `lcc open`. Delete the file to force a fresh one. A name in either key that the roster no longer knows still gets a row, so opening the picker never silently drops a setting, and a name nothing matches is simply inert.
 

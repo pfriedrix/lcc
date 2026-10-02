@@ -342,9 +342,23 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   a branch slug like `feature/pe-338-keep-error-observation-alive-after-the-main-sheet-is` measures
   over fifty columns, so dropping before shrinking took `GIT` and `DOING` off an 80-column terminal
   to spell out a name whose first twenty characters had already identified the row. `fit` therefore
-  drops `WORKTREE`, then shrinks `TASK` toward `task_floor`, and only then drops the fact columns —
-  and `measure` caps `TASK` and `DOING` outright, since neither is worth an unbounded share of the
-  row. `STATUS` is still never dropped.
+  shrinks `TASK` toward `task_floor` first, and only then drops the fact columns — and `measure`
+  caps `TASK` and `DOING` outright, since neither is worth an unbounded share of the row. `STATUS`
+  is still never dropped. The worktree path was a column until it was not: it is the branch leaf
+  behind a constant prefix, so `ISSUE` and `TASK` had already said all of it, and at ~120 columns
+  it was what forced both of those shrinks on any terminal. `Row.worktree` stays — `collect` keys
+  the git cache on it and `startForWorktree` needs it — but nothing draws it, so a row from another
+  repository is no longer distinguishable from one in this one. Put the repo *name* back before
+  putting the path back.
+- **`AGE` is its own column, and folding it back into `STATUS` costs the alignment it exists for.**
+  It was folded in once: `● waiting~ 10m` next to `✗ exited 1 16m` puts every number at a different
+  offset, because the status words differ in length, so the one column a person scans down stops
+  being a column. What that fold got right has to survive the split — `measure` sizes `AGE` from
+  `ageCell`, or `10mo` is cut to `10m` and ten months of silence reads as ten minutes; and the age
+  is dated from `status_at`, falling back to `last_activity_at`, so a prompt that has been up an
+  hour does not reset every time a subagent reports in behind it. `ageCell` returns `—` when
+  `row.status` is null: the timestamp on such a row is whatever the last hook left in that worktree,
+  and nothing is running there to have been silent for it, so dating it measures the epoch.
 - **A session's hook settings file is per session, not per daemon.** `watch_paths.hooksFor`
   names it `hooks-<session id>.json` and `watch_hooks.settingsJson` bakes that id into every
   hook command line, so a report says which session it came from. Collapsing them back into
@@ -354,6 +368,20 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   byte of output set. The worktree path is *not* a unique key: `lcc open` will happily start
   a second session in a worktree that already has one.
 
+- **`claude` reads one `--settings`, and it is the last one.** Measured against the real binary:
+  a `SessionStart` hook in the first file fires on its own, and does not fire when a second
+  `--settings` follows, whatever unrelated keys that second file holds — nothing warns, the
+  flag is simply ignored. `registerSession` prepends `--settings hooks-<id>.json` to whatever
+  argv the caller registered, so the day `mcp.deny`'s denylist was appended to that argv every
+  background session stopped reporting: no `PreToolUse`, no `Notification`, no `SessionEnd`, so
+  `STATUS` held whatever registration set and `DOING` stayed empty for the whole life of the
+  session — the dashboard reading `idle` for an agent burning a minute of CPU a minute. The
+  session's own settings file is therefore the only one: `settingsJson` writes
+  `deniedMcpServers` into it from the daemon's own config read, and `withoutSettings` strips a
+  caller's `--settings` pair before it can reach the child. Anything else that has to reach a
+  background session belongs in that file too, never on the command line — and a flag that is
+  fine on `lcc start`'s direct launch (one `--settings`, no hooks) is exactly the one that is
+  not fine on the registered path.
 - **The global half of the MCP list is not on disk, however much it looks like it should be.**
   `~/.claude.json` holds user-scope servers in its root `mcpServers`, so those *are* readable —
   but a claude.ai connector is fetched from the network and leaves only partial traces
@@ -367,7 +395,8 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   costs seconds and belongs nowhere near `lcc start` or `lcc open`.
 - **`mcpCarry` and `mcpDisable` are one list to a person and two keys on purpose.** They act
   by different mechanisms — `mcpCarry` decides what goes *into* `--mcp-config`, `mcpDisable`
-  becomes a `deniedMcpServers` denylist passed as `--settings` — and they have opposite
+  becomes a `deniedMcpServers` denylist, on `--settings` for a direct launch and inside the
+  session's own settings file for a registered one — and they have opposite
   defaults: absent `mcpCarry` carries everything, absent `mcpDisable` denies nothing. Folding
   them into a single allowlist compiles and reads tidier, and it turns every existing
   `mcpCarry` value into a denial of every global server the moment lcc is upgraded, so a
