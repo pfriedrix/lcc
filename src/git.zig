@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const disk = @import("disk.zig");
 const exec = @import("exec.zig");
 
 pub const Error = error{
@@ -117,17 +118,8 @@ pub const Repo = struct {
         return statuses.toOwnedSlice(self.gpa);
     }
 
-    fn unlinked(self: Repo, worktree_path: []const u8) bool {
-        const link = std.fs.path.join(self.gpa, &.{ worktree_path, ".git" }) catch return false;
-        _ = Io.Dir.cwd().statFile(self.io, link, .{}) catch |err| return switch (err) {
-            error.FileNotFound, error.NotDir => true,
-            else => false,
-        };
-        return false;
-    }
-
     pub fn dirtyCount(self: Repo, worktree_path: []const u8) ?u32 {
-        if (self.unlinked(worktree_path)) return null;
+        if (disk.isUnlinked(self.io, worktree_path)) return null;
 
         const out = self.captureIn(worktree_path, &.{ "git", "status", "--porcelain" }) orelse
             return null;

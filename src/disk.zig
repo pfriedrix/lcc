@@ -57,6 +57,17 @@ pub fn isGone(io: Io, path: []const u8) bool {
     return presence(io, path) == .missing;
 }
 
+pub fn isUnlinked(io: Io, worktree: []const u8) bool {
+    if (worktree.len == 0) return true;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const link = std.fmt.bufPrint(&buf, "{s}/.git", .{std.mem.trimEnd(u8, worktree, "/")}) catch return false;
+    _ = Io.Dir.cwd().statFile(io, link, .{}) catch |err| return switch (err) {
+        error.FileNotFound, error.NotDir => true,
+        else => false,
+    };
+    return false;
+}
+
 pub fn removeChild(io: Io, parent: []const u8, path: []const u8) !void {
     const dirname = std.fs.path.dirname(path) orelse return error.RefusingToDelete;
     const trimmed = std.mem.trimEnd(u8, parent, "/");
@@ -194,6 +205,48 @@ test "a directory we are not allowed to look at is not the same answer as one th
     try std.testing.expect(isGone(io, removed));
     try std.testing.expect(isGone(io, ""));
     try std.testing.expect(!isGone(io, base));
+}
+
+test "a worktree is unlinked only when its .git is definitely not there" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    try tmp.dir.createDirPath(io, "linked");
+    try tmp.dir.writeFile(io, .{ .sub_path = "linked/.git", .data = "gitdir: /nowhere\n" });
+    try tmp.dir.createDirPath(io, "main/.git");
+    try tmp.dir.createDirPath(io, "leftover");
+    try tmp.dir.writeFile(io, .{ .sub_path = "leftover/.DS_Store", .data = "" });
+
+    try std.testing.expect(!isUnlinked(io, try std.fs.path.join(arena, &.{ base, "linked" })));
+    try std.testing.expect(!isUnlinked(io, try std.fs.path.join(arena, &.{ base, "linked/" })));
+    try std.testing.expect(!isUnlinked(io, try std.fs.path.join(arena, &.{ base, "main" })));
+    try std.testing.expect(isUnlinked(io, try std.fs.path.join(arena, &.{ base, "leftover" })));
+    try std.testing.expect(isUnlinked(io, try std.fs.path.join(arena, &.{ base, "removed" })));
+    try std.testing.expect(isUnlinked(io, ""));
+
+    const sealed = try std.fs.path.join(arena, &.{ base, "sealed" });
+    const inside = try std.fs.path.join(arena, &.{ sealed, "worktree" });
+    try Io.Dir.cwd().createDirPath(io, inside);
+    var dir = try Io.Dir.cwd().openDir(io, sealed, .{});
+    defer dir.close(io);
+    try dir.setPermissions(io, @enumFromInt(0o000));
+    defer dir.setPermissions(io, @enumFromInt(0o700)) catch {};
+
+    if (isUnlinked(io, inside)) {
+        std.debug.print(
+            "a worktree behind a directory this process cannot enter read as unlinked: one " ++
+                "unreadable parent takes every live agent under it off the dashboard.\n",
+            .{},
+        );
+        return error.TestUnexpectedResult;
+    }
 }
 
 test "isInside distinguishes containment from a shared prefix" {
