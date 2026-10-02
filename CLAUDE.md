@@ -271,6 +271,17 @@ Do not "simplify" `build.zig`'s separate `test_mod`: reusing the executable's mo
   quietly takes a session out of `◈ plan` the first time the agent asks for a permission —
   so `plan` only ever survives until the next prompt, which reads as the mode being flaky
   rather than as a bug.
+- **An `ended` hook record is the worktree's binding to its conversation, not leftover state.**
+  `SessionEnd` fires on every orderly exit, and `lcc open --stop-all` is one: it sends SIGTERM,
+  and Claude Code runs its hooks on the way out. The record used to be deleted on `ended`, so
+  `--stop-all` erased the one place the Claude session id was kept, and enter on each row then
+  launched a bare `--resume` — Claude Code's picker, in every worktree, one at a time.
+  `recordState` therefore writes `ended` like any other event; `recover` and `doingFor` already
+  read nothing from it, so the row still shows `no session`, and `resumeFor` hands its id to
+  `startForWorktree`. Deleting it again "to keep the directory tidy" compiles and passes every
+  status test. The id is only used once `claude_projects.hasTranscript` says its transcript still
+  exists — `claude --resume <id>` on a deleted one refuses to start — and `resumeChoice` falls
+  back to `--continue`, never to the bare `--resume`.
 - **`watch_state` recovers a status, never a session.** The rows it feeds `collect` keep
   `session_id = null` on purpose: that is the only thing making `watch_table.Row.attachable`
   return `false`, so enter starts the work again instead of asking the daemon for a pty that

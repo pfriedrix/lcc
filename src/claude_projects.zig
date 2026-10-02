@@ -59,6 +59,35 @@ pub fn hasSessionsFor(
     return transcriptCount(gpa, io, projects, cwd) > 0;
 }
 
+pub fn hasTranscript(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    cwd: []const u8,
+    session_id: []const u8,
+) bool {
+    if (session_id.len == 0 or std.mem.indexOfScalar(u8, session_id, '/') != null) return false;
+    const projects = root(gpa, environ) catch return false;
+    const resolved = disk.realPath(gpa, io, cwd);
+    if (transcriptExists(gpa, io, projects, resolved, session_id)) return true;
+    if (std.mem.eql(u8, resolved, cwd)) return false;
+    return transcriptExists(gpa, io, projects, cwd, session_id);
+}
+
+fn transcriptExists(
+    gpa: std.mem.Allocator,
+    io: Io,
+    projects: []const u8,
+    cwd: []const u8,
+    session_id: []const u8,
+) bool {
+    const name = dirName(gpa, cwd) catch return false;
+    const file = std.fmt.allocPrint(gpa, "{s}.jsonl", .{session_id}) catch return false;
+    const file_path = std.fs.path.join(gpa, &.{ projects, name, file }) catch return false;
+    Io.Dir.cwd().access(io, file_path, .{}) catch return false;
+    return true;
+}
+
 fn transcriptCount(
     gpa: std.mem.Allocator,
     io: Io,
@@ -413,6 +442,42 @@ test "hasSessionsFor answers for the launch directory only" {
     const sub = try std.fs.path.join(arena, &.{ worktree, "Common" });
     try cwd.createDirPath(io, sub);
     try std.testing.expect(!hasSessionsFor(arena, io, &environ, sub));
+}
+
+test "hasTranscript names one session's transcript, not any transcript in the directory" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const projects = try std.fs.path.join(arena, &.{ base, "projects" });
+    const cwd = Io.Dir.cwd();
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("HOME", base);
+    try environ.put("LCC_CLAUDE_PROJECTS", projects);
+
+    const worktree = try std.fs.path.join(arena, &.{ base, "App.worktrees", "pe-1" });
+    try cwd.createDirPath(io, worktree);
+    try std.testing.expect(!hasTranscript(arena, io, &environ, worktree, "uuid-1"));
+
+    const project_dir = try std.fs.path.join(arena, &.{ projects, try dirName(arena, worktree) });
+    try cwd.createDirPath(io, project_dir);
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ project_dir, "uuid-2.jsonl" }),
+        .data = "{\"type\":\"mode\"}\n",
+    });
+    try std.testing.expect(!hasTranscript(arena, io, &environ, worktree, "uuid-1"));
+    try std.testing.expect(hasTranscript(arena, io, &environ, worktree, "uuid-2"));
+
+    try std.testing.expect(!hasTranscript(arena, io, &environ, worktree, ""));
+    try std.testing.expect(!hasTranscript(arena, io, &environ, worktree, "../uuid-2"));
 }
 
 test "list reads origins and skips directories with no discoverable cwd" {

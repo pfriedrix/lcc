@@ -277,13 +277,17 @@ shows what each worktree was last doing rather than a column of `no session` —
 which is what you used to get, because a fresh process rewrites the registry from
 the one session it just started and erases the rest. A recovered row reads
 exactly like a live one; the AGE column is what tells you the `● waiting` is four
-hours old. Enter on it starts the work again with `--resume` instead of
-attaching, since there is no longer a session to attach to. An agent interrupted
-mid-turn reads `● waiting` rather than `◐ active`: it has no process left, and a
-turn in flight is a claim only a running one can make. A session you quit
-normally clears its file and goes back to `no session`, having nothing left to
-say. Sessions that died before this shipped left no file behind and stay
-`no session` until you start them again.
+hours old. Enter on it starts the work again instead of attaching, since there
+is no longer a session to attach to — and it resumes *that* conversation,
+`--resume <id>` with the id the hooks recorded, not Claude Code's picker. If that
+conversation's transcript has since been deleted it falls back to `--continue`,
+the latest one in the worktree. An agent interrupted mid-turn reads `● waiting`
+rather than `◐ active`: it has no process left, and a turn in flight is a claim
+only a running one can make. A session that ended normally — `/exit`, or
+`lcc open --stop-all`, which ends every session the same way — goes back to
+`no session`, having nothing left to say, but its file keeps which conversation
+it was, so enter on that row picks it up again too. Sessions that died before
+this shipped left no file behind and stay `no session` until you start them again.
 
 A row the dead process left in the registry does not outrank that file either. It
 can only read `unknown` — the one thing that could have said otherwise is gone —
