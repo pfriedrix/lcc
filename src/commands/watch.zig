@@ -622,8 +622,16 @@ fn startForWorktree(app: app_mod.App, row: watch_table.Row) !watch_client.Starte
             try argv.appendSlice(app.gpa, &.{ "--mcp-config", carried.path });
         }
     } else |_| {}
-    if (claude_projects.hasSessionsFor(app.gpa, app.io, app.environ, row.worktree)) {
-        try argv.append(app.gpa, "--resume");
+    const states = watch_state.load(app.gpa, app.io, app.environ);
+    const last = watch_state.resumeFor(states, disk.realPath(app.gpa, app.io, row.worktree));
+    switch (resumeChoice(
+        last,
+        if (last) |id| claude_projects.hasTranscript(app.gpa, app.io, app.environ, row.worktree, id) else false,
+        claude_projects.hasSessionsFor(app.gpa, app.io, app.environ, row.worktree),
+    )) {
+        .session => |id| try argv.appendSlice(app.gpa, &.{ "--resume", id }),
+        .latest => try argv.append(app.gpa, "--continue"),
+        .fresh => {},
     }
 
     return watch_client.startSession(app, .{
@@ -634,6 +642,19 @@ fn startForWorktree(app: app_mod.App, row: watch_table.Row) !watch_client.Starte
         .program = try claude.resolvePath(app.gpa, app.io),
         .argv = argv.items,
     });
+}
+
+pub const Resume = union(enum) {
+    session: []const u8,
+    latest,
+    fresh,
+};
+
+pub fn resumeChoice(last: ?[]const u8, transcript_exists: bool, has_any: bool) Resume {
+    if (last) |id| {
+        if (transcript_exists) return .{ .session = id };
+    }
+    return if (has_any) .latest else .fresh;
 }
 
 fn kill(app: app_mod.App, id: []const u8) void {
@@ -698,11 +719,7 @@ fn recordState(
     event: []const u8,
     doing: []const u8,
 ) void {
-    const parsed = watch_hooks.Event.parse(event) orelse return;
-    if (parsed == .ended) {
-        watch_state.clear(app.gpa, app.io, app.environ, payload.session_id);
-        return;
-    }
+    _ = watch_hooks.Event.parse(event) orelse return;
     watch_state.write(app.gpa, app.io, app.environ, .{
         .event = event,
         .cwd = payload.cwd,
@@ -712,6 +729,32 @@ fn recordState(
         .doing = doing,
         .at = app_mod.nowSeconds(app.io),
     });
+}
+
+test "enter on a row with no session picks up the conversation it held, never a picker" {
+    const exact = resumeChoice("uuid-1", true, true);
+    if (exact != .session or !std.mem.eql(u8, exact.session, "uuid-1")) {
+        std.debug.print(
+            "a worktree whose last session is known resumed as {s}: after `lcc open --stop-all` " ++
+                "every row then needs its conversation found again by hand, one worktree at a time.\n",
+            .{@tagName(exact)},
+        );
+        return error.TestExpectedEqual;
+    }
+
+    const gone = resumeChoice("uuid-1", false, true);
+    if (gone != .latest) {
+        std.debug.print(
+            "a session whose transcript was deleted resumed as {s}: `claude --resume` on an id " ++
+                "with no transcript refuses to start, so enter does nothing but fail.\n",
+            .{@tagName(gone)},
+        );
+        return error.TestExpectedEqual;
+    }
+
+    try std.testing.expect(resumeChoice(null, false, true) == .latest);
+    try std.testing.expect(resumeChoice(null, false, false) == .fresh);
+    try std.testing.expect(resumeChoice("uuid-1", false, false) == .fresh);
 }
 
 test "the --json keys name sessions, never the process behind them" {

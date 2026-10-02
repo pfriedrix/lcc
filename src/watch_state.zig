@@ -49,6 +49,12 @@ pub fn statusFor(records: []const Record, cwd: []const u8) ?Resolved {
     return .{ .status = status, .last_activity_at = record.at, .doing = record.doing };
 }
 
+pub fn resumeFor(records: []const Record, cwd: []const u8) ?[]const u8 {
+    const record = newestFor(records, cwd) orelse return null;
+    if (record.claude_session.len == 0) return null;
+    return record.claude_session;
+}
+
 pub fn doingFor(records: []const Record, cwd: []const u8) []const u8 {
     const record = newestFor(records, cwd) orelse return "";
     if (watch_hooks.Event.parse(record.event)) |event| {
@@ -92,17 +98,6 @@ pub fn write(
     Io.Dir.renameAbsolute(tmp_path, file_path, io) catch {
         cwd.deleteFile(io, tmp_path) catch {};
     };
-}
-
-pub fn clear(
-    gpa: std.mem.Allocator,
-    io: Io,
-    environ: *const std.process.Environ.Map,
-    claude_session: []const u8,
-) void {
-    if (claude_session.len == 0) return;
-    const file_path = watch_paths.stateFor(gpa, environ, claude_session) catch return;
-    Io.Dir.cwd().deleteFile(io, file_path) catch {};
 }
 
 fn readAt(gpa: std.mem.Allocator, io: Io, file_path: []const u8) ?Record {
@@ -305,7 +300,7 @@ test "a mode that is reported replaces the one remembered, rather than sticking"
     try testing.expect(!watch_hooks.isPlan(records[0].permission_mode));
 }
 
-test "a state file survives a round trip, and ending the session removes it" {
+test "a state file survives a round trip, and ending the session keeps which session it was" {
     const gpa = testing.allocator;
     const io = testing.io;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -334,8 +329,38 @@ test "a state file survives a round trip, and ending the session removes it" {
     try testing.expectEqualStrings("waiting", records[0].event);
     try testing.expectEqual(version, records[0].version);
 
-    clear(arena, io, &environ, "uuid-1");
-    try testing.expectEqual(@as(usize, 0), load(arena, io, &environ).len);
+    write(arena, io, &environ, .{
+        .event = "ended",
+        .cwd = base,
+        .claude_session = "uuid-1",
+        .lcc_session = "s-00000003",
+        .at = 1010,
+    });
+
+    const ended = load(arena, io, &environ);
+    try testing.expectEqual(@as(usize, 1), ended.len);
+    try testing.expect(statusFor(ended, base) == null);
+    try testing.expectEqualStrings("", doingFor(ended, base));
+
+    const resumed = resumeFor(ended, base) orelse {
+        std.debug.print(
+            "an ended session left no id behind: `lcc open --stop-all` ends every session this " ++
+                "way, so after it each worktree's enter falls back to a picker and the person " ++
+                "has to find their own conversation again, one worktree at a time.\n",
+            .{},
+        );
+        return error.TestExpectedEqual;
+    };
+    try testing.expectEqualStrings("uuid-1", resumed);
+}
+
+test "the session a worktree resumes is its newest, whether or not it ended" {
+    const older: Record = .{ .version = version, .event = "idle", .cwd = "/w", .claude_session = "a", .at = 1000 };
+    const newer: Record = .{ .version = version, .event = "ended", .cwd = "/w", .claude_session = "b", .at = 2000 };
+
+    try testing.expectEqualStrings("b", resumeFor(&.{ older, newer }, "/w").?);
+    try testing.expectEqualStrings("b", resumeFor(&.{ newer, older }, "/w").?);
+    try testing.expect(resumeFor(&.{ older, newer }, "/elsewhere") == null);
 }
 
 test "a record with no session to name it is never written" {
